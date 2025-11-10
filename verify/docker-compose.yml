@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  verifier:
+    image: tapp-verifier:latest
+    container_name: tapp-verifier
+    privileged: true
+
+    network_mode: host
+    ipc: host
+    
+    volumes:
+      - /run/udev/control:/run/udev/control
+      - /dev:/dev
+
+      - ./input/confidential.qcow2:/opt/verifier/input/confidential.qcow2
+      - ./input/evidence.json:/opt/verifier/input/evidence.json:ro
+      - ./verify_evidence.py:/opt/verifier/input/verify_evidence.py:ro
+      - ./policy.rego:/opt/verifier/input/policy.rego:ro
+      
+      - ./output:/opt/verifier/output
+    
+    environment:
+      - POLICY_ID=tapp
+      - IMAGE_ID=m-2ze9oirw30sb7rbxd6mp
+      - INSTANCE_ID=i-2ze7pu5vxnm6ka228vgv
+      - INSTANCE_NAME=CVMGPU
+      - OWNER_ACCOUNT_ID=0G-0000
+      - FULL_AUDIT_REPORT=false
+    
+    restart: "no"
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

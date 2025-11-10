@@ -1,0 +1,32 @@
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest
+
+WORKDIR /opt/verifier
+
+# install basic deps
+RUN yum install -y \
+    trustee \
+    jq \
+    unzip \
+    wget \
+    curl \
+    systemd \
+    python3 \
+    && yum clean all
+
+RUN pip3 install requests -i https://mirrors.aliyun.com/pypi/simple/
+
+# install cryptpilot
+RUN wget https://github.com/openanolis/cryptpilot/releases/download/v0.2.8-1/cryptpilot-0.2.8-1.an8.x86_64.rpm \
+    && dnf install -y cryptpilot-0.2.8-1.an8.x86_64.rpm \
+    && rm -f cryptpilot-0.2.8-1.an8.x86_64.rpm
+
+RUN mkdir -p /opt/verifier/input \
+    /opt/verifier/output
+
+COPY entrypoint.sh /opt/verifier/entrypoint.sh
+RUN chmod +x /opt/verifier/entrypoint.sh
+
+EXPOSE 8081
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/sbin/init"]
