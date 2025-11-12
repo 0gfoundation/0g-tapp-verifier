@@ -2,7 +2,7 @@
 set -e
 
 echo "========================================="
-echo "  Verifier 镜像验证流程"
+echo "  Verifier image verification process"
 echo "========================================="
 
 # check input file
