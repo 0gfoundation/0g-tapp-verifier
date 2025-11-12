@@ -4,7 +4,7 @@ WORKDIR /opt/verifier
 
 # install basic deps
 RUN yum install -y \
-    trustee \
+    trustee-1.7.3-1.al8 \
     jq \
     unzip \
     wget \

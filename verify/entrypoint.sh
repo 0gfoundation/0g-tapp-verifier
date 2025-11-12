@@ -101,7 +101,7 @@ echo "[4/5] register policy..."
 if [ -f "$POLICY_FILE" ]; then
     echo "use custom policy file: $POLICY_FILE"
     POLICY_BASENAME=$(basename "$POLICY_FILE" .rego)
-    TARGET_POLICY="/opt/trustee/attestation-service/policies/opa/${POLICY_ID}_cpu.rego"
+    TARGET_POLICY="/opt/trustee/attestation-service/policies/opa/${POLICY_ID}.rego"
     cp "$POLICY_FILE" "$TARGET_POLICY"
     echo "✓ Policy is registered (ID: ${POLICY_ID})"
 else
