@@ -67,18 +67,6 @@ jobs:
           --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
           ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
-    - name: Make package public
-      if: github.event_name != 'pull_request'
-      continue-on-error: true
-      run: |
-        gh api \
-          --method PATCH \
-          -H "Accept: application/vnd.github+json" \
-          /orgs/0gfoundation/packages/container/0g-tapp-verifier \
-          -f visibility='public'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
     - name: Output build summary
       run: |
         echo "## Built Image" >> $GITHUB_STEP_SUMMARY
