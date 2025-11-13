@@ -1,4 +1,4 @@
-# Virtual Machine Image Security Audit Guide
+# Confidential Virtual Machine Image Security Audit Guide
 
 ## Overview
 
@@ -161,7 +161,12 @@ fi
 
 ### Script 2: Binary Hash Verification
 
-**Purpose**: Verify the integrity of critical binary files by calculating their hash values.
+**Purpose**: Verify the integrity of critical binary files by calculating their hash values and comparing them with GitHub release attestations.
+
+**Verification Workflow**:
+1. Calculate hashes from binaries in the VM image
+2. Compare with official GitHub release hashes
+3. Verify GitHub Sigstore attestations (optional but recommended)
 
 **Script**: `check_binary_hash.sh`
 
@@ -177,7 +182,7 @@ NC='\033[0m'
 
 BINARY_FILES=(
     "/usr/local/bin/tapp-cli"
-    "/usr/local/bin/tapp-server"
+    "/usr/local/bin/tapp_server"
 )
 
 if [ $# -eq 0 ]; then
@@ -308,6 +313,101 @@ echo ""
 exit $FAIL_COUNT
 ```
 
+## Verifying Against GitHub Release
+
+### Manual Hash Verification Guide
+
+After running the hash check script, you should manually compare the results with the official GitHub release to verify binary integrity.
+
+### Step 1: Calculate Hashes from VM Image
+
+```bash
+# Run the hash check script
+./check_binary_hash.sh myimage.qcow2 sha256
+
+# Or calculate manually
+virt-cat -a myimage.qcow2 /usr/local/bin/tapp-cli | sha256sum
+virt-cat -a myimage.qcow2 /usr/local/bin/tapp_server | sha256sum
+```
+
+**Example output**:
+```
+[File: /usr/local/bin/tapp-cli]
+✅ File exists
+
+SHA256:
+a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2
+
+[File: /usr/local/bin/tapp_server]
+✅ File exists
+
+SHA256:
+f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1
+```
+
+### Step 2: Visit GitHub Release Page
+
+1. Open your browser and navigate to the project's GitHub release page
+2. **Example**: `https://github.com/0gfoundation/0g-tapp/releases/tag/v0.0.1`
+3. Look for the **Assets** section at the bottom of the release
+
+### Step 3: Find Official Checksums
+
+In the GitHub release page, look for:
+- **Checksums file**: Usually named `checksums.txt`, `SHA256SUMS`, or similar
+- **Attestation badges**: Look for "Provenance" or signature indicators
+- **Release notes**: May include hash values directly
+
+**Click to download the checksums file or view it inline**
+
+### Step 4: Compare Hashes Manually
+
+```
+Official checksums.txt (from GitHub):
+────────────────────────────────────────────────────────────────
+a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2  tapp-cli
+f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp_server
+
+Your extracted hashes (from Step 1):
+────────────────────────────────────────────────────────────────
+a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2  tapp-cli
+f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp_server
+
+Result: ✅ MATCH - Binaries are authentic
+```
+
+### Verification Checklist
+
+- [ ] Downloaded checksums from official GitHub release
+- [ ] Verified you're on the correct repository (e.g., `0gfoundation/0g-tapp`)
+- [ ] Checked the correct release tag/version
+- [ ] All hash values match exactly (character by character)
+- [ ] No warnings or errors during hash calculation
+
+### What to Do If Hashes Don't Match
+
+❌ **DO NOT USE THE IMAGE** if hashes don't match
+
+Possible causes:
+- Binary files were modified or tampered with
+- Wrong version of binaries in the image
+- Corrupted download or build process
+
+Actions:
+1. Verify you're comparing against the correct release version
+2. Re-download the image from a trusted source
+3. Contact the image provider for clarification
+4. Rebuild the image from official source code
+
+### Additional Verification (Optional)
+
+For projects that support Sigstore attestations, GitHub may display:
+- ✅ **"Provenance" badge** - Indicates cryptographically signed build
+- 📋 **Build logs** - Link to the GitHub Actions workflow that built the binary
+- 🔐 **Signature files** - `.sig` or `.pem` files for advanced verification
+
+These provide additional confidence that binaries were built by the official repository and haven't been tampered with.
+
 ## Usage Examples
 
 ### SSH Security Check
@@ -344,7 +444,6 @@ chmod +x check_binary_hash.sh
 
 ```bash
 #!/bin/bash
-
 IMAGE="production-image.qcow2"
 
 echo "Starting security audit for $IMAGE"
@@ -360,15 +459,28 @@ echo -e "\n[Step 2] Binary Integrity Check"
 ./check_binary_hash.sh "$IMAGE" sha256
 HASH_RESULT=$?
 
+echo -e "\n=================================="
+echo "Next Steps:"
+echo "=================================="
+echo "1. Copy the hash values above"
+echo "2. Visit GitHub release page:"
+echo "   https://github.com/0gfoundation/0g-tapp/releases/tag/v0.0.1"
+echo "3. Download checksums file from Assets section"
+echo "4. Manually compare hash values"
+echo ""
+
 # 3. Manual inspection (optional)
-echo -e "\n[Step 3] Additional Checks"
+echo -e "[Step 3] Generating inspection report (optional)..."
 virt-inspector -a "$IMAGE" > "${IMAGE}.inspection.xml"
 
 # Final result
 echo -e "\n=================================="
-echo "Audit Complete"
-echo "SSH Security: $([ $SSH_RESULT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
-echo "Binary Check: $([ $HASH_RESULT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+echo "Audit Summary"
+echo "=================================="
+echo "SSH Security:    $([ $SSH_RESULT -eq 0 ] && echo '✅ PASS' || echo '❌ FAIL')"
+echo "Binary Check:    $([ $HASH_RESULT -eq 0 ] && echo '✅ PASS' || echo '❌ FAIL')"
+echo "Manual Verify:   ⏳ PENDING (see instructions above)"
+echo "=================================="
 
 exit $(($SSH_RESULT + $HASH_RESULT))
 ```
@@ -376,11 +488,13 @@ exit $(($SSH_RESULT + $HASH_RESULT))
 ## Best Practices
 
 1. **Always verify images before deployment** - Run audits on new images before using them in production
-2. **Maintain hash baselines** - Store known-good hash values for comparison
-3. **Automate audits** - Integrate these scripts into your CI/CD pipeline
-4. **Regular re-audits** - Periodically re-check images to detect tampering
-5. **Access control** - Limit who can modify base images
-6. **Audit logging** - Keep records of all audit results with timestamps
+2. **Verify against GitHub releases** - Manually compare hashes with official GitHub release checksums
+3. **Document verification** - Record which release version you verified against and keep audit logs
+4. **Access control** - Limit who can modify base images
+5. **Regular re-audits** - Periodically re-check images to detect tampering
+6. **Use specific versions** - Reference exact release tags (e.g., v0.0.1), not "latest"
+7. **Automate where possible** - Integrate SSH and hash check scripts into your CI/CD pipeline
+8. **Verify build provenance** - Check for Sigstore attestations or "Provenance" badges on GitHub releases
 
 ## Troubleshooting
 
@@ -411,4 +525,6 @@ virt-inspector -a image.qcow2 > /dev/null
 
 - [libguestfs Official Documentation](http://libguestfs.org/)
 - [guestfs Tools Reference](http://libguestfs.org/guestfs.1.html)
+- [0G Foundation GitHub](https://github.com/0gfoundation)
+- [Sigstore Project Overview](https://docs.sigstore.dev/)
 - [Virtual Machine Security Best Practices](https://www.nist.gov/publications/guide-security-focused-configuration-management-information-systems)
