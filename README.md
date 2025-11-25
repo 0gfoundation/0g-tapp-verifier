@@ -16,8 +16,15 @@ This section guides you through the process of verifying TEE evidence.
 ### Prerequisites
 
 - Access to Alibaba Cloud OSS
-- Sufficient storage space (at least 20GB for the CVM image)
+- Sufficient storage space (at least 50GB)
 - Command-line tools: `ossutil`, `git`, `bash`
+- Alinux3 instance
+
+### Step 0: Setup host environment
+Load nbd device
+```bash
+sudo modprobe nbd max_part=8
+```
 
 ### Step 1: Download and Configure OSS
 
@@ -41,7 +48,7 @@ Create the input directory and download the confidential image:
 
 ```bash
 mkdir -p ./verify/input
-ossutil cp oss://confidential-disk/0g-tapp-confidential-gpu.qcow2 ./verify/input/0g-tapp-confidential-gpu.qcow2
+ossutil cp oss://confidential-disk/0g-tapp-confidential-gpu.qcow2 ./verify/input/confidential.qcow2
 ```
 
 This will download the `0g-tapp-confidential-gpu.qcow2` image file to your local `./verify/input/` directory.
@@ -72,7 +79,7 @@ sh examples/get_evidence.sh 8.131.111.246 > ./verify/input/evidence.json
 Run the verification script:
 
 ```bash
-sh ./verify/run.sh
+cd verify && sh run.sh
 ```
 
 The script will verify the TEE evidence against the confidential image and output the verification results.
