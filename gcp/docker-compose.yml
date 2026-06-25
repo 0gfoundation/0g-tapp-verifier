@@ -1,0 +1,19 @@
+services:
+  rvps:
+    image: ghcr.io/confidential-containers/staged-images/rvps:latest
+    ports: ["50003:50003"]
+    volumes:
+      - ./rvps-data:/opt/confidential-containers/attestation-service/reference_values:rw
+      - ./rvps.json:/etc/rvps.json:rw
+    command: ["rvps","--address","0.0.0.0:50003","--config","/etc/rvps.json"]
+    restart: always
+  as:
+    image: ghcr.io/confidential-containers/staged-images/coco-as-grpc:latest
+    ports: ["50004:50004"]
+    depends_on: [rvps]
+    volumes:
+      - ./as-data:/var/lib/attestation-service:rw
+      - ./as-config.json:/etc/as-config.json:rw
+      - ./keys:/keys:rw
+    command: ["grpc-as","--socket","0.0.0.0:50004","--config-file","/etc/as-config.json"]
+    restart: always
