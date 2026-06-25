@@ -11,7 +11,7 @@ evaluates a node's evidence.
 
 > `policy.rego` and `reference-values.json` are **copies** of the canonical artifacts kept
 > in the [`0g-tapp`](https://github.com/0gfoundation/0g-tapp) repo: `verifier/policy.rego`
-> (one method-agnostic policy) and `reference-values/<tapp-server-version>/<env>.json`
+> (one method-agnostic policy) and `verifier/reference-values/<tapp-server-version>/<env>.json`
 > (one set per release × `{dev,prod}`). The copy here is the v0.1.0 `dev` set. Re-sync from
 > `0g-tapp` when verifying a different release/environment.
 
@@ -38,7 +38,7 @@ Prereqs (host): docker + docker compose, grpcurl, openssl, python3.
 
 ```bash
 # 1. Set the reference values for your target release/env
-#    (copy from 0g-tapp reference-values/<version>/<env>.json; default here is v0.1.0/dev)
+#    (copy from 0g-tapp verifier/reference-values/<version>/<env>.json; default here is v0.1.0/dev)
 $EDITOR reference-values.json     # the 5 measurement.* digests
 
 # 2. Get a node's evidence (hex)

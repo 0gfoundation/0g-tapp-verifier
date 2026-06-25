@@ -16,7 +16,7 @@
 #
 # Prereqs (host): docker + docker compose, grpcurl, openssl, python3
 # Reference values: reference-values.json is a copy of 0g-tapp
-#   reference-values/<version>/<env>.json — re-sync it for the target release/env.
+#   verifier/reference-values/<version>/<env>.json — re-sync it for the target release/env.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
