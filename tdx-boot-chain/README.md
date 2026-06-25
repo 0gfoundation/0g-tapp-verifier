@@ -1,12 +1,13 @@
-# GCP TDX boot-chain verifier (gRPC CoCo-AS)
+# TDX boot-chain verifier (gRPC CoCo-AS)
 
-Self-hosted, automated verification that a GCP confidential VM (Intel TDX) node's
-boot chain matches a known-good image. Brings up a local trustee (the same
-`coco-as-grpc` + `rvps` stack as the shared AS), registers the reference values and the
-policy, and evaluates a node's evidence.
+Self-hosted, automated verification that an Intel TDX confidential VM node's boot chain
+matches a known-good image. Cloud-agnostic — it checks the boot-chain measurements, not
+which platform the node runs on. Brings up a local trustee (the same `coco-as-grpc` +
+`rvps` stack as the shared AS), registers the reference values and the policy, and
+evaluates a node's evidence.
 
-> This is the GCP/gRPC flow. The original Aliyun/cryptpilot RESTful flow under `verify/`
-> is unchanged.
+> This is the gRPC CoCo-AS flow. The original Aliyun/cryptpilot RESTful flow under
+> `verify/` is unchanged.
 
 ## What it checks
 

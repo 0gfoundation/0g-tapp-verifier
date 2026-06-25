@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# GCP TDX boot-chain verifier (gRPC CoCo-AS) — one-shot automation
+# TDX confidential VM boot-chain verifier (gRPC CoCo-AS) — one-shot automation
 # =============================================================================
 # Brings up a local trustee (coco-as-grpc :50004 + rvps :50003), registers the
 # reference values + policy, and evaluates a node's TDX evidence against them.
