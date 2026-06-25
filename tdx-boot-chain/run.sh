@@ -12,15 +12,16 @@
 #         | grep -o 'Evidence (hex): [0-9a-f]*' | sed 's/Evidence (hex): //'
 #
 # Env:
-#   POLICY_ID   policy id (default: 0g-tapp)   — registered as <POLICY_ID>_cpu
+#   POLICY_ID   policy id (default: 0g-tapp-v0.1.0-dev)   — registered as <POLICY_ID>_cpu
 #
 # Prereqs (host): docker + docker compose, grpcurl, openssl, python3
-# Reference values: edit reference-values.json for the target release image.
+# Reference values: reference-values.json is a copy of 0g-tapp
+#   reference-values/<version>/<env>.json — re-sync it for the target release/env.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 
-POLICY_ID="${POLICY_ID:-0g-tapp}"
+POLICY_ID="${POLICY_ID:-0g-tapp-v0.1.0-dev}"
 AS=127.0.0.1:50004
 RVPS=127.0.0.1:50003
 EVIDENCE_HEX="${1:-evidence.hex}"

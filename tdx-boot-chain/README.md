@@ -9,6 +9,12 @@ evaluates a node's evidence.
 > This is the gRPC CoCo-AS flow. The original Aliyun/cryptpilot RESTful flow under
 > `verify/` is unchanged.
 
+> `policy.rego` and `reference-values.json` are **copies** of the canonical artifacts kept
+> in the [`0g-tapp`](https://github.com/0gfoundation/0g-tapp) repo: `verifier/policy.rego`
+> (one method-agnostic policy) and `reference-values/<tapp-server-version>/<env>.json`
+> (one set per release × `{dev,prod}`). The copy here is the v0.1.0 `dev` set. Re-sync from
+> `0g-tapp` when verifying a different release/environment.
+
 ## What it checks
 
 Five boot-chain measurements from the TDX evidence's `uefi_event_logs` (RTMR0-2):
@@ -21,8 +27,8 @@ so it is not checked separately. See `policy.rego` for field formats and matchin
 |---|---|
 | `docker-compose.yml` | local trustee: `coco-as-grpc` :50004 + `rvps` :50003 |
 | `as-config.json` / `rvps.json` | AS / RVPS config (AS → RVPS at `http://rvps:50003`) |
-| `policy.rego` | boot-chain policy; reads reference values via `query_reference_value()` (RVPS), embedded fallback |
-| `reference-values.json` | the 5 reference digests for the target image (edit per release) |
+| `policy.rego` | boot-chain policy; reads reference values from RVPS via `query_reference_value()` |
+| `reference-values.json` | the 5 reference digests for the target image (a copy of `0g-tapp` `reference-values/<version>/<env>.json`) |
 | `attestation.proto` / `reference.proto` | gRPC protos for AS / RVPS |
 | `run.sh` | one-shot: keys → compose up → register RVPS + policy → evaluate |
 
@@ -31,7 +37,8 @@ so it is not checked separately. See `policy.rego` for field formats and matchin
 Prereqs (host): docker + docker compose, grpcurl, openssl, python3.
 
 ```bash
-# 1. Set the reference values for your target image
+# 1. Set the reference values for your target release/env
+#    (copy from 0g-tapp reference-values/<version>/<env>.json; default here is v0.1.0/dev)
 $EDITOR reference-values.json     # the 5 measurement.* digests
 
 # 2. Get a node's evidence (hex)
@@ -57,9 +64,11 @@ status non-affirming even when the boot chain passes (update the platform TCB to
 ## Notes
 
 - Policy is registered as `<POLICY_ID>_cpu` — the AS appends the `_cpu` device-class suffix
-  (evaluate with `policy_ids=[<POLICY_ID>]`). Default `POLICY_ID=0g-tapp`.
+  (evaluate with `policy_ids=[<POLICY_ID>]`). Default `POLICY_ID=0g-tapp-v0.1.0-dev`.
 - `keys/`, `*-data/`, `evidence.*` are generated at runtime and gitignored.
-- Same `policy.rego` is used against the shared remote AS; there RVPS isn't writable, so
-  the policy's embedded fallback values are used instead of `query_reference_value()`.
+- The same `policy.rego` is the canonical method-agnostic policy. Against a **shared** remote
+  AS (RVPS not writable) you instead inject the reference values into the policy at
+  registration — see `0g-tapp` `verifier/register-shared-as.sh`. Here (self-hosted) RVPS is
+  writable, so the values are registered to RVPS and read via `query_reference_value()`.
 - The AS token signing key is self-signed locally; this flow decodes the EAR payload and
   does not verify the token signature (the AS already verified the quote).
