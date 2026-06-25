@@ -1,0 +1,9 @@
+{
+  "work_dir": "/var/lib/attestation-service",
+  "rvps_config": { "type": "GrpcRemote", "address": "http://rvps:50003" },
+  "attestation_token_broker": {
+    "type": "Ear",
+    "duration_min": 5,
+    "signer": { "key_path": "/keys/token.key", "cert_path": "/keys/token-cert-chain.pem" }
+  }
+}
