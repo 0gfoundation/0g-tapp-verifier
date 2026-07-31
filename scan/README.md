@@ -29,10 +29,13 @@ service does it once and serves the result, with the time it was taken.
 
 For each node signer an app has on chain:
 
-- **signer binding** — the on-chain signer appears in the quote's report_data,
-  which is what ties a piece of hardware to the app's registration
-- **quote validity and platform state** — from the AS: signature chain to Intel,
-  `ear.status`, TCB status, advisories
+- **signer binding** — the on-chain signer appears in the quote's report_data.
+  This is the load-bearing check: the signer is derived inside the TEE, and only
+  the signer registered on chain can obtain the app's KMS key, so everything else
+  is a statement about that identity.
+- **quote validity** — the AS verified the signature chain to Intel. (Getting a
+  token back is the proof; an unverifiable quote is refused, not annotated.)
+- **platform TCB** — reported, never used to fail a node. See below.
 - **which CVM image booted** — measured boot-chain digests compared against the
   published reference values, reported per component
 - **the measured runtime log** — every `start_app`, `stop_app`,
@@ -54,19 +57,34 @@ boot-chain comparison happens here. That means:
 
 ## Reading the output honestly
 
-- Every result is **as of** a timestamp. A node may have restarted since, which
-  derives a new signer and resets its RTMRs.
-- `teeUrl` is supplied by whoever registered the node and is **not attested**. Some
-  registered nodes carry placeholder URLs (`http://probe:0`) or point at hosts
-  that no longer answer; one is registered as `http://127.0.0.1:50051`, which
-  resolves to the verifier's own machine.
+- Every result is **as of** a timestamp — and only that. Evidence carries no
+  challenge ([0g-tapp#76](https://github.com/0gfoundation/0g-tapp/issues/76)), so
+  it is replayable: "as of" means "when we received a blob claiming this", not
+  "when the node was in this state". A node may also have restarted since, which
+  re-derives its signer and resets its RTMRs.
+- **Platform TCB is reported, never a reason to fail.** Host firmware belongs to
+  the cloud provider, not the app's owner, and providers take Intel's updates on
+  their own schedule — every node measured so far reports `OutOfDate`, so failing
+  on it would paint everything red and carry no signal. It is not nothing either:
+  the advisory ids differ widely in how much they bear on TDX isolation, so they
+  are listed rather than reduced to a colour.
+- **`ear.status` is not shown.** Evaluating with no policy means that field is the
+  AS *default* policy's opinion, which does not include the boot-chain check made
+  here — its `executables` claim is always "warning" regardless. Beside a real
+  verdict it would read as a summary of a check it never performed.
+- `teeUrl` is how a verifier finds a node at all — the registry's only pointer to
+  where evidence can be fetched. It does not need to be attested, because getting
+  it wrong cannot pass silently: a dead or mistyped address yields no evidence, and
+  an address serving another instance yields evidence whose signer does not match
+  the registration. Several nodes are registered with placeholders (`http://probe:0`)
+  or point at hosts that no longer answer, and one at `http://127.0.0.1:50051`.
 - A failed check is a **state**, not an absence: "the chain says this node serves
-  the app, the node says it has no such app" is worth showing.
-- `ear.status` aggregates several claims. A stale platform TCB alone makes it
-  non-affirming even when the boot chain matches, so boot chain and platform state
-  are reported separately.
-- Only a recent window of each event log is cached. Responses say how many entries
-  exist on the node versus how many are shown.
+  the app, the node says it has no such app" is worth showing, and is cached so
+  every reader does not re-trigger the same failing fetch.
+- **Registered and verified are separate columns.** Registration is what actually
+  authorises a node — it is how a node obtains the KMS key, and that path carries
+  no attestation material at all. Verification is an observation made afterwards.
+  Merging them would hide the gap, which is currently wide.
 
 ## Running
 
@@ -77,7 +95,7 @@ tappscan history 0g-kms-dev
 # Attest an app's current nodes (serves a cached result while it is fresh)
 tappscan check 0g-kms-dev --reference-values ../../0g-tapp/verifier/reference-values
 
-# The deployable form: refresh loop + read-only HTTP on :8088
+# The deployable form: refresh loop + read-only HTTP on :9090
 tappscan serve --reference-values ../../0g-tapp/verifier/reference-values
 ```
 
@@ -92,7 +110,7 @@ docker compose -f scan/docker-compose.yml up -d --build    # from the repo root
 ```
 
 Brings up `rvps` + `as` on an internal network only, an nginx front that allows
-`AttestationEvaluate` and refuses `SetAttestationPolicy`, and tappscan on `:8088`.
+`AttestationEvaluate` and refuses `SetAttestationPolicy`, and tappscan on `:9090`.
 The AS is not published directly because it has **no authentication**: anyone who
 can reach it can overwrite any policy id, and an EAR token records only which
 policy id was used — never a hash of it — so a client cannot detect a swap.
@@ -109,8 +127,29 @@ All reads are served from memory; nothing here can trigger evidence fetching.
 | `GET /` | single-page view |
 | `GET /api/health` | contract, chain, scanned block, last refresh |
 | `GET /api/apps` | every app with its cached attestation state |
-| `GET /api/apps/:app_id` | identity epochs, full history, per-node status |
-| `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `this_app_only`, `limit` |
+| `GET /api/apps/:app_id` | per-signer registration, status and trace size; full event history |
+| `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
+
+`scope` selects a slice of the machine's trace: `app` (this app plus the
+machine-scoped operations, the default), `others`, or `all`. The trace belongs to
+the CVM, not to one app — every app on a machine measures into the same RTMR3, and
+operations like `docker_login` or `claim_config` carry no app id, so they are shown
+under every app on that machine rather than hidden or arbitrarily assigned.
+
+## The signer is the unit
+
+A signer is re-derived on every tapp restart, so the same address reappearing means
+the same running instance — one row, several registration intervals, rather than
+several identities. Different signers are never chained into a longer-lived "node":
+only `updateNode` records such a link (9 of 63 node events on the live registry),
+elsewhere a change is a remove plus an add with nothing tying them together, and
+even the explicit link is just the owner asserting one replaces the other. A signer
+says nothing about hardware.
+
+Each signer carries a verification status and a trace, whether current or retired.
+The one difference is `reverifiable`: a retired signer's RTMRs are gone with its
+instance, so whatever was cached while it was live is the only record that will ever
+exist. Traces are therefore kept whole, never windowed.
 
 ## Notes on the chain scan
 

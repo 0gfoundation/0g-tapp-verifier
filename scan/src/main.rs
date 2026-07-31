@@ -131,7 +131,7 @@ enum Command {
         attest: AttestOpts,
 
         /// Address to listen on
-        #[arg(long, env = "TAPPSCAN_BIND", default_value = "0.0.0.0:8088")]
+        #[arg(long, env = "TAPPSCAN_BIND", default_value = "0.0.0.0:9090")]
         bind: String,
 
         /// Seconds between chain syncs

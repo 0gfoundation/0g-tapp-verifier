@@ -22,8 +22,8 @@ COPY --from=build /src/scan/target/release/tappscan /usr/local/bin/tappscan
 WORKDIR /var/lib/tappscan
 ENV TAPPSCAN_CACHE=/var/lib/tappscan/chain.json \
     TAPPSCAN_STATUS=/var/lib/tappscan/status.json \
-    TAPPSCAN_BIND=0.0.0.0:8088 \
+    TAPPSCAN_BIND=0.0.0.0:9090 \
     RUST_LOG=tappscan=info
-EXPOSE 8088
+EXPOSE 9090
 ENTRYPOINT ["tappscan"]
 CMD ["serve"]

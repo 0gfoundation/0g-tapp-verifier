@@ -48,7 +48,8 @@ services:
       context: ..
       dockerfile: scan/Dockerfile
     depends_on: [as]
-    ports: ["8088:8088"]
+    # Host port is overridable because 9090 is a popular one to already have taken.
+    ports: ["${TAPPSCAN_PORT:-9090}:9090"]
     volumes:
       - tappscan-data:/var/lib/tappscan
       # Published reference values, read at startup to identify CVM images. Kept
