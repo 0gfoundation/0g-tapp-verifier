@@ -41,13 +41,16 @@
   its RTMRs. To verify a node yourself instead of trusting this page, use
   <code>tapp-cli verify-app</code> (layer 2) or run your own trustee (layer 1).
   <br>
-  What a verdict rests on is the <em>signer</em>: the quote proves a genuine TDX
-  platform holds that key and booted a particular image, and only the signer
-  registered on chain can obtain the app's KMS key. It says nothing about the
-  address the evidence arrived from — <code>teeUrl</code> is whatever the node's
-  owner typed at registration, so it can be a placeholder or point somewhere long
-  dead. That affects whether a node can be <em>reached</em>, and makes any location
-  read off its IP a guess, but not what a reachable node's evidence establishes.
+  <code>teeUrl</code> is how a verifier finds a node at all — the registry's only
+  pointer to where evidence can be fetched. It does not need to be attested,
+  because getting it wrong cannot pass silently: a dead or mistyped address yields
+  no evidence, and an address serving some other instance yields evidence whose
+  signer does not match the registration. What a verdict rests on is the
+  <em>signer</em>: the quote proves a genuine TDX platform holds that key and
+  booted a particular image, and only the signer registered on chain can obtain
+  the app's KMS key. The key follows the signer, not the address — so a relay
+  forwarding a genuine node's evidence cannot make a conclusion false, and any
+  location read off an IP is a guess rather than part of the verdict.
   <br>
   Evidence carries no challenge
   (<a href="https://github.com/0gfoundation/0g-tapp/issues/76">0g-tapp#76</a>), so
