@@ -82,7 +82,14 @@ struct AppSummary {
     latest_block: u64,
     /// Distinct images identified across this app's nodes.
     images: Vec<String>,
-    attested: usize,
+    /// Current signers that answered with evidence. Registration alone says
+    /// nothing about whether a node is up — most registered nodes on the live
+    /// registry cannot be reached at all — so "alive" means reachable, not
+    /// registered.
+    reachable: usize,
+    /// Current signers whose boot chain matched a published reference set.
+    identified: usize,
+    /// Current signers whose last attempt failed (unreachable, no such app, …).
     failed: usize,
     /// Age in seconds of the OLDEST cached result, so the listing never looks
     /// fresher than its stalest entry.
@@ -118,9 +125,10 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                 events: t.entries.len(),
                 signers_ever: t.signers.len(),
                 latest_block: t.latest_block(),
-                images,
-                attested: cached.iter().filter(|e| e.attested.is_some()).count(),
+                reachable: cached.iter().filter(|e| e.attested.is_some()).count(),
+                identified: cached.iter().filter(|e| e.image().is_some()).count(),
                 failed: cached.iter().filter(|e| e.error.is_some()).count(),
+                images,
                 oldest_result_age: cached.iter().map(|e| e.age_secs(now)).max(),
                 signers,
                 app_id,

@@ -106,9 +106,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         events: usize,
 
-        /// Only show runtime events for this app id (the log covers the whole node)
-        #[arg(long)]
-        events_this_app_only: bool,
+        /// Which slice of the machine's trace to print. The trace belongs to the
+        /// CVM, not the app: every app on a machine measures into the same RTMR3,
+        /// and operations like docker_login carry no app id at all.
+        ///   app    — this app plus the unattributable machine-scoped events
+        ///   others — what the machine's other apps did
+        ///   all    — the whole trace
+        #[arg(long, default_value = "app")]
+        scope: EventScope,
     },
     /// Keep the cache warm: sync the chain, re-attest whatever the chain says has
     /// changed, and repeat. This is what makes reads cheap for everyone else.
@@ -138,6 +143,26 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
+}
+
+/// Which slice of a machine's trace to show for one app.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EventScope {
+    App,
+    Others,
+    All,
+}
+
+impl EventScope {
+    /// Operations carrying no app id belong to the machine rather than to any one
+    /// app, so they are shown under every scope rather than hidden or assigned.
+    fn admits(self, event_app: Option<&str>, app_id: &str) -> bool {
+        match (self, event_app) {
+            (EventScope::All, _) | (_, None) => true,
+            (EventScope::Others, Some(a)) => a != app_id,
+            (EventScope::App, Some(a)) => a == app_id,
+        }
+    }
 }
 
 fn unix_now() -> i64 {
@@ -282,7 +307,7 @@ async fn main() -> Result<()> {
             attest: opts,
             force,
             events,
-            events_this_app_only,
+            scope,
         } => {
             let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
             let mut store = status::Store::load(&cli.status);
@@ -307,7 +332,7 @@ async fn main() -> Result<()> {
             let now = unix_now();
             for signer in &signers {
                 match store.get(&app_id, signer) {
-                    Some(entry) => print_entry(entry, now, events, events_this_app_only, &app_id),
+                    Some(entry) => print_entry(entry, now, events, scope, &app_id),
                     None => println!("  {signer}\n    ✗ never attested (see log above)\n"),
                 }
             }
@@ -597,7 +622,7 @@ fn print_entry(
     s: &status::Entry,
     now: i64,
     event_limit: usize,
-    this_app_only: bool,
+    scope: EventScope,
     app_id: &str,
 ) {
     let yn = |b: bool| if b { "✓" } else { "✗" };
@@ -663,17 +688,17 @@ fn print_entry(
         ),
     }
 
-    println!(
-        "    event log  : {} tapp event(s), replay {}",
-        a.event_count,
-        if a.runtime_replay_ok { "✓" } else { "✗ MISMATCH" }
-    );
-
     let shown: Vec<&attest::RuntimeEvent> = a
         .events
         .iter()
-        .filter(|e| !this_app_only || e.app_id() == Some(app_id))
+        .filter(|e| scope.admits(e.app_id(), app_id))
         .collect();
+    println!(
+        "    event log  : {} in scope of {} on this machine, replay {}",
+        shown.len(),
+        a.event_count,
+        if a.runtime_replay_ok { "✓" } else { "✗ MISMATCH" }
+    );
     let skip = if event_limit == 0 {
         0
     } else {
@@ -687,7 +712,8 @@ fn print_entry(
             "      {:<10} {:<22} {:<26} {:<8} {}",
             e.timestamp().map(|t| t.to_string()).unwrap_or_default(),
             e.operation,
-            e.app_id().unwrap_or("-"),
+            // No app id means the machine, not this app.
+            e.app_id().unwrap_or("(machine)"),
             e.result().unwrap_or("-"),
             e.digest
                 .as_deref()
