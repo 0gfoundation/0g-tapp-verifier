@@ -625,7 +625,6 @@ fn print_entry(
     scope: EventScope,
     app_id: &str,
 ) {
-    let yn = |b: bool| if b { "✓" } else { "✗" };
     println!("  {}", s.signer);
     println!("    teeUrl     : {}", s.tee_url);
 
@@ -643,11 +642,19 @@ fn print_entry(
         return;
     };
 
-    println!(
-        "    signer     : {} attested {}",
-        yn(a.signer_ok),
-        a.attested_signer.as_deref().unwrap_or("—")
-    );
+    // A mismatch is not "the registration went stale" — it means the registered
+    // identity and the one the node holds are two different things, and neither has
+    // standing: the registered signer cannot be attested (it exists nowhere) and
+    // the attested one is not registered (so it has no claim on the app's key).
+    if a.signer_ok {
+        println!("    signer     : ✓ the quote attests this address");
+    } else {
+        println!(
+            "    signer     : ✗ MISMATCH — registered {}, attested {}",
+            s.signer,
+            a.attested_signer.as_deref().unwrap_or("nothing")
+        );
+    }
     // What the AS established, and nothing more. `ear.status` is deliberately not
     // shown as a verdict: tappscan evaluates with no policy, so that field is the
     // AS DEFAULT policy's opinion, which does not include the boot-chain check
