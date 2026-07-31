@@ -3,116 +3,190 @@
 <title>tappscan</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* Palette taken from 0G's own explorer (storagescan-galileo.0g.ai): violet brand
-     on white, near-black text, monospace for hashes, 10px cards, pill badges. */
+  /* Palette read out of 0G's own explorer (storagescan-galileo.0g.ai): violet
+     brand, near-black text on white, monospace for identifiers, 10px surfaces,
+     pill badges. Neutrals are tinted toward the brand hue rather than pure grey. */
   :root {
-    --bg:#fff; --surface:#fff; --fg:#141414; --dim:#484848;
-    --line:#ebebeb; --line-strong:#e5e5e5;
-    --brand:#9200e1; --brand-soft:#b75fff; --brand-tint:#f3e6fe;
-    --ok:#0e7a4a; --ok-tint:#e6f6ee;
-    --bad:#c62828; --bad-tint:#fdeaea;
-    --warn:#8a5a00; --warn-tint:#fdf3e2;
-    --mono: ui-monospace, "GeistMono", SFMono-Regular, Menlo, monospace;
-    --sans: "Metropolis", "Regola", -apple-system, "Segoe UI", Roboto, sans-serif;
+    --brand:#9200e1; --brand-2:#b75fff; --brand-tint:#f7f0fe; --brand-tint-2:#f0e2fd;
+    --bg:#fdfcfe; --surface:#ffffff; --fg:#141318; --dim:#5c5566;
+    --line:#eceaf0; --line-2:#ded9e4;
+    --ok:#0e6b45; --ok-tint:#e8f5ee;
+    --bad:#b3261e; --bad-tint:#fdecea;
+    --warn:#7a5300; --warn-tint:#fbf1e0;
+    --mono:"GeistMono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    --sans:"Metropolis", "Regola", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+    /* spacing scale — every gap below comes from this */
+    --s1:.25rem; --s2:.5rem; --s3:.75rem; --s4:1rem; --s5:1.5rem; --s6:2rem; --s7:3rem;
+    --r-surface:10px; --r-pill:9999px;
+    --ease:cubic-bezier(.22,1,.36,1);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#0d0d0f; --surface:#161619; --fg:#f2f2f2; --dim:#a0a0a8;
-      --line:#26262b; --line-strong:#32323a;
-      --brand:#b75fff; --brand-soft:#9200e1; --brand-tint:#241033;
-      --ok:#5fd6a0; --ok-tint:#10241b;
-      --bad:#ff8a80; --bad-tint:#2c1413;
-      --warn:#ffcc80; --warn-tint:#2b2010;
+      --brand:#c07cff; --brand-2:#9200e1; --brand-tint:#1d1526; --brand-tint-2:#271a33;
+      --bg:#0f0d13; --surface:#17141c; --fg:#f3f1f6; --dim:#a49bb0;
+      --line:#262231; --line-2:#332d40;
+      --ok:#66d69f; --ok-tint:#11251c;
+      --bad:#ff9a91; --bad-tint:#2c1614;
+      --warn:#e8bd72; --warn-tint:#2a2010;
     }
   }
-  * { box-sizing:border-box }
-  body { margin:0 auto; padding:2rem 1.5rem 3rem; max-width:1180px;
-         background:var(--bg); color:var(--fg); font:15px/1.55 var(--sans);
-         -webkit-font-smoothing:antialiased; }
-  code, .mono, td.mono, th.mono { font-family:var(--mono); font-size:.92em }
 
-  header { display:flex; align-items:baseline; gap:.6rem; margin-bottom:.3rem }
-  h1 { font-size:1.35rem; font-weight:700; margin:0; letter-spacing:-.01em }
-  h1 span { color:var(--brand) }
-  .tag { font-size:.7rem; text-transform:uppercase; letter-spacing:.08em;
-         color:var(--brand); background:var(--brand-tint);
-         padding:.15rem .5rem; border-radius:9999px; font-weight:600 }
-  .sub { color:var(--dim); font-size:.86rem; margin:0 0 1.5rem; font-family:var(--mono) }
-  .sub b { color:var(--fg); font-weight:600 }
+  *, *::before, *::after { box-sizing:border-box }
+  html { -webkit-text-size-adjust:100% }
+  body {
+    margin:0 auto; padding:var(--s6) var(--s5) var(--s7); max-width:1160px;
+    background:var(--bg); color:var(--fg);
+    font:400 15px/1.55 var(--sans); -webkit-font-smoothing:antialiased;
+  }
+  code, .mono { font-family:var(--mono); font-size:.9em; font-variant-ligatures:none }
 
-  .panel { background:var(--surface); border:1px solid var(--line);
-           border-radius:10px; overflow:hidden; margin-bottom:1rem }
-  table { border-collapse:collapse; width:100% }
-  th, td { text-align:left; padding:.6rem .85rem; white-space:nowrap;
-           border-bottom:1px solid var(--line) }
-  thead th { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
-             color:var(--dim); font-weight:600; background:var(--bg) }
-  tbody tr:last-child td { border-bottom:0 }
-  tbody tr[data-app] { cursor:pointer }
-  tbody tr[data-app]:hover { background:var(--brand-tint) }
-  .num { text-align:right; font-family:var(--mono) }
-  .wrap { overflow-x:auto }
+  /* ── head ─────────────────────────────────────────────────────────────── */
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:var(--s3) }
+  h1 { margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.015em }
+  h1 b { color:var(--brand); font-weight:700 }
+  .tag {
+    font-size:.68rem; font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+    color:var(--brand); background:var(--brand-tint-2);
+    padding:.2rem .55rem; border-radius:var(--r-pill);
+  }
+  .meta {
+    margin:var(--s2) 0 var(--s5); color:var(--dim);
+    font-family:var(--mono); font-size:.78rem; line-height:1.7;
+  }
+  .meta b { color:var(--fg); font-weight:600 }
 
-  /* pill badges, as on the reference explorer */
-  .pill { display:inline-block; padding:.12rem .55rem; border-radius:9999px;
-          font-size:.76rem; font-weight:600; white-space:nowrap }
-  .pill-ok { color:var(--ok); background:var(--ok-tint) }
-  .pill-bad { color:var(--bad); background:var(--bad-tint) }
-  .pill-warn { color:var(--warn); background:var(--warn-tint) }
-  .pill-dim { color:var(--dim); background:var(--line) }
-  .ok { color:var(--ok) } .bad { color:var(--bad) } .warn { color:var(--warn) } .dim { color:var(--dim) }
+  h2 {
+    margin:var(--s6) 0 var(--s2); font-size:.72rem; font-weight:600;
+    letter-spacing:.09em; text-transform:uppercase; color:var(--dim);
+  }
+  .lede { margin:0 0 var(--s4); color:var(--dim); font-size:.88rem; max-width:64ch }
+  .hint { margin:0 0 var(--s3); color:var(--dim); font-size:.8rem }
 
-  .card { background:var(--surface); border:1px solid var(--line);
-          border-radius:10px; padding:1.1rem 1.25rem; margin:1rem 0 }
-  .card h3 { margin:0 0 .1rem; font-size:.95rem; font-family:var(--mono);
-             font-weight:600; overflow-wrap:anywhere }
-  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.07em;
-       color:var(--dim); margin:2rem 0 .5rem }
-  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.3rem 1.1rem; margin:.8rem 0 0 }
-  .kv dt { color:var(--dim); font-size:.82rem; text-transform:uppercase; letter-spacing:.04em }
-  .kv dd { margin:0; overflow-wrap:anywhere; font-size:.9rem }
+  /* ── tables ───────────────────────────────────────────────────────────── */
+  .panel {
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-surface); overflow:hidden;
+  }
+  .scroll { overflow-x:auto; -webkit-overflow-scrolling:touch }
+  table { border-collapse:collapse; width:100%; font-size:.88rem }
+  th, td { text-align:left; padding:.55rem var(--s3); white-space:nowrap }
+  tbody td { border-top:1px solid var(--line) }
+  thead th {
+    font-size:.68rem; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+    color:var(--dim); padding-top:var(--s3); padding-bottom:var(--s3);
+  }
+  th:first-child, td:first-child { padding-left:var(--s4) }
+  th:last-child,  td:last-child  { padding-right:var(--s4) }
+  .num { text-align:right; font-family:var(--mono); font-size:.84rem }
+  tr.row { cursor:pointer; transition:background .15s var(--ease) }
+  tr.row:hover, tr.row:focus-visible { background:var(--brand-tint); outline:none }
+  tr.row:focus-visible td:first-child { box-shadow:inset 3px 0 0 var(--brand) }
+  .name { font-weight:500 }
 
-  button { font:inherit; font-size:.82rem; background:var(--bg);
-           border:1px solid var(--line-strong); color:var(--fg);
-           border-radius:9999px; padding:.2rem .75rem; cursor:pointer }
+  /* ── badges ───────────────────────────────────────────────────────────── */
+  .pill {
+    display:inline-block; padding:.1rem .5rem; border-radius:var(--r-pill);
+    font-size:.72rem; font-weight:600; white-space:nowrap; letter-spacing:.01em;
+  }
+  .p-ok   { color:var(--ok);    background:var(--ok-tint) }
+  .p-bad  { color:var(--bad);   background:var(--bad-tint) }
+  .p-warn { color:var(--warn);  background:var(--warn-tint) }
+  .p-dim  { color:var(--dim);   background:var(--line) }
+  .ok { color:var(--ok) } .bad { color:var(--bad) } .dim { color:var(--dim) }
+
+  /* ── signer cards ─────────────────────────────────────────────────────── */
+  .card {
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-surface); padding:var(--s4) var(--s5) var(--s5);
+    margin:0 0 var(--s3);
+  }
+  .card.retired { background:transparent; border-style:dashed }
+  .card > h3 {
+    margin:0; font-family:var(--mono); font-size:.82rem; font-weight:600;
+    overflow-wrap:anywhere; display:flex; flex-wrap:wrap; align-items:center; gap:var(--s2);
+  }
+  dl { display:grid; grid-template-columns:11rem 1fr; gap:var(--s1) var(--s4);
+       margin:var(--s4) 0 0; font-size:.88rem }
+  dt { color:var(--dim); font-size:.72rem; font-weight:600; letter-spacing:.06em;
+       text-transform:uppercase; padding-top:.2rem }
+  dd { margin:0; overflow-wrap:anywhere }
+  dd + dt { border-top:1px solid var(--line); padding-top:var(--s2); margin-top:var(--s1) }
+  dt + dd { border-top:1px solid var(--line); padding-top:var(--s2); margin-top:var(--s1) }
+  dl > dt:first-of-type, dl > dt:first-of-type + dd { border-top:0; padding-top:0; margin-top:0 }
+  @media (max-width:640px) {
+    dl { grid-template-columns:1fr; gap:0 }
+    dt { padding-top:var(--s3) } dt + dd { border-top:0; padding-top:.1rem; margin-top:0 }
+    dd + dt { border-top:1px solid var(--line) }
+  }
+
+  pre {
+    margin:var(--s3) 0 0; padding:var(--s3); overflow-x:auto;
+    font-family:var(--mono); font-size:.75rem; line-height:1.7; color:var(--dim);
+    background:var(--bg); border:1px solid var(--line); border-radius:8px;
+  }
+
+  /* ── controls ─────────────────────────────────────────────────────────── */
+  button {
+    font:inherit; font-size:.8rem; font-weight:500;
+    color:var(--fg); background:var(--surface);
+    border:1px solid var(--line-2); border-radius:var(--r-pill);
+    padding:.3rem .8rem; min-height:32px; cursor:pointer;
+    transition:border-color .15s var(--ease), color .15s var(--ease), background .15s var(--ease);
+  }
   button:hover { border-color:var(--brand); color:var(--brand) }
-  a { color:var(--brand) }
-  pre { margin:.6rem 0 0; overflow-x:auto; font-family:var(--mono); font-size:.8rem;
-        background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:.7rem }
+  button:active { background:var(--brand-tint) }
+  :focus-visible { outline:2px solid var(--brand); outline-offset:2px; border-radius:4px }
+  a { color:var(--brand); text-underline-offset:2px }
+  .toolbar { display:flex; flex-wrap:wrap; gap:var(--s2); align-items:center; margin:var(--s3) 0 0 }
+  .empty { color:var(--dim); font-size:.88rem; padding:var(--s5) var(--s4); text-align:center }
+
+  @media (prefers-reduced-motion:reduce) {
+    * { transition-duration:0s !important; animation-duration:0s !important }
+  }
 </style>
 
-<header><h1>tapp<span>scan</span></h1><span class="tag">trust layer 3</span></header>
-<p class="sub" id="head">loading…</p>
-<div id="view"></div>
+<header>
+  <h1>tapp<b>scan</b></h1>
+  <span class="tag">trust layer 3</span>
+</header>
+<p class="meta" id="meta">loading…</p>
+<main id="view" aria-live="polite"></main>
 
 <script>
-const $ = (h) => { const d = document.createElement('div'); d.innerHTML = h; return d.firstElementChild }
+const el = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild }
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
-const short = (s, n = 10) => s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-4) : (s ?? '')
+const short = (s, n = 10) => s && s.length > n * 2 + 4 ? s.slice(0, n) + '…' + s.slice(-4) : (s ?? '')
+const pill = (kind, text) => `<span class="pill p-${kind}">${text}</span>`
+const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`
 
 function age(secs) {
   if (secs == null) return '—'
   if (secs < 60) return secs + 's ago'
-  if (secs < 3600) return Math.floor(secs / 60) + 'm ago'
-  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago'
-  return Math.floor(secs / 86400) + 'd ago'
+  if (secs < 3600) return Math.round(secs / 60) + 'm ago'
+  if (secs < 86400) return Math.round(secs / 3600) + 'h ago'
+  return Math.round(secs / 86400) + 'd ago'
+}
+
+// Measured timestamps are unix seconds from inside the CVM. Shown as a date, with
+// the raw value on hover — an event log is something people cross-reference.
+function when(ts) {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `<span title="${ts}">${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+         ` ${pad(d.getHours())}:${pad(d.getMinutes())}</span>`
 }
 
 async function get(path) {
   const r = await fetch(path)
-  if (!r.ok) throw new Error(path + ' → ' + r.status)
+  if (!r.ok) throw new Error(`${path} → ${r.status}`)
   return r.json()
 }
 
-// Registered / reachable / verified stay three separate numbers.
-//
-// Registration is what actually authorises a node — it is how a node obtains the
-// app's KMS key — and it says nothing about whether the node is up: most
-// registered nodes on the live registry cannot be reached at all. Verification is
-// an observation made afterwards, on top of being reachable. Collapsing these into
-// one indicator would hide the two gaps worth looking at.
-function pill(cls, text) { return `<span class="pill pill-${cls}">${text}</span>` }
-
+// Registered, reachable and verified stay three separate numbers. Registration is
+// what authorises a node — it is how a node obtains the app's KMS key — and says
+// nothing about whether it is up. Verification is an observation made afterwards,
+// on top of being reachable. One combined indicator would hide both gaps.
 function aliveCell(a) {
   if (!a.signers.length) return pill('dim', 'no node')
   if (!a.reachable && !a.failed) return pill('dim', 'not checked')
@@ -121,38 +195,37 @@ function aliveCell(a) {
 }
 
 function verifiedCell(a) {
-  if (!a.signers.length) return '<span class="dim">—</span>'
-  if (!a.reachable && !a.failed) return '<span class="dim">—</span>'
+  if (!a.signers.length || (!a.reachable && !a.failed)) return '<span class="dim">—</span>'
   if (!a.reachable) return '<span class="dim">no evidence</span>'
-  if (a.images.length === 1 && a.identified === a.reachable)
-    return `${pill('ok', '✓')} <code>${esc(a.images[0])}</code>`
   if (a.images.length > 1) return pill('warn', `${a.images.length} different images`)
   if (!a.identified) return pill('warn', 'image unknown')
-  return `${pill('warn', `${a.identified}/${a.reachable}`)} <code>${esc(a.images[0])}</code>`
+  const badge = a.identified === a.reachable ? pill('ok', '✓') : pill('warn', `${a.identified}/${a.reachable}`)
+  return `${badge} <code>${esc(a.images[0])}</code>`
 }
 
 // An app with no registered node, or whose every registered node failed to answer,
-// is not something you can look at — it is off. Those are hidden unless asked for,
-// so the list is what is actually running. Apps not yet checked stay visible: on a
-// cold start that is everything, and hiding them would show an empty registry.
+// is off — hidden unless asked for, so the list is what is actually running. Apps
+// not yet checked stay visible: on a cold start that is all of them.
 const isOff = (a) => !a.signers.length || (a.failed > 0 && a.reachable === 0)
 let showOff = false
 
 async function showList() {
-  location.hash = ''
+  history.replaceState(null, '', location.pathname)
   const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
-  document.getElementById('head').innerHTML =
-    `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id} · block <b>${h.scanned_to_block}</b> ·
-     ${h.apps} apps · ${h.events} events · refreshed ${age(h.now - h.refreshed_at)}`
+  document.getElementById('meta').innerHTML =
+    `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id}<br>` +
+    `block <b>${h.scanned_to_block.toLocaleString()}</b> · ${plural(h.apps, 'app')} · ` +
+    `${plural(h.events, 'event')} · refreshed ${age(h.now - h.refreshed_at)}`
 
-  const hidden = all.filter(isOff).length
+  const hiddenCount = all.filter(isOff).length
   const apps = showOff ? all : all.filter(a => !isOff(a))
 
   const rows = apps.map(a => `
-    <tr data-app="${esc(a.app_id)}">
-      <td>${a.unnamed
-        ? '<span class="dim mono" title="plaintext app id could not be recovered">' + short(a.app_id) + '</span>'
-        : esc(a.app_id)}</td>
+    <tr class="row" tabindex="0" role="link" data-app="${esc(a.app_id)}"
+        aria-label="${esc(a.app_id)}">
+      <td class="${a.unnamed ? 'mono dim' : 'name'}"
+          ${a.unnamed ? 'title="plaintext app id could not be recovered"' : ''}>
+        ${a.unnamed ? short(a.app_id) : esc(a.app_id)}</td>
       <td>${aliveCell(a)}</td>
       <td class="num">${a.signers.length}</td>
       <td class="num">${a.reachable}</td>
@@ -163,158 +236,185 @@ async function showList() {
     </tr>`).join('')
 
   const view = document.getElementById('view')
-  view.innerHTML = `<div class="panel wrap"><table>
-    <thead><tr><th>app</th><th></th>
-    <th class="num" title="current nodes on chain — these, and only these, can obtain the app's KMS key">registered</th>
-    <th class="num" title="of those, how many answered with evidence">reachable</th>
-    <th class="num" title="distinct signers over the app's whole life">signers ever</th>
-    <th class="num">events</th>
-    <th title="boot chain matched a published reference set">verified</th>
-    <th>as of</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>
-    ${hidden ? `<button id="toggle-off">${showOff
-      ? 'hide the ' + hidden + ' that are off'
-      : 'show ' + hidden + ' with no reachable node'}</button>` : ''}`
-  view.querySelectorAll('tr[data-app]').forEach(tr =>
-    tr.onclick = () => showApp(tr.dataset.app))
-  const toggle = document.getElementById('toggle-off')
-  if (toggle) toggle.onclick = () => { showOff = !showOff; showList() }
+  view.innerHTML = apps.length ? `
+    <div class="panel scroll"><table>
+      <thead><tr>
+        <th>app</th><th></th>
+        <th class="num" title="current nodes on chain — these, and only these, can obtain the app's KMS key">registered</th>
+        <th class="num" title="of those, how many answered with evidence">reachable</th>
+        <th class="num" title="distinct signers over the app's whole life">signers ever</th>
+        <th class="num">events</th>
+        <th title="boot chain matched a published reference set">verified</th>
+        <th>as of</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${hiddenCount ? `<div class="toolbar"><button id="toggle">${showOff
+      ? `hide the ${hiddenCount} that are off`
+      : `show ${hiddenCount} with no reachable node`}</button></div>` : ''}`
+    : `<div class="panel"><p class="empty">Nothing running. ${hiddenCount
+        ? `<button id="toggle">show ${hiddenCount} registered but unreachable</button>`
+        : 'The registry has no apps yet.'}</p></div>`
+
+  view.querySelectorAll('tr.row').forEach(tr => {
+    const open = () => showApp(tr.dataset.app)
+    tr.onclick = open
+    tr.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() } }
+  })
+  const toggle = document.getElementById('toggle')
+  if (toggle) toggle.onclick = () => { showOff = !showOff; render(showList) }
 }
 
-// One card per SIGNER — current or retired, same shape. The signer is the unit
-// that carries a verification status and a trace; the only difference is whether
-// the result can be produced again, since a retired signer's RTMRs are gone with
-// its instance.
+// One card per signer — current or retired, same shape. The signer is the unit that
+// carries a verification status and a trace; the only difference is whether the
+// result can be produced again, since a retired signer's RTMRs are gone with its
+// instance. Different signers are never chained into a longer-lived "node".
 function signerCard(h, now) {
-  const label = h.current
-    ? '<span class="pill pill-ok">current</span>'
-    : '<span class="pill pill-dim">retired — cannot be re-attested</span>'
   const spans = h.intervals
-    .map(i => `${i.from_block} → ${i.to_block ?? '<span class="ok">now</span>'}`).join(', ')
-  const head = `<h3>${esc(h.signer)}</h3>
-    <dl class="kv">
-      <dt></dt><dd>${label}</dd>
-      <dt>registered</dt><dd class="mono">${spans} · ${h.code_updates} code update(s)</dd>`
-
+    .map(i => `${i.from_block.toLocaleString()} → ${i.to_block ? i.to_block.toLocaleString() : '<span class="ok">now</span>'}`)
+    .join('<br>')
   const st = h.status
-  // The trace is worth offering whenever one was captured, retired or not — for a
-  // retired signer it is the only record that will ever exist.
-  const traceRow = h.trace_events
-    ? `<dt>trace</dt><dd>${h.trace_events} measured operations
-         <button data-events="${esc(h.signer)}">show</button></dd>`
-    : ''
+  const a = st?.attested
 
-  if (!st) return `<div class="card">${head}
-    <dt>verification</dt><dd><span class="pill pill-dim">never attested</span></dd></dl></div>`
+  const rows = []
+  rows.push(['registered', `<span class="mono">${spans}</span>` +
+    `<div class="dim">${plural(h.code_updates, 'code update')} while serving</div>`])
 
-  const a = st.attested
-  if (!a) return `<div class="card">${head}
-      <dt>verification</dt><dd><span class="pill pill-bad">unreachable</span>
-        <span class="dim">${esc(st.error || 'failed')}</span></dd>
-      <dt>teeUrl</dt><dd>${esc(st.tee_url || '—')}</dd>
-      <dt>attempted</dt><dd>${age(now - st.checked_at)}</dd>
-    </dl></div>`
+  if (!st) {
+    rows.push(['verification', pill('dim', 'never attested')])
+  } else if (!a) {
+    rows.push(['verification', `${pill('bad', 'unreachable')} <span class="dim">${esc(st.error || 'failed')}</span>`])
+    if (st.tee_url) rows.push(['teeUrl', `<span class="mono">${esc(st.tee_url)}</span>`])
+    rows.push(['attempted', age(now - st.checked_at)])
+  } else {
+    rows.push(['teeUrl', `<span class="mono">${esc(st.tee_url)}</span>`])
+    rows.push(['signer bound', a.signer_ok
+      ? `${pill('ok', '✓')} the quote attests this address`
+      : `${pill('bad', 'mismatch')} the quote attests <code>${esc(a.attested_signer || 'nothing')}</code>
+         <div class="dim">The registered identity is not the one this node holds, so neither
+         has standing: the registered signer cannot be attested, and the attested signer is
+         not registered.</div>`])
+    rows.push(['quote', `${pill('ok', '✓')} signature chain verified by the AS`])
+    rows.push(['platform tcb', a.tcb_status === 'UpToDate'
+      ? `${pill('ok', 'UpToDate')}`
+      : `${pill('dim', esc(a.tcb_status))}` + (a.advisories.length
+          ? `<div class="dim">Host firmware predates ${plural(a.advisories.length, 'Intel advisory', 'Intel advisories')}:
+             <span class="mono">${a.advisories.map(esc).join(', ')}</span></div>` : '')])
 
-  const diff = a.closest
-    ? `<span class="pill pill-warn">unknown</span> closest ${a.closest.hits}/${a.closest.total}
-       <code>${esc(a.closest.label)}</code>, differs in <b>${a.closest.failed.map(esc).join(', ')}</b>`
-    : (a.image ? `<span class="pill pill-ok">✓</span> <code>${esc(a.image)}</code>`
-               : '<span class="pill pill-warn">unknown</span>')
-  const measured = a.image ? '' : Object.entries(a.measured || {})
-    .map(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`).join('\n')).join('\n')
+    const boot = a.image
+      ? `${pill('ok', '✓')} <code>${esc(a.image)}</code>`
+      : a.closest
+        ? `${pill('warn', 'unknown')} closest ${a.closest.hits}/${a.closest.total}:
+           <code>${esc(a.closest.label)}</code>
+           <div class="dim">Differs in <b>${a.closest.failed.map(esc).join(', ')}</b>.</div>`
+        : `${pill('warn', 'unknown')} <span class="dim">no reference set applies</span>`
+    const measured = a.image ? '' : Object.entries(a.measured || {})
+      .flatMap(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`)).join('\n')
+    rows.push(['boot chain', `${boot} <span class="dim">(${esc(a.boot_format)})</span>` +
+      (measured ? `<pre>${esc(measured)}</pre>` : '')])
 
-  return `<div class="card">${head}
-      <dt>teeUrl</dt><dd class="mono">${esc(st.tee_url)}</dd>
-      <dt>signer bound</dt><dd>${a.signer_ok
-        ? `${pill('ok', '✓')} the quote attests this address`
-        : `${pill('bad', 'mismatch')} the quote attests
-           <code>${esc(a.attested_signer || 'nothing')}</code> — the registered
-           identity is not the one this node holds, so neither has standing: the
-           registered signer cannot be attested and the attested signer is not
-           registered`}</dd>
-      <dt>quote</dt><dd><span class="pill pill-ok">✓</span> signature chain verified by the AS</dd>
-      <dt>platform TCB</dt><dd>${a.tcb_status === 'UpToDate'
-        ? '<span class="ok">UpToDate</span>'
-        : `<span class="dim">${esc(a.tcb_status)}</span>` +
-          (a.advisories.length
-            ? ` — host firmware predates ${a.advisories.length} Intel
-                ${a.advisories.length === 1 ? 'advisory' : 'advisories'}:
-                <span class="dim">${a.advisories.map(esc).join(', ')}</span>`
-            : '')}</dd>
-      <dt>boot chain</dt><dd>${diff} <span class="dim">(${esc(a.boot_format)})</span></dd>
-      ${traceRow}
-      <dt>replay</dt><dd>${a.runtime_replay_ok
-        ? '<span class="ok">✓</span> every measured operation reproduces its digest'
-        : '<span class="bad">✗ MISMATCH</span>'}</dd>
-      <dt>as of</dt><dd>${age(now - st.checked_at)} <span class="dim">(${st.checked_at} unix)</span></dd>
-    </dl>${measured ? '<pre class="dim">' + esc(measured) + '</pre>' : ''}</div>`
+    rows.push(['replay', a.runtime_replay_ok
+      ? `${pill('ok', '✓')} every measured operation reproduces its digest`
+      : pill('bad', 'mismatch')])
+    if (h.trace_events) {
+      rows.push(['trace', `${plural(h.trace_events, 'measured operation')} on this machine
+        <div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
+    }
+    rows.push(['as of', `${age(now - st.checked_at)} <span class="dim mono">(${st.checked_at})</span>`])
+  }
+
+  return `<section class="card${h.current ? '' : ' retired'}">
+    <h3>${esc(h.signer)} ${h.current
+      ? pill('ok', 'current')
+      : pill('dim', 'retired · cannot be re-attested')}</h3>
+    <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+  </section>`
 }
 
 async function showApp(appId) {
-  location.hash = encodeURIComponent(appId)
+  history.replaceState(null, '', '#' + encodeURIComponent(appId))
   const d = await get('/api/apps/' + encodeURIComponent(appId))
-
-  // Current signers first, then retired ones newest-first. Different signers are
-  // never chained into a longer-lived "node": only updateNode records such a link,
-  // most changes are a remove plus an add with nothing tying them together, and
-  // even the explicit link is just the owner asserting one replaces the other.
   const current = d.signers.filter(h => h.current)
   const retired = d.signers.filter(h => !h.current).reverse()
 
-  document.getElementById('view').innerHTML = `
-    <p><button id="back">← all apps</button></p>
-    <h3>${esc(d.app_id)}</h3>
-    <p class="dim">${current.length} current signer(s) — these, and only these, can
-      obtain the app's KMS key. ${retired.length} retired.</p>
+  const view = document.getElementById('view')
+  view.innerHTML = `
+    <div class="toolbar"><button id="back">← all apps</button></div>
+    <h2>${esc(d.app_id)}</h2>
+    <p class="lede">${current.length
+      ? `${plural(current.length, 'signer')} registered right now — these, and only these,
+         can obtain this app's KMS key.`
+      : 'No node is registered for this app right now.'}</p>
     ${current.map(h => signerCard(h, d.now)).join('')}
-    ${retired.length ? '<h3>retired</h3>' : ''}
+    ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
+      <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
+      restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
     ${retired.map(h => signerCard(h, d.now)).join('')}`
 
-  document.getElementById('back').onclick = showList
-  document.querySelectorAll('button[data-events]').forEach(b =>
-    b.onclick = () => showEvents(appId, b.dataset.events))
+  document.getElementById('back').onclick = () => render(showList)
+  view.querySelectorAll('button[data-trace]').forEach(b =>
+    b.onclick = () => render(() => showTrace(appId, b.dataset.trace)))
 }
 
-// The trace belongs to the CVM, not to one app: every app on the machine measures
-// into the same RTMR3. So it is shown per app — this app's operations plus the
-// machine-scoped ones that carry no app id (docker_login, add_to_whitelist,
-// claim_config), which are unattributable and therefore shown under every app on
-// that machine. What the co-tenants did is one click away, not hidden: it is all
-// measured precisely so it can be inspected.
-async function showEvents(appId, signer, scope = 'app') {
+// One signer's trace always reads the same way: the operations measured for THIS
+// app, plus the shared ones. Shared means an operation carrying no app id at all —
+// docker_login, add_to_whitelist, claim_config — which acts on the CVM rather than
+// on one app, and so belongs to every app on it. There is no other way to slice it,
+// so there is nothing to switch between; what the machine's other apps did is on
+// their own pages.
+async function showTrace(appId, signer) {
   const d = await get(`/api/apps/${encodeURIComponent(appId)}/events` +
-                      `?signer=${signer}&scope=${scope}&limit=300`)
+                      `?signer=${encodeURIComponent(signer)}&scope=app&limit=300`)
   const n = d.nodes[0] || {}
-  const rows = (n.events || []).slice().reverse().map(e => {
+  const events = (n.events || []).slice().reverse()
+  const shared = events.filter(e => !e.payload?.app_id).length
+
+  const rows = events.map(e => {
     const own = e.payload?.app_id
-    return `<tr><td class="dim">${e.payload?.timestamp ?? ''}</td>
+    const result = e.payload?.result
+    return `<tr>
+      <td class="dim mono">${when(e.payload?.timestamp)}</td>
       <td>${esc(e.operation)}</td>
-      <td class="${own ? (own === appId ? '' : 'dim') : 'warn'}">${own ? esc(own)
-        : '<span title="no app id — belongs to the machine, not to one app">machine</span>'}</td>
-      <td class="${e.payload?.result === 'success' ? 'ok' : 'dim'}">${esc(e.payload?.result ?? '')}</td>
-      <td class="dim">${short(e.digest, 8)}</td>
-      <td>${e.digest_matches ? '' : '<span class="bad">replay ✗</span>'}</td></tr>`}).join('')
+      <td>${own ? esc(own) : `<span class="pill p-dim"
+        title="carries no app id — acts on the CVM, so it belongs to every app on it">shared</span>`}</td>
+      <td>${result
+        ? `<span class="${result === 'success' ? 'ok' : 'bad'}">${esc(result)}</span>`
+        : '<span class="dim">—</span>'}</td>
+      <td class="dim mono">${short(e.digest, 8)}</td>
+      <td>${e.digest_matches ? '' : pill('bad', 'replay ✗')}</td>
+    </tr>`}).join('')
 
-  const tabs = [['app', 'this app + machine'], ['others', 'other apps here'], ['all', 'everything']]
-    .map(([s, label]) => s === scope ? `<b>${label}</b>`
-      : `<button data-scope="${s}">${label}</button>`).join(' ')
-
-  const card = $(`
-    <div class="card"><h3>event log · ${esc(short(signer, 8))}</h3>
-      <div class="dim">${tabs}</div>
-      <div class="dim">${n.returned} shown of ${n.in_scope} in scope · ${n.trace_total}
-        in the machine's whole trace. Newest first.</div>
-      <div class="wrap"><table><thead><tr><th>timestamp</th><th>operation</th><th>app</th>
-        <th>result</th><th>digest</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
-    </div>`)
   const view = document.getElementById('view')
-  view.querySelector('.card > h3')?.textContent.startsWith('event log') && view.firstElementChild.remove()
-  view.insertAdjacentElement('afterbegin', card)
-  card.querySelectorAll('button[data-scope]').forEach(b =>
-    b.onclick = () => showEvents(appId, signer, b.dataset.scope))
+  view.innerHTML = `
+    <div class="toolbar"><button id="back">← ${esc(appId)}</button></div>
+    <h2>trace · <span class="mono">${esc(short(signer, 10))}</span></h2>
+    <p class="lede">${plural(events.length - shared, 'operation')} measured for this app,
+      ${shared} shared with every app on the machine, out of ${n.trace_total} in the whole
+      trace. Newest first.</p>
+    ${events.length ? `<div class="panel scroll"><table>
+      <thead><tr><th>when</th><th>operation</th><th>app</th><th>result</th>
+        <th>digest</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`
+      : `<div class="panel"><p class="empty">Nothing has been measured for this app on this
+         node yet.</p></div>`}`
+  document.getElementById('back').onclick = () => render(() => showApp(appId))
 }
 
-const boot = () => location.hash ? showApp(decodeURIComponent(location.hash.slice(1))) : showList()
-boot().catch(e => document.getElementById('view').innerHTML =
-  '<p class="bad">' + esc(e.message) + '</p>')
+// One place to report a failed fetch, so no view has to.
+async function render(fn) {
+  try {
+    await fn()
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  } catch (e) {
+    document.getElementById('view').innerHTML =
+      `<div class="panel"><p class="empty"><span class="bad">${esc(e.message)}</span><br>
+       <span class="dim">tappscan may still be starting its first scan.</span></p></div>`
+  }
+}
+
+addEventListener('hashchange', () => {
+  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
+  render(app ? () => showApp(app) : showList)
+})
+render(location.hash ? () => showApp(decodeURIComponent(location.hash.slice(1))) : showList)
 </script>
