@@ -13,7 +13,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::refvalues::{self, Measured, RefSet, SetMatch, ANY_BSA};
@@ -44,7 +44,7 @@ const TAPP_DOMAIN: &str = "tapp.0g.com";
 
 /// One measured tapp operation (start_app, stop_app, get_app_secret_key, …) as
 /// the AS parsed it out of the event log.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeEvent {
     pub operation: String,
     /// The measured JSON payload, verbatim.

@@ -576,6 +576,12 @@ impl Timeline {
             .map(|e| e.signers.clone())
             .unwrap_or_default()
     }
+
+    /// Block of the app's most recent registry event — the trigger for
+    /// re-attesting a cached result.
+    pub fn latest_block(&self) -> u64 {
+        self.entries.last().map(|e| e.block).unwrap_or(0)
+    }
 }
 
 // ─── Scanning ────────────────────────────────────────────────────────────────
