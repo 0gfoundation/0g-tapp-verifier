@@ -22,10 +22,14 @@ use std::path::Path;
 
 use crate::attest::{NodeStatus, RuntimeEvent};
 
-/// Runtime events kept per node. The full log can run to thousands of entries on
-/// a long-lived node, and it is always re-fetchable, so the cache keeps a recent
-/// window and records how many were dropped.
-const KEEP_EVENTS: usize = 200;
+// The whole trace is kept, never a window.
+//
+// A signer's event log IS its history: RTMR3 only appends, so one fetch yields
+// every measured operation from boot onward, and there is nothing a series of
+// periodic snapshots would add. But the moment the instance restarts, the log
+// resets and the old trace cannot be produced again by anyone. Truncating it would
+// therefore not save a re-fetchable convenience — it would destroy the only record
+// that will ever exist of what a since-gone identity did.
 
 /// One node's last attestation attempt — successful or not.
 ///
@@ -70,7 +74,13 @@ pub struct Attested {
     pub runtime_replay_ok: bool,
 
     pub event_count: usize,
-    /// Most recent events, oldest first; `event_count - events.len()` were dropped.
+    /// The signer's complete trace, oldest first.
+    ///
+    /// It is the CVM's log, not the app's: every app on that machine measures into
+    /// the same RTMR3, so this contains other apps' operations too, plus
+    /// machine-scoped ones (docker_login, add_to_whitelist, claim_config) that
+    /// carry no app id at all. Splitting it per app is a presentation concern —
+    /// see the events endpoint.
     pub events: Vec<RuntimeEvent>,
     /// Non-empty when the check hit a problem worth showing but still produced a
     /// result (e.g. report_data could not be read).
@@ -126,7 +136,6 @@ impl Entry {
                 hits: m.hits(),
                 total: m.components.len(),
             });
-        let dropped = status.runtime_events.len().saturating_sub(KEEP_EVENTS);
         Self {
             app_id: app_id.to_string(),
             signer: status.signer.clone(),
@@ -154,7 +163,7 @@ impl Entry {
                 .collect(),
             runtime_replay_ok: status.runtime_replay_ok(),
             event_count: status.runtime_events.len(),
-            events: status.runtime_events.iter().skip(dropped).cloned().collect(),
+            events: status.runtime_events.clone(),
             note: status.note.clone(),
             }),
         }

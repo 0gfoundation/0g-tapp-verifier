@@ -465,113 +465,144 @@ pub struct Entry {
     pub identity_change: bool,
 }
 
-/// One signer's stint as a node of this app: registered at a block, possibly
-/// retired at a later one.
-///
-/// Deliberately flat — one row per registration, with no attempt to chain
-/// registrations into longer-lived "nodes". Only `updateNode` records a link
-/// between an outgoing and incoming signer, and it is used for a minority of
-/// changes (9 of 63 node events on the live registry); everywhere else a change
-/// is a remove followed by an add, with nothing tying them together. Worse, even
-/// an explicit link is only the owner ASSERTING that one replaces the other —
-/// a signer says nothing about hardware, so a chained view would present an
-/// unverifiable claim as structure. The same address can also be registered
-/// several times over an app's life, so rows are per registration, not per signer.
+/// One stretch during which a signer was a registered node of this app.
 #[derive(Debug, Clone, Serialize)]
-pub struct Registration {
-    pub signer: String,
+pub struct Interval {
     pub from_block: u64,
-    /// `None` while this registration is still active.
+    /// `None` while the registration is still active.
     pub to_block: Option<u64>,
+}
+
+/// Everything the chain says about one signer of this app.
+///
+/// Keyed by signer, not by registration: a signer is derived afresh on every tapp
+/// restart, so the same address reappearing means the same running instance — the
+/// same boot, the same RTMRs, the same event-log trace. Registering it, removing
+/// it and registering it again is on-chain bookkeeping of one identity, so those
+/// stretches are `intervals` of a single row.
+///
+/// (That rests on "same address ⇒ same boot". If signer derivation ever became
+/// deterministic across restarts, one address could span two boots with two
+/// different traces and this row would conflate them. It would be visible: the
+/// trace resets.)
+///
+/// There is deliberately no attempt to chain DIFFERENT signers into longer-lived
+/// "nodes". Only `updateNode` records such a link, and it accounts for a minority
+/// of changes (9 of 63 node events on the live registry); elsewhere a change is a
+/// remove plus an add with nothing tying them together. Even the explicit link is
+/// only the owner asserting that one replaces the other — a signer says nothing
+/// about hardware — so chaining would render an unverifiable claim as structure.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignerHistory {
+    pub signer: String,
+    /// Registration stretches, in block order.
+    pub intervals: Vec<Interval>,
     /// Code/config updates that landed while this signer was serving the app.
     /// App-level updates count for every signer active at the time; a per-node
     /// override counts only for its own.
     pub code_updates: usize,
 }
 
-impl Registration {
+impl SignerHistory {
     pub fn is_current(&self) -> bool {
-        self.to_block.is_none()
+        self.intervals.iter().any(|i| i.to_block.is_none())
     }
+
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Timeline {
     pub app_id: String,
     pub entries: Vec<Entry>,
-    /// Every signer registration, in block order.
-    pub registrations: Vec<Registration>,
+    /// Every signer that has served this app, in order of first appearance.
+    pub signers: Vec<SignerHistory>,
 }
 
 impl Timeline {
     fn build<'a>(app_id: String, events: impl Iterator<Item = &'a AppEvent>) -> Self {
-        let mut signers: BTreeSet<String> = BTreeSet::new();
+        let mut active: BTreeSet<String> = BTreeSet::new();
         let mut entries: Vec<Entry> = Vec::new();
-        let mut registrations: Vec<Registration> = Vec::new();
-
-        // Close the open registration(s) of the given signers, or of everyone
-        // when `signer` is None (the app was unregistered).
-        fn retire(regs: &mut [Registration], signer: Option<&str>, block: u64) {
-            for r in regs.iter_mut().filter(|r| r.is_current()) {
-                if signer.map(|s| r.signer == s).unwrap_or(true) {
-                    r.to_block = Some(block);
-                }
-            }
-        }
+        let mut signers: Vec<SignerHistory> = Vec::new();
+        let mut index: BTreeMap<String, usize> = BTreeMap::new();
 
         for e in events {
-            let before = signers.clone();
-            match &e.event {
-                Event::NodeAdded { signer, .. } => {
-                    signers.insert(signer.clone());
-                    registrations.push(Registration {
+            let before = active.clone();
+
+            // Open a registration stretch for `signer`, reusing its row.
+            let mut register = |signer: &String, block: u64, signers: &mut Vec<SignerHistory>| {
+                let i = *index.entry(signer.clone()).or_insert_with(|| {
+                    signers.push(SignerHistory {
                         signer: signer.clone(),
-                        from_block: e.block,
-                        to_block: None,
+                        intervals: Vec::new(),
                         code_updates: 0,
                     });
+                    signers.len() - 1
+                });
+                // Removed and re-added within the SAME block — an updateNode
+                // shuffle, common when breaking a replacement cycle. The node was
+                // never actually out of service, so continue the interval instead
+                // of splitting it at a boundary that has no duration.
+                match signers[i].intervals.last_mut() {
+                    Some(last) if last.to_block == Some(block) => last.to_block = None,
+                    _ => signers[i].intervals.push(Interval {
+                        from_block: block,
+                        to_block: None,
+                    }),
+                }
+            };
+            // Close the open stretch of `signer`, or of every signer when None.
+            let retire = |signer: Option<&str>, block: u64, signers: &mut Vec<SignerHistory>| {
+                for h in signers.iter_mut() {
+                    if signer.map(|s| h.signer == s).unwrap_or(true) {
+                        for i in h.intervals.iter_mut().filter(|i| i.to_block.is_none()) {
+                            i.to_block = Some(block);
+                        }
+                    }
+                }
+            };
+
+            match &e.event {
+                Event::NodeAdded { signer, .. } => {
+                    active.insert(signer.clone());
+                    register(signer, e.block, &mut signers);
                 }
                 Event::NodeRemoved { signer, .. } => {
-                    signers.remove(signer);
-                    retire(&mut registrations, Some(signer), e.block);
+                    active.remove(signer);
+                    retire(Some(signer), e.block, &mut signers);
                 }
                 Event::NodeReplaced {
                     old_signer,
                     new_signer,
                     ..
                 } => {
-                    signers.remove(old_signer);
-                    signers.insert(new_signer.clone());
-                    retire(&mut registrations, Some(old_signer), e.block);
-                    registrations.push(Registration {
-                        signer: new_signer.clone(),
-                        from_block: e.block,
-                        to_block: None,
-                        code_updates: 0,
-                    });
+                    active.remove(old_signer);
+                    active.insert(new_signer.clone());
+                    retire(Some(old_signer), e.block, &mut signers);
+                    register(new_signer, e.block, &mut signers);
                 }
                 // AppUnregistered leaves no nodes behind.
                 Event::AppUnregistered { .. } => {
-                    signers.clear();
-                    retire(&mut registrations, None, e.block);
+                    active.clear();
+                    retire(None, e.block, &mut signers);
                 }
                 // An app-level update applies to every node currently serving it.
                 Event::AppUpdated { .. } => {
-                    for r in registrations.iter_mut().filter(|r| r.is_current()) {
-                        r.code_updates += 1;
+                    for h in signers.iter_mut().filter(|h| h.is_current()) {
+                        h.code_updates += 1;
                     }
                 }
                 // A per-node override counts only for its own node — and only when
                 // it is a later CHANGE. The contract emits NodeCode on add and on
-                // update alike, so the one in a registration's own block is that
-                // node's initial value; counting it would report every node as
+                // update alike, so the one in a node's own registration block is
+                // that node's initial value; counting it would report every node as
                 // having had a code update the moment it joined.
                 Event::NodeCode { signer, .. } => {
-                    for r in registrations
-                        .iter_mut()
-                        .filter(|r| r.is_current() && &r.signer == signer && r.from_block != e.block)
-                    {
-                        r.code_updates += 1;
+                    for h in signers.iter_mut().filter(|h| {
+                        h.is_current()
+                            && &h.signer == signer
+                            && h.intervals.iter().all(|i| i.from_block != e.block)
+                    }) {
+                        h.code_updates += 1;
                     }
                 }
                 _ => {}
@@ -581,15 +612,15 @@ impl Timeline {
                 block: e.block,
                 tx: e.tx.clone(),
                 event: e.event.clone(),
-                signers: signers.iter().cloned().collect(),
-                identity_change: signers != before,
+                signers: active.iter().cloned().collect(),
+                identity_change: active != before,
             });
         }
 
         Timeline {
             app_id,
             entries,
-            registrations,
+            signers,
         }
     }
 
@@ -917,14 +948,14 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(t.registrations.len(), 2);
-        assert_eq!(t.registrations[0].signer, "0xaaa");
-        assert_eq!(t.registrations[0].from_block, 100);
-        assert_eq!(t.registrations[0].to_block, Some(120));
-        assert_eq!(t.registrations[0].code_updates, 1);
-        assert_eq!(t.registrations[1].signer, "0xbbb");
-        assert!(t.registrations[1].is_current());
-        assert_eq!(t.registrations[1].code_updates, 1);
+        assert_eq!(t.signers.len(), 2);
+        assert_eq!(t.signers[0].signer, "0xaaa");
+        assert_eq!(t.signers[0].intervals[0].from_block, 100);
+        assert_eq!(t.signers[0].intervals[0].to_block, Some(120));
+        assert_eq!(t.signers[0].code_updates, 1);
+        assert_eq!(t.signers[1].signer, "0xbbb");
+        assert!(t.signers[1].is_current());
+        assert_eq!(t.signers[1].code_updates, 1);
 
         // Only the replacement is an identity change.
         let changes: Vec<u64> = t
@@ -937,19 +968,21 @@ mod tests {
         assert_eq!(t.current_signers(), vec!["0xbbb"]);
     }
 
-    /// The same address can serve, leave, and be registered again. Rows are per
-    /// registration, so it gets two of them rather than one merged stint.
+    /// The same address can serve, leave, and be registered again. Because a
+    /// signer is re-derived on restart, the same address means the same running
+    /// instance — one row, two intervals, not two identities.
     #[test]
-    fn a_re_registered_signer_gets_a_second_row() {
+    fn a_re_registered_signer_stays_one_row_with_two_intervals() {
         let t = timeline(vec![
             (10, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 1 }),
             (20, Event::NodeRemoved { signer: "0xaaa".into(), ack_version: 2 }),
             (900, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 3 }),
         ]);
-        assert_eq!(t.registrations.len(), 2);
-        assert_eq!(t.registrations[0].to_block, Some(20));
-        assert_eq!(t.registrations[1].from_block, 900);
-        assert!(t.registrations[1].is_current());
+        assert_eq!(t.signers.len(), 1);
+        assert_eq!(t.signers[0].intervals.len(), 2);
+        assert_eq!(t.signers[0].intervals[0].to_block, Some(20));
+        assert_eq!(t.signers[0].intervals[1].from_block, 900);
+        assert!(t.signers[0].is_current());
     }
 
     /// An app-level update counts for every node then serving the app; a per-node
@@ -971,23 +1004,23 @@ mod tests {
             (40, Event::NodeCode { signer: "0xbbb".into(), compose: "n".into(),
                                    volumes: String::new() }),
         ]);
-        let by = |s: &str| t.registrations.iter().find(|r| r.signer == s).unwrap().code_updates;
+        let by = |s: &str| t.signers.iter().find(|h| h.signer == s).unwrap().code_updates;
         assert_eq!(by("0xaaa"), 1); // the app-level update only
         assert_eq!(by("0xbbb"), 2); // app-level + its own later override
     }
 
     #[test]
-    fn a_multi_node_app_keeps_one_row_per_node() {
+    fn removing_one_node_does_not_retire_the_others() {
         let t = timeline(vec![
             (10, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 1 }),
             (20, Event::NodeAdded { signer: "0xbbb".into(), ack_version: 2 }),
             (30, Event::NodeRemoved { signer: "0xaaa".into(), ack_version: 3 }),
         ]);
         assert_eq!(t.current_signers(), vec!["0xbbb"]);
-        assert_eq!(t.registrations.len(), 2);
-        // Removing one node must not retire the other.
-        assert_eq!(t.registrations[0].to_block, Some(30));
-        assert!(t.registrations[1].is_current());
+        assert_eq!(t.signers.len(), 2);
+        assert_eq!(t.signers[0].intervals[0].to_block, Some(30));
+        assert!(!t.signers[0].is_current());
+        assert!(t.signers[1].is_current());
     }
 
     #[test]
@@ -997,24 +1030,41 @@ mod tests {
             (10, Event::NodeAdded { signer: "0xbbb".into(), ack_version: 2 }),
             (20, Event::AppUnregistered { owner: "0xowner".into() }),
         ]);
-        assert!(t.registrations.iter().all(|r| r.to_block == Some(20)));
+        assert!(t.signers.iter().all(|h| !h.is_current()));
         assert!(t.current_signers().is_empty());
     }
 
-    /// register → unregister → re-register much later (seen on 0g-sandbox-provider).
-    /// The gap must not be absorbed into the earlier row.
+    /// register → unregister → re-register with a DIFFERENT signer much later
+    /// (seen on 0g-sandbox-provider). The gap must not be absorbed into the
+    /// earlier signer's interval.
     #[test]
-    fn a_later_registration_does_not_extend_a_retired_one() {
+    fn a_later_signer_does_not_extend_a_retired_one() {
         let t = timeline(vec![
             (100, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 1 }),
             (200, Event::NodeRemoved { signer: "0xaaa".into(), ack_version: 2 }),
             (200, Event::AppUnregistered { owner: "0xowner".into() }),
             (900, Event::NodeAdded { signer: "0xbbb".into(), ack_version: 3 }),
         ]);
-        assert_eq!(t.registrations.len(), 2);
-        assert_eq!(t.registrations[0].to_block, Some(200));
-        assert_eq!(t.registrations[1].from_block, 900);
-        assert!(t.registrations[1].is_current());
+        assert_eq!(t.signers.len(), 2);
+        assert_eq!(t.signers[0].intervals[0].to_block, Some(200));
+        assert_eq!(t.signers[1].intervals[0].from_block, 900);
+        assert!(t.signers[1].is_current());
+    }
+
+    /// Seen on 0g-kms-dev: a node removed and re-added in the same block while an
+    /// operator shuffles registrations. It never left service, so it stays one
+    /// interval rather than gaining a zero-length gap.
+    #[test]
+    fn a_same_block_shuffle_does_not_split_the_interval() {
+        let t = timeline(vec![
+            (10, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 1 }),
+            (50, Event::NodeRemoved { signer: "0xaaa".into(), ack_version: 2 }),
+            (50, Event::NodeAdded { signer: "0xaaa".into(), ack_version: 3 }),
+        ]);
+        assert_eq!(t.signers.len(), 1);
+        assert_eq!(t.signers[0].intervals.len(), 1);
+        assert_eq!(t.signers[0].intervals[0].from_block, 10);
+        assert!(t.signers[0].is_current());
     }
 
     #[test]
@@ -1024,7 +1074,7 @@ mod tests {
             (20, Event::Acknowledged { user: "0xu".into(), ack_version: 1 }),
             (30, Event::AckRevoked { user: "0xu".into() }),
         ]);
-        assert_eq!(t.registrations[0].code_updates, 0);
+        assert_eq!(t.signers[0].code_updates, 0);
         assert!(!t.entries[1].identity_change);
     }
 }

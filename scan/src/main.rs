@@ -182,10 +182,10 @@ async fn main() -> Result<()> {
                 let t = registry.timeline(&app);
                 let signers = t.current_signers();
                 println!(
-                    "  {:<34} {:>3} events  {:>2} registration(s)  {:>2} node(s)  {}",
+                    "  {:<34} {:>3} events  {:>2} signer(s) ever  {:>2} node(s)  {}",
                     app,
                     t.entries.len(),
-                    t.registrations.len(),
+                    t.signers.len(),
                     signers.len(),
                     attestation_summary(&store, &app, &signers, now)
                 );
@@ -200,19 +200,27 @@ async fn main() -> Result<()> {
             }
             println!("{}  —  {} event(s)\n", t.app_id, t.entries.len());
 
-            println!("signer registrations:");
-            for r in &t.registrations {
-                let until = match r.to_block {
-                    Some(b) => b.to_string(),
-                    None => "now".to_string(),
-                };
+            println!("signers:");
+            for h in &t.signers {
+                // Several intervals means the address was removed and registered
+                // again — the same instance, re-recorded on chain.
+                let spans: Vec<String> = h
+                    .intervals
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{}..{}",
+                            i.from_block,
+                            i.to_block.map(|b| b.to_string()).unwrap_or("now".into())
+                        )
+                    })
+                    .collect();
                 println!(
-                    "  {}  blocks {}..{:<9}  {} code update(s){}",
-                    r.signer,
-                    r.from_block,
-                    until,
-                    r.code_updates,
-                    if r.is_current() {
+                    "  {}  {}  {} code update(s){}",
+                    h.signer,
+                    spans.join(", "),
+                    h.code_updates,
+                    if h.is_current() {
                         "  ← current, attestable"
                     } else {
                         "  (retired — cannot be re-attested)"

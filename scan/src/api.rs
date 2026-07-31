@@ -73,8 +73,8 @@ struct AppSummary {
     /// True when the plaintext app id could not be recovered and this is a hash.
     unnamed: bool,
     events: usize,
-    /// Signer registrations over the app's whole life, current ones included.
-    registrations: usize,
+    /// Distinct signers that have ever served this app, current ones included.
+    signers_ever: usize,
     /// Node signers currently registered on chain. These, and only these, can
     /// obtain the app's KMS key — which is why the count of registered nodes and
     /// the count of VERIFIED ones are reported separately and never merged.
@@ -116,7 +116,7 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
             AppSummary {
                 unnamed: app_id.starts_with("0x") && app_id.len() == 66,
                 events: t.entries.len(),
-                registrations: t.registrations.len(),
+                signers_ever: t.signers.len(),
                 latest_block: t.latest_block(),
                 images,
                 attested: cached.iter().filter(|e| e.attested.is_some()).count(),
@@ -156,47 +156,31 @@ async fn app_detail(
         })
         .collect();
 
-    // Retired registrations carry whatever was cached for them while they were
-    // live. That result can never be reproduced — the node's RTMRs are gone — so
-    // it is served with a flag saying so rather than silently omitted.
-    //
-    // The store holds ONE result per (app, signer), so when the same address was
-    // registered more than once it can only describe the most recent of those
-    // registrations. Attaching it to the earlier ones too would date a result to a
-    // stint it was not taken in.
-    let latest_of_signer: std::collections::HashMap<&str, usize> = timeline
-        .registrations
+    // A retired signer carries whatever was cached while it was live. That result
+    // can never be reproduced — its RTMRs are gone — so it is served with a flag
+    // saying so rather than silently omitted.
+    let signers: Vec<serde_json::Value> = timeline
+        .signers
         .iter()
-        .enumerate()
-        .map(|(i, r)| (r.signer.as_str(), i))
-        .collect();
-    let registrations: Vec<serde_json::Value> = timeline
-        .registrations
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let result = (latest_of_signer.get(r.signer.as_str()) == Some(&i))
-                .then(|| s.store.get(&app_id, &r.signer))
-                .flatten();
+        .map(|h| {
             json!({
-                "signer": r.signer,
-                "from_block": r.from_block,
-                "to_block": r.to_block,
-                "code_updates": r.code_updates,
-                "current": r.is_current(),
-                "last_result": result.map(|e| json!({
+                "signer": h.signer,
+                "intervals": h.intervals,
+                "code_updates": h.code_updates,
+                "current": h.is_current(),
+                "last_result": s.store.get(&app_id, &h.signer).map(|e| json!({
                     "checked_at": e.checked_at,
                     "image": e.image(),
                     "error": e.error,
                 })),
-                "reverifiable": r.is_current(),
+                "reverifiable": h.is_current(),
             })
         })
         .collect();
 
     Ok(Json(json!({
         "app_id": timeline.app_id,
-        "registrations": registrations,
+        "signers": signers,
         "history": timeline.entries,
         "current_signers": timeline.current_signers(),
         "nodes": nodes,
@@ -210,15 +194,34 @@ struct EventQuery {
     signer: Option<String>,
     /// Restrict to one measured operation (start_app, get_app_secret_key, …).
     operation: Option<String>,
-    /// Only events measured for this app id; the log covers the whole node.
-    #[serde(default)]
-    this_app_only: bool,
+    /// Which slice of the machine's trace to return: `app` (this app plus the
+    /// unattributable machine-scoped events — the default), `others` (what the
+    /// other apps on the same machine did), or `all`.
+    scope: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
 
 fn default_limit() -> usize {
-    100
+    200
+}
+
+/// Which apps' events a scope admits.
+///
+/// The trace belongs to the CVM, not to one app: every app on the machine measures
+/// into the same RTMR3. Operations that carry no app id at all (docker_login,
+/// add_to_whitelist, claim_config, withdraw_balance) cannot be attributed to any
+/// one app, so they are shown under EVERY app on the machine rather than hidden or
+/// arbitrarily assigned.
+fn in_scope(scope: &str, event_app: Option<&str>, app_id: &str) -> bool {
+    match (scope, event_app) {
+        ("all", _) => true,
+        // Unattributable: belongs to no app, so it is everyone's business.
+        (_, None) => true,
+        ("others", Some(a)) => a != app_id,
+        // "app" and anything unrecognised.
+        (_, Some(a)) => a == app_id,
+    }
 }
 
 /// The measured runtime event log, newest last. Paged because a long-lived node's
@@ -244,28 +247,27 @@ async fn app_events(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let scope = q.scope.as_deref().unwrap_or("app");
     let nodes: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
-            let (total, kept, events) = match &e.attested {
+            let (total, matched, events) = match &e.attested {
                 Some(a) => {
                     let filtered: Vec<&crate::attest::RuntimeEvent> = a
                         .events
                         .iter()
                         .filter(|ev| {
-                            q.operation
-                                .as_deref()
-                                .map(|op| ev.operation == op)
-                                .unwrap_or(true)
-                                && (!q.this_app_only || ev.app_id() == Some(app_id.as_str()))
+                            in_scope(scope, ev.app_id(), &app_id)
+                                && q.operation
+                                    .as_deref()
+                                    .map(|op| ev.operation == op)
+                                    .unwrap_or(true)
                         })
                         .collect();
+                    // Newest are the interesting ones, so drop from the front and
+                    // say how many were dropped.
                     let skip = filtered.len().saturating_sub(q.limit);
-                    (
-                        a.event_count,
-                        a.events.len(),
-                        filtered.into_iter().skip(skip).collect::<Vec<_>>(),
-                    )
+                    (a.event_count, filtered.len(), filtered.into_iter().skip(skip).collect::<Vec<_>>())
                 }
                 None => (0, 0, vec![]),
             };
@@ -273,14 +275,17 @@ async fn app_events(
                 "signer": e.signer,
                 "checked_at": e.checked_at,
                 "error": e.error,
-                // total_on_node vs cached makes the truncation explicit rather
-                // than letting a partial log look complete.
-                "total_on_node": total,
-                "cached": kept,
+                // The trace covers the whole machine; these three numbers say how
+                // much of it this response actually shows.
+                "trace_total": total,
+                "in_scope": matched,
+                "returned": events.len(),
                 "events": events,
             })
         })
         .collect();
 
-    Ok(Json(json!({"app_id": app_id, "nodes": nodes, "now": now()})))
+    Ok(Json(
+        json!({"app_id": app_id, "scope": scope, "nodes": nodes, "now": now()}),
+    ))
 }
