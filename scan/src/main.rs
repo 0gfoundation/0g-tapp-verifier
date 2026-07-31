@@ -6,6 +6,7 @@
 //! Anyone who does not want to trust this cache can verify directly —
 //! `tapp-cli verify-app` (layer 2) or a self-hosted trustee (layer 1).
 
+mod api;
 mod attest;
 mod chain;
 mod refvalues;
@@ -117,6 +118,20 @@ enum Command {
         /// Stop after this many rounds (0 = run forever)
         #[arg(long, default_value_t = 0)]
         rounds: u64,
+    },
+    /// Run the refresh loop and serve the read-only HTTP interface. This is the
+    /// deployable form of tappscan.
+    Serve {
+        #[command(flatten)]
+        attest: AttestOpts,
+
+        /// Address to listen on
+        #[arg(long, env = "TAPPSCAN_BIND", default_value = "0.0.0.0:8088")]
+        bind: String,
+
+        /// Seconds between chain syncs
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
     },
 }
 
@@ -330,6 +345,76 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("chain sync failed: {e}"),
                 }
             }
+        }
+
+        Command::Serve {
+            attest: opts,
+            bind,
+            interval,
+        } => {
+            let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
+            let shared: api::AppState = std::sync::Arc::new(tokio::sync::RwLock::new(api::Shared {
+                registry,
+                store: status::Store::load(&cli.status),
+                refreshed_at: unix_now(),
+            }));
+
+            // The refresh loop is the ONLY thing that touches nodes or the AS;
+            // serving is pure reads of what it has already established.
+            let refresher = {
+                let shared = shared.clone();
+                let scanner = scanner.clone();
+                let status_path = cli.status.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let (apps, jobs) = {
+                            let s = shared.read().await;
+                            let apps = s.registry.apps();
+                            let jobs = plan(&s.registry, &s.store, &apps, &opts, false, unix_now());
+                            (apps.len(), jobs)
+                        };
+                        if !jobs.is_empty() {
+                            tracing::info!("{apps} apps: attesting {} node(s)", jobs.len());
+                            // Work on a copy so readers are never blocked while
+                            // megabytes move over the network.
+                            let mut store = shared.read().await.store.clone();
+                            let done = run_jobs(
+                                scanner.clone(),
+                                &mut store,
+                                jobs,
+                                &opts,
+                                ref_sets.clone(),
+                            )
+                            .await;
+                            if let Err(e) = store.save(&status_path) {
+                                tracing::warn!("could not save status cache: {e}");
+                            }
+                            let mut s = shared.write().await;
+                            s.store = store;
+                            s.refreshed_at = unix_now();
+                            tracing::info!("{done} node(s) attested");
+                        } else {
+                            shared.write().await.refreshed_at = unix_now();
+                        }
+
+                        tokio::time::sleep(Duration::from_secs(interval)).await;
+                        match scanner.sync().await {
+                            Ok((r, added)) => {
+                                if added > 0 {
+                                    tracing::info!("{added} new chain event(s)");
+                                }
+                                shared.write().await.registry = r;
+                            }
+                            Err(e) => tracing::warn!("chain sync failed: {e}"),
+                        }
+                    }
+                })
+            };
+
+            let listener = tokio::net::TcpListener::bind(&bind).await?;
+            tracing::info!("serving on http://{bind}");
+            axum::serve(listener, api::router(shared)).await?;
+            refresher.abort();
         }
     }
     Ok(())

@@ -1,0 +1,181 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tappscan</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --dim:#666; --line:#e3e3e3; --ok:#137333; --bad:#b3261e; --warn:#8a6100; --card:#fafafa; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e6e6; --dim:#9aa0a6; --line:#2c2f36; --ok:#7ee2a8; --bad:#ff8a80; --warn:#ffcc80; --card:#1d2025; }
+  }
+  * { box-sizing: border-box }
+  body { margin:0; padding:1.5rem; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  h1 { font-size:1.1rem; margin:0 0 .25rem }
+  .sub { color:var(--dim); margin-bottom:1.25rem }
+  .sub b { color:var(--fg); font-weight:600 }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:600; }
+  tbody tr:hover { background:var(--card); cursor:pointer }
+  .num { text-align:right }
+  .ok { color:var(--ok) } .bad { color:var(--bad) } .warn { color:var(--warn) } .dim { color:var(--dim) }
+  .wrap { overflow-x:auto }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:.9rem; margin:.75rem 0 }
+  .card h3 { margin:0 0 .5rem; font-size:.95rem }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.15rem .9rem }
+  .kv dt { color:var(--dim) } .kv dd { margin:0; overflow-wrap:anywhere }
+  button { font:inherit; background:none; border:1px solid var(--line); color:var(--fg);
+           border-radius:4px; padding:.25rem .6rem; cursor:pointer }
+  button:hover { background:var(--card) }
+  .note { color:var(--dim); font-size:.9em; margin-top:1.5rem; border-top:1px solid var(--line); padding-top:.75rem }
+  pre { margin:0; overflow-x:auto }
+</style>
+
+<h1>tappscan</h1>
+<div class="sub" id="head">loading…</div>
+<div id="view"></div>
+
+<div class="note">
+  Layer 3 of the verification stack: a cache. Every result below is <em>as of</em> the
+  time shown — a node may have restarted since, which changes its signer and resets
+  its RTMRs. To verify a node yourself instead of trusting this page, use
+  <code>tapp-cli verify-app</code> (layer 2) or run your own trustee (layer 1).
+  <br>
+  <code>teeUrl</code> is supplied by whoever registered the node. It is not attested.
+</div>
+
+<script>
+const $ = (h) => { const d = document.createElement('div'); d.innerHTML = h; return d.firstElementChild }
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+const short = (s, n = 10) => s && s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-4) : (s ?? '')
+
+function age(secs) {
+  if (secs == null) return '—'
+  if (secs < 60) return secs + 's ago'
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago'
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago'
+  return Math.floor(secs / 86400) + 'd ago'
+}
+
+async function get(path) {
+  const r = await fetch(path)
+  if (!r.ok) throw new Error(path + ' → ' + r.status)
+  return r.json()
+}
+
+function imageCell(a) {
+  if (!a.signers.length) return '<span class="dim">no active node</span>'
+  if (!a.attested && !a.failed) return '<span class="dim">not attested yet</span>'
+  if (a.failed === a.attested + a.failed) return '<span class="bad">✗ all attempts failed</span>'
+  if (a.images.length === 1) return '<span class="ok">✓ ' + esc(a.images[0]) + '</span>'
+  if (a.images.length > 1) return '<span class="warn">' + a.images.length + ' different images</span>'
+  return '<span class="warn">image unknown</span>'
+}
+
+async function showList() {
+  location.hash = ''
+  const [h, apps] = await Promise.all([get('/api/health'), get('/api/apps')])
+  document.getElementById('head').innerHTML =
+    `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id} · block <b>${h.scanned_to_block}</b> ·
+     ${h.apps} apps · ${h.events} events · refreshed ${age(h.now - h.refreshed_at)}`
+
+  const rows = apps.map(a => `
+    <tr data-app="${esc(a.app_id)}">
+      <td>${a.unnamed ? '<span class="dim" title="plaintext app id could not be recovered">' + short(a.app_id) + '</span>' : esc(a.app_id)}</td>
+      <td class="num">${a.events}</td>
+      <td class="num">${a.epochs}</td>
+      <td class="num">${a.signers.length}</td>
+      <td>${imageCell(a)}</td>
+      <td class="dim">${age(a.oldest_result_age)}</td>
+    </tr>`).join('')
+
+  const view = document.getElementById('view')
+  view.innerHTML = `<div class="wrap"><table>
+    <thead><tr><th>app</th><th class="num">events</th><th class="num">identities</th>
+    <th class="num">nodes</th><th>image</th><th>as of</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`
+  view.querySelectorAll('tr[data-app]').forEach(tr =>
+    tr.onclick = () => showApp(tr.dataset.app))
+}
+
+function nodeCard(n, now) {
+  const a = n.attested
+  if (!a) return `<div class="card"><h3>${esc(n.signer)}</h3>
+    <div class="bad">✗ ${esc(n.error || 'not attested')}</div>
+    <div class="dim">${n.tee_url ? esc(n.tee_url) + ' · ' : ''}${n.checked_at ? 'attempted ' + age(now - n.checked_at) : ''}</div></div>`
+
+  const diff = a.closest
+    ? `<span class="warn">✗ unknown</span> — closest ${a.closest.hits}/${a.closest.total}
+       <code>${esc(a.closest.label)}</code>, differs in <b>${a.closest.failed.map(esc).join(', ')}</b>`
+    : (a.image ? `<span class="ok">✓ ${esc(a.image)}</span>` : '<span class="warn">✗ unknown</span>')
+
+  const measured = a.image ? '' : Object.entries(a.measured || {})
+    .map(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`).join('\n')).join('\n')
+
+  return `<div class="card">
+    <h3>${esc(n.signer)}</h3>
+    <dl class="kv">
+      <dt>teeUrl</dt><dd>${esc(n.tee_url)} <span class="dim">(unattested)</span></dd>
+      <dt>signer bound</dt><dd>${a.signer_ok
+        ? '<span class="ok">✓</span> the quote attests this address'
+        : '<span class="bad">✗</span> quote attests ' + esc(a.attested_signer || 'nothing')}</dd>
+      <dt>quote</dt><dd>ear.status <b>${esc(a.ear_status)}</b> · platform TCB
+        <span class="${a.tcb_status === 'UpToDate' ? 'ok' : 'warn'}">${esc(a.tcb_status)}</span>${
+        a.advisories.length ? ' · ' + a.advisories.length + ' advisories' : ''}</dd>
+      <dt>boot chain</dt><dd>${diff} <span class="dim">(${esc(a.boot_format)})</span></dd>
+      <dt>event log</dt><dd>${a.event_count} measured operations · replay ${
+        a.runtime_replay_ok ? '<span class="ok">✓</span>' : '<span class="bad">✗ MISMATCH</span>'}
+        <button data-events="${esc(n.signer)}">show</button></dd>
+      <dt>as of</dt><dd>${age(now - n.checked_at)} <span class="dim">(${n.checked_at} unix)</span></dd>
+    </dl>${measured ? '<pre class="dim">' + esc(measured) + '</pre>' : ''}</div>`
+}
+
+async function showApp(appId) {
+  location.hash = encodeURIComponent(appId)
+  const d = await get('/api/apps/' + encodeURIComponent(appId))
+  const epochs = d.epochs.map((e, i) => `
+    <tr><td class="num">#${i + 1}</td>
+    <td>${e.from_block} → ${e.to_block ?? '<span class="ok">now</span>'}</td>
+    <td class="num">${e.code_updates}</td>
+    <td>${e.signers.map(s => esc(short(s, 8))).join(', ')}</td>
+    <td>${i === 0 ? '' : e.identity_changed
+      ? '<span class="warn">⇄ identity changed</span>'
+      : '<span class="dim">re-registered, same identity</span>'}</td></tr>`).join('')
+
+  document.getElementById('view').innerHTML = `
+    <p><button id="back">← all apps</button></p>
+    <h3>${esc(d.app_id)}</h3>
+    <div class="wrap"><table>
+      <thead><tr><th>identity</th><th>blocks</th><th class="num">code updates</th>
+      <th>signers</th><th></th></tr></thead><tbody>${epochs}</tbody></table></div>
+    ${d.nodes.map(n => nodeCard(n, d.now)).join('')}`
+
+  document.getElementById('back').onclick = showList
+  document.querySelectorAll('button[data-events]').forEach(b =>
+    b.onclick = () => showEvents(appId, b.dataset.events))
+}
+
+async function showEvents(appId, signer) {
+  const d = await get(`/api/apps/${encodeURIComponent(appId)}/events?signer=${signer}&limit=200`)
+  const n = d.nodes[0] || {}
+  const rows = (n.events || []).slice().reverse().map(e => `
+    <tr><td class="dim">${e.payload?.timestamp ?? ''}</td>
+      <td>${esc(e.operation)}</td>
+      <td class="dim">${esc(e.payload?.app_id ?? '—')}</td>
+      <td class="${e.payload?.result === 'success' ? 'ok' : 'dim'}">${esc(e.payload?.result ?? '')}</td>
+      <td class="dim">${short(e.digest, 8)}</td>
+      <td>${e.digest_matches ? '' : '<span class="bad">replay ✗</span>'}</td></tr>`).join('')
+
+  document.getElementById('view').insertAdjacentElement('afterbegin', $(`
+    <div class="card"><h3>event log · ${esc(short(signer, 8))}</h3>
+      <div class="dim">${n.cached} of ${n.total_on_node} shown — the log only ever
+        appends, and the cache keeps a recent window. Newest first.</div>
+      <div class="wrap"><table><thead><tr><th>timestamp</th><th>operation</th><th>app</th>
+        <th>result</th><th>digest</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+    </div>`))
+}
+
+const boot = () => location.hash ? showApp(decodeURIComponent(location.hash.slice(1))) : showList()
+boot().catch(e => document.getElementById('view').innerHTML =
+  '<p class="bad">' + esc(e.message) + '</p>')
+</script>
