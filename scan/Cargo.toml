@@ -7,6 +7,9 @@ license = "Apache-2.0"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tonic = "0.12"
+prost = "0.13"
+base64 = "0.22"
 ethers = { version = "2.0", default-features = false, features = ["legacy", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,3 +18,6 @@ hex = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tonic-build = "0.12"

@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+// Wire-compatible SUBSET of 0g-tapp's proto/tapp_service.proto, carrying only
+// the one method tappscan calls. Package, service, method and field numbers
+// match upstream, so this speaks to a real tapp-server unchanged; the rest of
+// the (large) service is omitted deliberately — vendoring only what is used
+// keeps the drift surface to a single stable RPC.
+//
+// Upstream: https://github.com/0gfoundation/0g-tapp/blob/main/proto/tapp_service.proto
+
+package tapp_service;
+
+service TappService {
+  // Get attestation evidence for an application. The TEE-derived signer EVM
+  // address of the app is used as report_data, which is what binds the quote to
+  // the on-chain node signer.
+  rpc GetEvidence(GetEvidenceRequest) returns (GetEvidenceResponse);
+}
+
+message GetEvidenceRequest {
+  string app_id = 1;
+}
+
+message GetEvidenceResponse {
+  bool success = 1;
+  string message = 2;
+  bytes evidence = 3;
+  string tee_type = 4;
+  int64 timestamp = 5;
+}

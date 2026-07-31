@@ -607,6 +607,55 @@ impl Scanner {
         })
     }
 
+    /// The `teeUrl` a node was registered with, via `getNode`. This is an
+    /// owner-supplied string, NOT an attested fact — it says where to ask for
+    /// evidence, and nothing more.
+    pub async fn node_tee_url(&self, app_id: &str, signer: &str) -> Result<String> {
+        use ethers::abi::{encode, Token};
+        use ethers::types::{Bytes, TransactionRequest};
+
+        let addr: Address = signer
+            .parse()
+            .with_context(|| format!("invalid signer address: {signer}"))?;
+        let mut data = selector("getNode(string,address)").to_vec();
+        data.extend_from_slice(&encode(&[
+            Token::String(app_id.to_string()),
+            Token::Address(addr),
+        ]));
+        let tx = TransactionRequest::new()
+            .to(self.contract)
+            .data(Bytes::from(data));
+        let out = self.provider.call(&tx.into(), None).await?;
+
+        // NodeInfo = (teeUrl, addedAt, stakeAmount, composeHash, volumesHash).
+        // Deployments predating the per-node code override return only the first
+        // three fields, so fall back rather than failing on an older registry.
+        let shapes = [
+            vec![
+                ParamType::String,
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Bytes,
+                ParamType::Bytes,
+            ],
+            vec![ParamType::String, ParamType::Uint(256), ParamType::Uint(256)],
+        ];
+        for shape in shapes {
+            if let Ok(tokens) = decode(&[ParamType::Tuple(shape)], &out) {
+                if let Some(url) = tokens
+                    .into_iter()
+                    .next()
+                    .and_then(|t| t.into_tuple())
+                    .and_then(|f| f.into_iter().next())
+                    .and_then(|t| t.into_string())
+                {
+                    return Ok(url);
+                }
+            }
+        }
+        Err(anyhow!("could not decode getNode response for {signer}"))
+    }
+
     /// Fetch logs over `[from, to]`, splitting the range on errors and on
     /// suspiciously full responses (providers that cap instead of erroring).
     async fn fetch_logs(&self, from: u64, to: u64) -> Result<Vec<Log>> {
