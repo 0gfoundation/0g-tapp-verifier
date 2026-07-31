@@ -139,41 +139,42 @@ async fn app_detail(
     if timeline.entries.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
-    // Node status without the event log; that has its own endpoint so a detail
-    // view does not have to ship thousands of entries.
-    let nodes: Vec<serde_json::Value> = timeline
-        .current_signers()
-        .iter()
-        .map(|signer| match s.store.get(&app_id, signer) {
-            Some(e) => {
-                let mut v = serde_json::to_value(e).unwrap_or(json!({}));
-                if let Some(a) = v.get_mut("attested").and_then(|a| a.as_object_mut()) {
-                    a.remove("events");
-                }
-                v
-            }
-            None => json!({"signer": signer, "checked_at": null, "error": "not attested yet"}),
-        })
-        .collect();
 
-    // A retired signer carries whatever was cached while it was live. That result
-    // can never be reproduced — its RTMRs are gone — so it is served with a flag
-    // saying so rather than silently omitted.
+    // The signer is the unit: each one carries its chain registration, its
+    // verification result, and its trace. Current and retired signers differ in
+    // exactly one way — whether the result can be produced again — so they are
+    // reported the same shape rather than as two different kinds of thing. A
+    // retired signer's cached result and trace are the only record that will ever
+    // exist of it, so they are served with a flag, not omitted.
+    //
+    // The trace itself is left to the events endpoint: it runs to thousands of
+    // entries, and a detail view should not have to ship them.
     let signers: Vec<serde_json::Value> = timeline
         .signers
         .iter()
         .map(|h| {
+            let entry = s.store.get(&app_id, &h.signer);
+            let mut status = entry
+                .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
+                .unwrap_or(json!(null));
+            let mut trace_events = 0;
+            if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
+                trace_events = a
+                    .get("events")
+                    .and_then(|e| e.as_array())
+                    .map(|e| e.len())
+                    .unwrap_or(0);
+                a.remove("events");
+            }
             json!({
                 "signer": h.signer,
                 "intervals": h.intervals,
                 "code_updates": h.code_updates,
                 "current": h.is_current(),
-                "last_result": s.store.get(&app_id, &h.signer).map(|e| json!({
-                    "checked_at": e.checked_at,
-                    "image": e.image(),
-                    "error": e.error,
-                })),
+                // A retired signer's RTMRs are gone with its instance.
                 "reverifiable": h.is_current(),
+                "status": status,
+                "trace_events": trace_events,
             })
         })
         .collect();
@@ -183,7 +184,6 @@ async fn app_detail(
         "signers": signers,
         "history": timeline.entries,
         "current_signers": timeline.current_signers(),
-        "nodes": nodes,
         "now": now(),
     })))
 }

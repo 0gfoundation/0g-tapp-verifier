@@ -108,35 +108,61 @@ async function showList() {
     tr.onclick = () => showApp(tr.dataset.app))
 }
 
-function nodeCard(n, now) {
-  const a = n.attested
-  if (!a) return `<div class="card"><h3>${esc(n.signer)}</h3>
-    <div class="bad">✗ ${esc(n.error || 'not attested')}</div>
-    <div class="dim">${n.tee_url ? esc(n.tee_url) + ' · ' : ''}${n.checked_at ? 'attempted ' + age(now - n.checked_at) : ''}</div></div>`
+// One card per SIGNER — current or retired, same shape. The signer is the unit
+// that carries a verification status and a trace; the only difference is whether
+// the result can be produced again, since a retired signer's RTMRs are gone with
+// its instance.
+function signerCard(h, now) {
+  const label = h.current
+    ? '<span class="ok">current</span>'
+    : '<span class="dim">retired — cannot be re-attested</span>'
+  const spans = h.intervals
+    .map(i => `${i.from_block} → ${i.to_block ?? '<span class="ok">now</span>'}`).join(', ')
+  const head = `<h3>${esc(h.signer)}</h3>
+    <dl class="kv">
+      <dt></dt><dd>${label}</dd>
+      <dt>registered</dt><dd>${spans} · ${h.code_updates} code update(s)</dd>`
+
+  const st = h.status
+  // The trace is worth offering whenever one was captured, retired or not — for a
+  // retired signer it is the only record that will ever exist.
+  const traceRow = h.trace_events
+    ? `<dt>trace</dt><dd>${h.trace_events} measured operations
+         <button data-events="${esc(h.signer)}">show</button></dd>`
+    : ''
+
+  if (!st) return `<div class="card">${head}
+    <dt>verification</dt><dd class="dim">never attested</dd></dl></div>`
+
+  const a = st.attested
+  if (!a) return `<div class="card">${head}
+      <dt>verification</dt><dd class="bad">✗ ${esc(st.error || 'failed')}</dd>
+      <dt>teeUrl</dt><dd>${esc(st.tee_url || '—')} <span class="dim">(unattested)</span></dd>
+      <dt>attempted</dt><dd>${age(now - st.checked_at)}</dd>
+    </dl></div>`
 
   const diff = a.closest
     ? `<span class="warn">✗ unknown</span> — closest ${a.closest.hits}/${a.closest.total}
        <code>${esc(a.closest.label)}</code>, differs in <b>${a.closest.failed.map(esc).join(', ')}</b>`
     : (a.image ? `<span class="ok">✓ ${esc(a.image)}</span>` : '<span class="warn">✗ unknown</span>')
-
   const measured = a.image ? '' : Object.entries(a.measured || {})
     .map(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`).join('\n')).join('\n')
 
-  return `<div class="card">
-    <h3>${esc(n.signer)}</h3>
-    <dl class="kv">
-      <dt>teeUrl</dt><dd>${esc(n.tee_url)} <span class="dim">(unattested)</span></dd>
+  return `<div class="card">${head}
+      <dt>teeUrl</dt><dd>${esc(st.tee_url)} <span class="dim">(unattested)</span></dd>
       <dt>signer bound</dt><dd>${a.signer_ok
         ? '<span class="ok">✓</span> the quote attests this address'
-        : '<span class="bad">✗</span> quote attests ' + esc(a.attested_signer || 'nothing')}</dd>
+        : '<span class="bad">✗</span> the quote attests ' + esc(a.attested_signer || 'nothing') +
+          ' — this registration no longer matches the running instance'}</dd>
       <dt>quote</dt><dd>ear.status <b>${esc(a.ear_status)}</b> · platform TCB
         <span class="${a.tcb_status === 'UpToDate' ? 'ok' : 'warn'}">${esc(a.tcb_status)}</span>${
         a.advisories.length ? ' · ' + a.advisories.length + ' advisories' : ''}</dd>
       <dt>boot chain</dt><dd>${diff} <span class="dim">(${esc(a.boot_format)})</span></dd>
-      <dt>event log</dt><dd>${a.event_count} measured operations · replay ${
-        a.runtime_replay_ok ? '<span class="ok">✓</span>' : '<span class="bad">✗ MISMATCH</span>'}
-        <button data-events="${esc(n.signer)}">show</button></dd>
-      <dt>as of</dt><dd>${age(now - n.checked_at)} <span class="dim">(${n.checked_at} unix)</span></dd>
+      ${traceRow}
+      <dt>replay</dt><dd>${a.runtime_replay_ok
+        ? '<span class="ok">✓</span> every measured operation reproduces its digest'
+        : '<span class="bad">✗ MISMATCH</span>'}</dd>
+      <dt>as of</dt><dd>${age(now - st.checked_at)} <span class="dim">(${st.checked_at} unix)</span></dd>
     </dl>${measured ? '<pre class="dim">' + esc(measured) + '</pre>' : ''}</div>`
 }
 
@@ -144,39 +170,21 @@ async function showApp(appId) {
   location.hash = encodeURIComponent(appId)
   const d = await get('/api/apps/' + encodeURIComponent(appId))
 
-  // One row per SIGNER, newest first. A signer is re-derived on restart, so the
-  // same address reappearing is the same instance re-recorded on chain — hence
-  // several intervals on one row. Different signers are never chained into a
-  // longer-lived "node": only updateNode records such a link, most changes are a
-  // remove plus an add with nothing tying them together, and even the explicit
-  // link is just the owner asserting one replaces the other.
-  const regs = d.signers.slice().reverse().map(h => {
-    const res = h.last_result
-    let verdict = '<span class="dim">never attested</span>'
-    if (res && res.error) verdict = `<span class="bad">✗ ${esc(res.error)}</span>`
-    else if (res && res.image) verdict = `<span class="ok">✓ ${esc(res.image)}</span>`
-    else if (res) verdict = '<span class="warn">image unknown</span>'
-    const spans = h.intervals
-      .map(i => `${i.from_block} → ${i.to_block ?? '<span class="ok">now</span>'}`)
-      .join('<br>')
-    return `<tr>
-      <td>${esc(short(h.signer, 8))}</td>
-      <td>${spans}</td>
-      <td class="num">${h.code_updates}</td>
-      <td>${verdict}</td>
-      <td class="dim">${h.current ? 'attestable' : 'retired — cannot be re-attested'}</td>
-    </tr>`}).join('')
+  // Current signers first, then retired ones newest-first. Different signers are
+  // never chained into a longer-lived "node": only updateNode records such a link,
+  // most changes are a remove plus an add with nothing tying them together, and
+  // even the explicit link is just the owner asserting one replaces the other.
+  const current = d.signers.filter(h => h.current)
+  const retired = d.signers.filter(h => !h.current).reverse()
 
   document.getElementById('view').innerHTML = `
     <p><button id="back">← all apps</button></p>
     <h3>${esc(d.app_id)}</h3>
-    <div class="wrap"><table>
-      <thead><tr><th>signer</th><th>registered</th><th class="num">code updates</th>
-      <th>last known verdict</th><th></th></tr></thead><tbody>${regs}</tbody></table></div>
-    <p class="dim">A retired signer's evidence is gone with its instance — its RTMRs
-      reset on restart — so the verdict above is whatever was cached while it was
-      live, and is the only record that will ever exist.</p>
-    ${d.nodes.map(n => nodeCard(n, d.now)).join('')}`
+    <p class="dim">${current.length} current signer(s) — these, and only these, can
+      obtain the app's KMS key. ${retired.length} retired.</p>
+    ${current.map(h => signerCard(h, d.now)).join('')}
+    ${retired.length ? '<h3>retired</h3>' : ''}
+    ${retired.map(h => signerCard(h, d.now)).join('')}`
 
   document.getElementById('back').onclick = showList
   document.querySelectorAll('button[data-events]').forEach(b =>
