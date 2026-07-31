@@ -63,13 +63,18 @@ async function get(path) {
   return r.json()
 }
 
-function imageCell(a) {
-  if (!a.signers.length) return '<span class="dim">no active node</span>'
+// "registered" and "verified" are deliberately separate columns. Registration is
+// what actually authorises a node — it is how a node obtains the app's KMS key —
+// while verification is an observation made afterwards by this service. Merging
+// them into one light would hide exactly the gap worth looking at.
+function verifiedCell(a) {
+  if (!a.signers.length) return '<span class="dim">—</span>'
+  const n = a.images.length
   if (!a.attested && !a.failed) return '<span class="dim">not attested yet</span>'
-  if (a.failed === a.attested + a.failed) return '<span class="bad">✗ all attempts failed</span>'
-  if (a.images.length === 1) return '<span class="ok">✓ ' + esc(a.images[0]) + '</span>'
-  if (a.images.length > 1) return '<span class="warn">' + a.images.length + ' different images</span>'
-  return '<span class="warn">image unknown</span>'
+  if (a.attested === 0) return '<span class="bad">0 <span class="dim">— all attempts failed</span></span>'
+  if (n === 1) return `<span class="ok">✓ ${esc(a.images[0])}</span>`
+  if (n > 1) return `<span class="warn">${n} different images</span>`
+  return `<span class="warn">0 <span class="dim">— ${a.attested} attested, image unknown</span></span>`
 }
 
 async function showList() {
@@ -82,17 +87,22 @@ async function showList() {
   const rows = apps.map(a => `
     <tr data-app="${esc(a.app_id)}">
       <td>${a.unnamed ? '<span class="dim" title="plaintext app id could not be recovered">' + short(a.app_id) + '</span>' : esc(a.app_id)}</td>
-      <td class="num">${a.events}</td>
-      <td class="num">${a.epochs}</td>
+      <td>${a.signers.length ? '<span class="ok">alive</span>' : '<span class="dim">no node</span>'}</td>
       <td class="num">${a.signers.length}</td>
-      <td>${imageCell(a)}</td>
+      <td class="num dim">${a.registrations}</td>
+      <td class="num">${a.events}</td>
+      <td>${verifiedCell(a)}</td>
       <td class="dim">${age(a.oldest_result_age)}</td>
     </tr>`).join('')
 
   const view = document.getElementById('view')
   view.innerHTML = `<div class="wrap"><table>
-    <thead><tr><th>app</th><th class="num">events</th><th class="num">identities</th>
-    <th class="num">nodes</th><th>image</th><th>as of</th></tr></thead>
+    <thead><tr><th>app</th><th></th>
+    <th class="num" title="current nodes — these hold the app's KMS key">registered</th>
+    <th class="num" title="signer registrations over the app's whole life">regs ever</th>
+    <th class="num">events</th>
+    <th title="boot chain matched a published reference set">verified</th>
+    <th>as of</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`
   view.querySelectorAll('tr[data-app]').forEach(tr =>
     tr.onclick = () => showApp(tr.dataset.app))
@@ -133,21 +143,34 @@ function nodeCard(n, now) {
 async function showApp(appId) {
   location.hash = encodeURIComponent(appId)
   const d = await get('/api/apps/' + encodeURIComponent(appId))
-  const epochs = d.epochs.map((e, i) => `
-    <tr><td class="num">#${i + 1}</td>
-    <td>${e.from_block} → ${e.to_block ?? '<span class="ok">now</span>'}</td>
-    <td class="num">${e.code_updates}</td>
-    <td>${e.signers.map(s => esc(short(s, 8))).join(', ')}</td>
-    <td>${i === 0 ? '' : e.identity_changed
-      ? '<span class="warn">⇄ identity changed</span>'
-      : '<span class="dim">re-registered, same identity</span>'}</td></tr>`).join('')
+
+  // Flat: one row per signer registration, newest first. Registrations are NOT
+  // chained into longer-lived "nodes" — only updateNode records such a link, most
+  // changes are a remove plus an add with nothing tying them together, and even
+  // an explicit link is just the owner asserting one replaces the other.
+  const regs = d.registrations.slice().reverse().map(r => {
+    const res = r.last_result
+    let verdict = '<span class="dim">never attested</span>'
+    if (res && res.error) verdict = `<span class="bad">✗ ${esc(res.error)}</span>`
+    else if (res && res.image) verdict = `<span class="ok">✓ ${esc(res.image)}</span>`
+    else if (res) verdict = '<span class="warn">image unknown</span>'
+    return `<tr>
+      <td>${esc(short(r.signer, 8))}</td>
+      <td>${r.from_block} → ${r.to_block ?? '<span class="ok">now</span>'}</td>
+      <td class="num">${r.code_updates}</td>
+      <td>${verdict}</td>
+      <td class="dim">${r.current ? 'attestable' : 'retired — cannot be re-attested'}</td>
+    </tr>`}).join('')
 
   document.getElementById('view').innerHTML = `
     <p><button id="back">← all apps</button></p>
     <h3>${esc(d.app_id)}</h3>
     <div class="wrap"><table>
-      <thead><tr><th>identity</th><th>blocks</th><th class="num">code updates</th>
-      <th>signers</th><th></th></tr></thead><tbody>${epochs}</tbody></table></div>
+      <thead><tr><th>signer</th><th>blocks</th><th class="num">code updates</th>
+      <th>last known verdict</th><th></th></tr></thead><tbody>${regs}</tbody></table></div>
+    <p class="dim">A retired signer's evidence is gone with its instance — its RTMRs
+      reset on restart — so the verdict above is whatever was cached while it was
+      live, and is the only record that will ever exist.</p>
     ${d.nodes.map(n => nodeCard(n, d.now)).join('')}`
 
   document.getElementById('back').onclick = showList

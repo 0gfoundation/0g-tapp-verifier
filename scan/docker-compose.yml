@@ -63,6 +63,13 @@ services:
       TAPPSCAN_REFERENCE_VALUES: /etc/tappscan/reference-values
       TAPPSCAN_RPC: ${TAPPSCAN_RPC:-https://evmrpc-testnet.0g.ai}
       TAPPSCAN_CONTRACT: ${TAPPSCAN_CONTRACT:-0x2Ce80374318B1d7Fb3345724457a182E0ad165c9}
+      # Earliest event of the contract above; scanning from 0 works but wastes
+      # ~40M blocks of splitting. MUST be changed together with the contract —
+      # a from-block later than a registry's first event silently loses history,
+      # and it cannot be detected automatically: the 0G public RPC is pruned, so
+      # eth_getCode at a historical block returns "state is not available" and a
+      # deployment-block search would converge on the chain head.
+      TAPPSCAN_FROM_BLOCK: ${TAPPSCAN_FROM_BLOCK:-40273630}
       RUST_LOG: ${RUST_LOG:-tappscan=info}
     restart: always
 

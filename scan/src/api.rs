@@ -73,8 +73,11 @@ struct AppSummary {
     /// True when the plaintext app id could not be recovered and this is a hash.
     unnamed: bool,
     events: usize,
-    epochs: usize,
-    /// Node signers currently registered on chain.
+    /// Signer registrations over the app's whole life, current ones included.
+    registrations: usize,
+    /// Node signers currently registered on chain. These, and only these, can
+    /// obtain the app's KMS key — which is why the count of registered nodes and
+    /// the count of VERIFIED ones are reported separately and never merged.
     signers: Vec<String>,
     latest_block: u64,
     /// Distinct images identified across this app's nodes.
@@ -95,7 +98,15 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
         .into_iter()
         .map(|app_id| {
             let t = s.registry.timeline(&app_id);
-            let cached = s.store.for_app(&app_id);
+            let signers = t.current_signers();
+            // Only CURRENT signers count towards the summary. Results for retired
+            // ones stay in the store (they are the sole record of what a since-gone
+            // identity attested), but counting them would make an app look busier
+            // and staler than it is.
+            let cached: Vec<&status::Entry> = signers
+                .iter()
+                .filter_map(|signer| s.store.get(&app_id, signer))
+                .collect();
             let mut images: Vec<String> = cached
                 .iter()
                 .filter_map(|e| e.image().map(str::to_string))
@@ -105,13 +116,13 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
             AppSummary {
                 unnamed: app_id.starts_with("0x") && app_id.len() == 66,
                 events: t.entries.len(),
-                epochs: t.epochs.len(),
-                signers: t.current_signers(),
+                registrations: t.registrations.len(),
                 latest_block: t.latest_block(),
                 images,
                 attested: cached.iter().filter(|e| e.attested.is_some()).count(),
                 failed: cached.iter().filter(|e| e.error.is_some()).count(),
                 oldest_result_age: cached.iter().map(|e| e.age_secs(now)).max(),
+                signers,
                 app_id,
             }
         })
@@ -145,9 +156,47 @@ async fn app_detail(
         })
         .collect();
 
+    // Retired registrations carry whatever was cached for them while they were
+    // live. That result can never be reproduced — the node's RTMRs are gone — so
+    // it is served with a flag saying so rather than silently omitted.
+    //
+    // The store holds ONE result per (app, signer), so when the same address was
+    // registered more than once it can only describe the most recent of those
+    // registrations. Attaching it to the earlier ones too would date a result to a
+    // stint it was not taken in.
+    let latest_of_signer: std::collections::HashMap<&str, usize> = timeline
+        .registrations
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.signer.as_str(), i))
+        .collect();
+    let registrations: Vec<serde_json::Value> = timeline
+        .registrations
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let result = (latest_of_signer.get(r.signer.as_str()) == Some(&i))
+                .then(|| s.store.get(&app_id, &r.signer))
+                .flatten();
+            json!({
+                "signer": r.signer,
+                "from_block": r.from_block,
+                "to_block": r.to_block,
+                "code_updates": r.code_updates,
+                "current": r.is_current(),
+                "last_result": result.map(|e| json!({
+                    "checked_at": e.checked_at,
+                    "image": e.image(),
+                    "error": e.error,
+                })),
+                "reverifiable": r.is_current(),
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "app_id": timeline.app_id,
-        "epochs": timeline.epochs,
+        "registrations": registrations,
         "history": timeline.entries,
         "current_signers": timeline.current_signers(),
         "nodes": nodes,

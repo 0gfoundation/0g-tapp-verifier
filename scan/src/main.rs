@@ -33,7 +33,12 @@ struct Cli {
     #[arg(long, env = "TAPPSCAN_CONTRACT", default_value = DEFAULT_CONTRACT)]
     contract: String,
 
-    /// First block to scan on a cold start
+    /// First block to scan on a cold start. Set this to the registry's deployment
+    /// block to avoid splitting tens of millions of empty blocks — but set it
+    /// together with --contract, because a value later than a registry's first
+    /// event silently loses history. It cannot be derived automatically: the 0G
+    /// public RPC is pruned, so eth_getCode at a historical block answers "state
+    /// is not available" and a deployment-block search converges on the head.
     #[arg(long, env = "TAPPSCAN_FROM_BLOCK", default_value_t = 0)]
     from_block: u64,
 
@@ -177,10 +182,10 @@ async fn main() -> Result<()> {
                 let t = registry.timeline(&app);
                 let signers = t.current_signers();
                 println!(
-                    "  {:<34} {:>3} events  {:>2} epoch(s)  {:>2} node(s)  {}",
+                    "  {:<34} {:>3} events  {:>2} registration(s)  {:>2} node(s)  {}",
                     app,
                     t.entries.len(),
-                    t.epochs.len(),
+                    t.registrations.len(),
                     signers.len(),
                     attestation_summary(&store, &app, &signers, now)
                 );
@@ -195,29 +200,23 @@ async fn main() -> Result<()> {
             }
             println!("{}  —  {} event(s)\n", t.app_id, t.entries.len());
 
-            println!("hardware identities:");
-            for (i, ep) in t.epochs.iter().enumerate() {
-                let until = match ep.to_block {
+            println!("signer registrations:");
+            for r in &t.registrations {
+                let until = match r.to_block {
                     Some(b) => b.to_string(),
                     None => "now".to_string(),
                 };
-                // Only flag a real identity change; an app re-registered on the
-                // same node starts a new stretch without changing machines.
-                let note = if i == 0 {
-                    ""
-                } else if ep.identity_changed {
-                    "  ⇄ 身份变更"
-                } else {
-                    "  (同一身份重新注册)"
-                };
                 println!(
-                    "  #{}  blocks {}..{:<9}  {} code update(s)  signers: {}{}",
-                    i + 1,
-                    ep.from_block,
+                    "  {}  blocks {}..{:<9}  {} code update(s){}",
+                    r.signer,
+                    r.from_block,
                     until,
-                    ep.code_updates,
-                    ep.signers.join(", "),
-                    note
+                    r.code_updates,
+                    if r.is_current() {
+                        "  ← current, attestable"
+                    } else {
+                        "  (retired — cannot be re-attested)"
+                    }
                 );
             }
 
