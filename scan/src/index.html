@@ -41,7 +41,18 @@
   its RTMRs. To verify a node yourself instead of trusting this page, use
   <code>tapp-cli verify-app</code> (layer 2) or run your own trustee (layer 1).
   <br>
-  <code>teeUrl</code> is supplied by whoever registered the node. It is not attested.
+  What a verdict rests on is the <em>signer</em>: the quote proves a genuine TDX
+  platform holds that key and booted a particular image, and only the signer
+  registered on chain can obtain the app's KMS key. It says nothing about the
+  address the evidence arrived from — <code>teeUrl</code> is whatever the node's
+  owner typed at registration, so it can be a placeholder or point somewhere long
+  dead. That affects whether a node can be <em>reached</em>, and makes any location
+  read off its IP a guess, but not what a reachable node's evidence establishes.
+  <br>
+  Evidence carries no challenge
+  (<a href="https://github.com/0gfoundation/0g-tapp/issues/76">0g-tapp#76</a>), so
+  "as of" means "when we received a blob claiming this", not "when the node was in
+  this state".
 </div>
 
 <script>
@@ -137,7 +148,7 @@ function signerCard(h, now) {
   const a = st.attested
   if (!a) return `<div class="card">${head}
       <dt>verification</dt><dd class="bad">✗ ${esc(st.error || 'failed')}</dd>
-      <dt>teeUrl</dt><dd>${esc(st.tee_url || '—')} <span class="dim">(unattested)</span></dd>
+      <dt>teeUrl</dt><dd>${esc(st.tee_url || '—')}</dd>
       <dt>attempted</dt><dd>${age(now - st.checked_at)}</dd>
     </dl></div>`
 
@@ -149,7 +160,7 @@ function signerCard(h, now) {
     .map(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`).join('\n')).join('\n')
 
   return `<div class="card">${head}
-      <dt>teeUrl</dt><dd>${esc(st.tee_url)} <span class="dim">(unattested)</span></dd>
+      <dt>teeUrl</dt><dd>${esc(st.tee_url)}</dd>
       <dt>signer bound</dt><dd>${a.signer_ok
         ? '<span class="ok">✓</span> the quote attests this address'
         : '<span class="bad">✗</span> the quote attests ' + esc(a.attested_signer || 'nothing') +
