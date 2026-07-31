@@ -56,6 +56,13 @@
   (<a href="https://github.com/0gfoundation/0g-tapp/issues/76">0g-tapp#76</a>), so
   "as of" means "when we received a blob claiming this", not "when the node was in
   this state".
+  <br>
+  Platform TCB is reported, never used to fail a node. Host firmware belongs to the
+  cloud provider, not to the app's owner, and providers take Intel's updates on
+  their own schedule — so a stale TCB is the normal state, and rejecting on it would
+  mark every node red and tell you nothing. It is not nothing either: the advisory
+  ids differ widely in how much they bear on TDX isolation, so they are listed for
+  you to judge rather than reduced to a colour.
 </div>
 
 <script>
@@ -168,9 +175,15 @@ function signerCard(h, now) {
         ? '<span class="ok">✓</span> the quote attests this address'
         : '<span class="bad">✗</span> the quote attests ' + esc(a.attested_signer || 'nothing') +
           ' — this registration no longer matches the running instance'}</dd>
-      <dt>quote</dt><dd>ear.status <b>${esc(a.ear_status)}</b> · platform TCB
-        <span class="${a.tcb_status === 'UpToDate' ? 'ok' : 'warn'}">${esc(a.tcb_status)}</span>${
-        a.advisories.length ? ' · ' + a.advisories.length + ' advisories' : ''}</dd>
+      <dt>quote</dt><dd><span class="ok">✓</span> signature chain verified by the AS</dd>
+      <dt>platform TCB</dt><dd>${a.tcb_status === 'UpToDate'
+        ? '<span class="ok">UpToDate</span>'
+        : `<span class="dim">${esc(a.tcb_status)}</span>` +
+          (a.advisories.length
+            ? ` — host firmware predates ${a.advisories.length} Intel
+                ${a.advisories.length === 1 ? 'advisory' : 'advisories'}:
+                <span class="dim">${a.advisories.map(esc).join(', ')}</span>`
+            : '')}</dd>
       <dt>boot chain</dt><dd>${diff} <span class="dim">(${esc(a.boot_format)})</span></dd>
       ${traceRow}
       <dt>replay</dt><dd>${a.runtime_replay_ok

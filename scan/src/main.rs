@@ -623,11 +623,22 @@ fn print_entry(
         yn(a.signer_ok),
         a.attested_signer.as_deref().unwrap_or("—")
     );
+    // What the AS established, and nothing more. `ear.status` is deliberately not
+    // shown as a verdict: tappscan evaluates with no policy, so that field is the
+    // AS DEFAULT policy's opinion, which does not include the boot-chain check
+    // this tool actually makes — its `executables` claim is always "warning" here.
+    println!("    quote      : ✓ signature chain verified by the AS");
+    // Host firmware is the cloud provider's to update, not the app owner's, so a
+    // stale platform TCB is reported as a fact rather than folded into a verdict.
+    // The advisory ids are listed because they differ wildly in relevance.
     println!(
-        "    quote      : ear.status={} tcb={} advisories={}",
-        a.ear_status,
+        "    platform   : TCB {}{}",
         a.tcb_status,
-        a.advisories.len()
+        if a.advisories.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", a.advisories.join(", "))
+        }
     );
 
     // Boot chain: a partial match ("this image except its initrd") is the useful
