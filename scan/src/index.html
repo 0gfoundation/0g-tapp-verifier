@@ -44,11 +44,6 @@
   header { display:flex; flex-wrap:wrap; align-items:center; gap:var(--s3) }
   h1 { margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.015em }
   h1 b { color:var(--brand); font-weight:700 }
-  .tag {
-    font-size:.68rem; font-weight:600; letter-spacing:.09em; text-transform:uppercase;
-    color:var(--brand); background:var(--brand-tint-2);
-    padding:.2rem .55rem; border-radius:var(--r-pill);
-  }
   .meta {
     margin:var(--s2) 0 var(--s5); color:var(--dim);
     font-family:var(--mono); font-size:.78rem; line-height:1.7;
@@ -145,10 +140,7 @@
   }
 </style>
 
-<header>
-  <h1>tapp<b>scan</b></h1>
-  <span class="tag">trust layer 3</span>
-</header>
+<header><h1>tapp<b>scan</b></h1></header>
 <p class="meta" id="meta">loading…</p>
 <main id="view" aria-live="polite"></main>
 
