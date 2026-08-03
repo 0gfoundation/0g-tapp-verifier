@@ -80,8 +80,14 @@ async fn index() -> Html<&'static str> {
 
 /// Re-derive `image` and `closest` from the stored measurements against the
 /// currently loaded reference values, so a verdict is never older than the values
-/// it was reached against. Also hides the ANY_BSA pseudo-component, which is a
-/// matching device rather than something a node measured under that name.
+/// it was reached against.
+///
+/// `ANY_BSA` is renamed rather than hidden. It is the name of a matching device, not
+/// of something a node measured — but on a UKI image it is the ONLY component, so
+/// dropping it left an unidentified node showing no measurements at all, which is
+/// exactly when someone needs the digest in order to publish or fix a reference
+/// value. It is presented as `uki`, which is the reference-value key it is compared
+/// against.
 fn refreshed_verdict(entry: &status::Entry, sets: &[crate::refvalues::RefSet]) -> serde_json::Value {
     let mut v = serde_json::to_value(entry).unwrap_or(json!({}));
     let Some(a) = &entry.attested else { return v };
@@ -92,6 +98,13 @@ fn refreshed_verdict(entry: &status::Entry, sets: &[crate::refvalues::RefSet]) -
         // Also derived: the registration this is compared against can change.
         obj.insert("signer_ok".into(), json!(a.signer_ok(&entry.signer)));
         if let Some(m) = obj.get_mut("measured").and_then(|m| m.as_object_mut()) {
+            if let Some(bsa) = m.remove(crate::refvalues::ANY_BSA) {
+                // Only meaningful on a UKI image; on a grub one these digests are
+                // the shim and grub entries, already listed under their own names.
+                if a.boot_format == "uki" {
+                    m.insert("uki".into(), bsa);
+                }
+            }
             m.retain(|k, _| !k.starts_with('_'));
         }
     }
