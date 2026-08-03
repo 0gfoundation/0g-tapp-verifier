@@ -388,6 +388,8 @@ async fn main() -> Result<()> {
             let shared: api::AppState = std::sync::Arc::new(tokio::sync::RwLock::new(api::Shared {
                 registry,
                 store: status::Store::load(&cli.status),
+                balances: Default::default(),
+                rpc_url: cli.rpc_url.clone(),
                 refreshed_at: unix_now(),
             }));
 
@@ -427,6 +429,33 @@ async fn main() -> Result<()> {
                             tracing::info!("{done} node(s) attested");
                         } else {
                             shared.write().await.refreshed_at = unix_now();
+                        }
+
+                        // Balances are a plain chain read and change on their own
+                        // schedule, so they refresh every round regardless of
+                        // whether anything needed re-attesting.
+                        let addresses = {
+                            let s = shared.read().await;
+                            let mut all: Vec<String> = s
+                                .registry
+                                .apps()
+                                .iter()
+                                .flat_map(|app| {
+                                    s.registry
+                                        .timeline(app)
+                                        .signers
+                                        .iter()
+                                        .map(|h| h.signer.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect();
+                            all.sort();
+                            all.dedup();
+                            all
+                        };
+                        let balances = scanner.balances(&addresses).await;
+                        if !balances.is_empty() {
+                            shared.write().await.balances = balances;
                         }
 
                         tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -575,6 +604,7 @@ async fn run_jobs(
                         job.latest_block,
                         now,
                         format!("cannot read teeUrl from chain: {e}"),
+                        true, // reading the chain is our job, not the node's
                     );
                 }
             };
@@ -590,7 +620,17 @@ async fn run_jobs(
             {
                 Ok(s) => status::Entry::from_status(&s, &job.app_id, job.latest_block),
                 Err(e) => {
-                    tracing::warn!("{}/{} at {tee_url}: {e}", job.app_id, job.signer);
+                    // Say whose fault it is. An AS that could not finish tells you
+                    // nothing about the node, and reporting it as a node failure
+                    // dresses our own outage up as theirs.
+                    if e.is_verifier() {
+                        tracing::warn!(
+                            "{}/{}: evidence in hand but verification failed on our side: {e}",
+                            job.app_id, job.signer
+                        );
+                    } else {
+                        tracing::warn!("{}/{} at {tee_url}: {e}", job.app_id, job.signer);
+                    }
                     status::Entry::failed(
                         &job.app_id,
                         &job.signer,
@@ -598,6 +638,7 @@ async fn run_jobs(
                         job.latest_block,
                         now,
                         e.to_string(),
+                        e.is_verifier(),
                     )
                 }
             }
@@ -630,7 +671,8 @@ fn print_entry(
 
     let Some(a) = &s.attested else {
         println!(
-            "    ✗ {}",
+            "    {} {}",
+            if s.verifier_fault { "⚠ VERIFIER" } else { "✗ NODE" },
             s.error.as_deref().unwrap_or("attestation failed")
         );
         println!(

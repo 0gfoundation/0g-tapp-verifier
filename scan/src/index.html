@@ -134,13 +134,27 @@
   a { color:var(--brand); text-underline-offset:2px }
   .toolbar { display:flex; flex-wrap:wrap; gap:var(--s2); align-items:center; margin:var(--s3) 0 0 }
   .empty { color:var(--dim); font-size:.88rem; padding:var(--s5) var(--s4); text-align:center }
+  button.primary { color:#fff; background:var(--brand); border-color:var(--brand) }
+  button.primary:hover { background:var(--brand-2); border-color:var(--brand-2); color:#fff }
+  button[disabled] { opacity:.45; cursor:default }
+  button[disabled]:hover { border-color:var(--line-2); color:var(--fg) }
+  .wallet { margin-left:auto; display:flex; align-items:center; gap:var(--s2);
+            font-size:.8rem; color:var(--dim) }
+  .amount { font:inherit; font-family:var(--mono); font-size:.8rem; width:7rem;
+            padding:.3rem .6rem; color:var(--fg); background:var(--bg);
+            border:1px solid var(--line-2); border-radius:var(--r-pill) }
+  .bal { font-family:var(--mono) }
+  .say { margin:var(--s2) 0 0; font-size:.8rem }
 
   @media (prefers-reduced-motion:reduce) {
     * { transition-duration:0s !important; animation-duration:0s !important }
   }
 </style>
 
-<header><h1>tapp<b>scan</b></h1></header>
+<header>
+  <h1>tapp<b>scan</b></h1>
+  <div class="wallet"><span id="acct"></span><button id="connect">connect wallet</button></div>
+</header>
 <p class="meta" id="meta">loading…</p>
 <main id="view" aria-live="polite"></main>
 
@@ -181,14 +195,22 @@ async function get(path) {
 // on top of being reachable. One combined indicator would hide both gaps.
 function aliveCell(a) {
   if (!a.signers.length) return pill('dim', 'no node')
-  if (!a.reachable && !a.failed) return pill('dim', 'not checked')
-  if (!a.reachable) return pill('bad', 'unreachable')
-  return pill('ok', a.reachable === a.signers.length ? 'alive' : `alive ${a.reachable}/${a.signers.length}`)
+  if (a.reachable) {
+    return pill('ok', a.reachable === a.signers.length ? 'alive' : `alive ${a.reachable}/${a.signers.length}`)
+  }
+  if (a.failed) return pill('bad', 'unreachable')
+  // Evidence arrived and we fell over, or nothing has been tried yet. Either way
+  // this is not a claim about the node.
+  if (a.verifier_errors) return pill('warn', 'not verified here')
+  return pill('dim', 'not checked')
 }
 
 function verifiedCell(a) {
-  if (!a.signers.length || (!a.reachable && !a.failed)) return '<span class="dim">—</span>'
-  if (!a.reachable) return '<span class="dim">no evidence</span>'
+  if (!a.signers.length) return '<span class="dim">—</span>'
+  if (!a.reachable) {
+    if (a.verifier_errors) return '<span class="dim">verifier error</span>'
+    return a.failed ? '<span class="dim">no evidence</span>' : '<span class="dim">—</span>'
+  }
   if (a.images.length > 1) return pill('warn', `${a.images.length} different images`)
   if (!a.identified) return pill('warn', 'image unknown')
   const badge = a.identified === a.reachable ? pill('ok', '✓') : pill('warn', `${a.identified}/${a.reachable}`)
@@ -198,12 +220,15 @@ function verifiedCell(a) {
 // An app with no registered node, or whose every registered node failed to answer,
 // is off — hidden unless asked for, so the list is what is actually running. Apps
 // not yet checked stay visible: on a cold start that is all of them.
+// Only the NODE failing counts as off. Our own verifier error must never hide an
+// app — that would let an outage on this side quietly shrink the list.
 const isOff = (a) => !a.signers.length || (a.failed > 0 && a.reachable === 0)
 let showOff = false
 
 async function showList() {
   history.replaceState(null, '', location.pathname)
   const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
+  chain = h.chain
   document.getElementById('meta').innerHTML =
     `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id}<br>` +
     `block <b>${h.scanned_to_block.toLocaleString()}</b> · ${plural(h.apps, 'app')} · ` +
@@ -272,10 +297,30 @@ function signerCard(h, now) {
   rows.push(['registered', `<span class="mono">${spans}</span>` +
     `<div class="dim">${plural(h.code_updates, 'code update')} while serving</div>`])
 
+  // A signer spends gas. Live at zero cannot transact; retired holding a balance has
+  // funds behind in a key derived inside an instance that is gone.
+  const bal = h.balance_wei
+  const note = h.current
+    ? (isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">cannot send transactions</span>` : '')
+    : (isZero(bal) ? '' : `${pill('warn', 'left behind')} <span class="dim">this key was derived
+        inside an instance that no longer exists</span>`)
+  rows.push(['balance', `<span class="bal">${bal == null ? '—' : og(bal) + ' OG'}</span> ${note}
+    ${h.current && eth() ? `<div class="toolbar">
+      <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
+             id="amt-${esc(h.signer)}" aria-label="amount in OG">
+      <button class="primary" data-topup="${esc(h.signer)}"${account ? '' : ' disabled'}>
+        ${account ? 'top up' : 'connect wallet to top up'}</button>
+      </div><p class="say dim" id="say-${esc(h.signer)}"></p>` : ''}`])
+
   if (!st) {
     rows.push(['verification', pill('dim', 'never attested')])
   } else if (!a) {
-    rows.push(['verification', `${pill('bad', 'unreachable')} <span class="dim">${esc(st.error || 'failed')}</span>`])
+    rows.push(['verification', st.verifier_fault
+      ? `${pill('warn', 'not verified here')}
+         <div class="dim">Evidence arrived; this service could not finish verifying it,
+         so nothing is established either way. Retried on the next round.</div>
+         <pre>${esc(st.error || '')}</pre>`
+      : `${pill('bad', 'unreachable')} <span class="dim">${esc(st.error || 'failed')}</span>`])
     if (st.tee_url) rows.push(['teeUrl', `<span class="mono">${esc(st.tee_url)}</span>`])
     rows.push(['attempted', age(now - st.checked_at)])
   } else {
@@ -346,6 +391,14 @@ async function showApp(appId) {
   document.getElementById('back').onclick = () => render(showList)
   view.querySelectorAll('button[data-trace]').forEach(b =>
     b.onclick = () => render(() => showTrace(appId, b.dataset.trace)))
+  view.querySelectorAll('button[data-topup]').forEach(b => {
+    const signer = b.dataset.topup
+    b.onclick = () => {
+      const box = document.getElementById('say-' + signer)
+      const say = (html, cls) => { box.className = 'say ' + cls; box.innerHTML = html }
+      topUp(signer, document.getElementById('amt-' + signer).value, say)
+    }
+  })
 }
 
 // One signer's trace always reads the same way: the operations measured for THIS
@@ -392,6 +445,96 @@ async function showTrace(appId, signer) {
   document.getElementById('back').onclick = () => render(() => showApp(appId))
 }
 
+// ── wallet ───────────────────────────────────────────────────────────────────
+// Reads stay on the server; the only write in this whole service is a top-up, and
+// it happens entirely inside the visitor's wallet. Done with plain EIP-1193 calls
+// so the page keeps needing no libraries and no external assets.
+let chain = null      // { id, rpc } from /api/health
+let account = null
+
+const eth = () => window.ethereum
+const hexChain = (id) => '0x' + id.toString(16)
+
+// Balances are wei as decimal strings — too large for a JS number, so formatted
+// from the digits rather than converted.
+function og(wei, places = 4) {
+  if (wei == null) return null
+  const s = String(wei).padStart(19, '0')
+  const whole = s.slice(0, -18).replace(/^0+(?=\d)/, '')
+  const frac = s.slice(-18).slice(0, places).replace(/0+$/, '')
+  if (frac) return `${whole}.${frac}`
+  // Dust: non-zero, but nothing left after rounding. Showing a flat 0 would read as
+  // an empty account while the "no gas" flag says otherwise.
+  if (whole === '0' && !isZero(wei)) return '<0.' + '0'.repeat(places - 1) + '1'
+  return whole
+}
+const isZero = (wei) => wei == null || /^0*$/.test(String(wei))
+
+function paintWallet() {
+  const btn = document.getElementById('connect')
+  const label = document.getElementById('acct')
+  if (!eth()) {
+    btn.remove()
+    label.textContent = 'no wallet extension'
+    return
+  }
+  if (account) {
+    label.innerHTML = `<span class="mono">${esc(short(account, 6))}</span>`
+    btn.textContent = 'disconnect'
+    btn.onclick = () => { account = null; paintWallet(); refreshView() }
+  } else {
+    label.textContent = ''
+    btn.textContent = 'connect wallet'
+    btn.onclick = connect
+  }
+}
+
+async function connect() {
+  try {
+    const [a] = await eth().request({ method: 'eth_requestAccounts' })
+    account = a
+    paintWallet()
+    refreshView()
+  } catch (e) { alert(e.message || 'wallet refused') }
+}
+
+// A top-up is only meaningful on the chain the registry lives on, so switch (or add)
+// before sending rather than letting a transfer land on whatever was selected.
+async function ensureChain() {
+  const want = hexChain(chain.id)
+  const have = await eth().request({ method: 'eth_chainId' })
+  if (have === want) return
+  try {
+    await eth().request({ method: 'wallet_switchEthereumChain', params: [{ chainId: want }] })
+  } catch (e) {
+    if (e.code !== 4902) throw e
+    await eth().request({ method: 'wallet_addEthereumChain', params: [{
+      chainId: want, chainName: `0G (chain ${chain.id})`,
+      nativeCurrency: { name: 'OG', symbol: 'OG', decimals: 18 },
+      rpcUrls: [chain.rpc],
+    }] })
+  }
+}
+
+async function topUp(signer, og, say) {
+  const amount = Number(og)
+  if (!(amount > 0)) { say('Enter an amount first.', 'bad'); return }
+  try {
+    say('Confirm in your wallet…', 'dim')
+    await ensureChain()
+    // 18 decimals, built as a string so no float rounding reaches the value.
+    const [whole, frac = ''] = String(amount).split('.')
+    const wei = BigInt(whole + frac.padEnd(18, '0').slice(0, 18))
+    const tx = await eth().request({ method: 'eth_sendTransaction', params: [{
+      from: account, to: signer, value: '0x' + wei.toString(16),
+    }] })
+    say(`Sent — <span class="mono">${esc(short(tx, 8))}</span>. The balance here updates
+         on the next refresh round.`, 'ok')
+  } catch (e) {
+    say(esc(e.message || 'wallet refused'), 'bad')
+  }
+}
+
 // One place to report a failed fetch, so no view has to.
 async function render(fn) {
   try {
@@ -404,9 +547,23 @@ async function render(fn) {
   }
 }
 
+// Repaint whatever is on screen after the wallet connects or disconnects.
+const refreshView = () => {
+  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
+  render(app ? () => showApp(app) : showList)
+}
+
 addEventListener('hashchange', () => {
   const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
   render(app ? () => showApp(app) : showList)
 })
-render(location.hash ? () => showApp(decodeURIComponent(location.hash.slice(1))) : showList)
+paintWallet()
+if (eth()) {
+  // Reflect a wallet that is already unlocked, without prompting.
+  eth().request({ method: 'eth_accounts' }).then(([a]) => {
+    if (a) { account = a; paintWallet(); refreshView() }
+  }).catch(() => {})
+  eth().on?.('accountsChanged', ([a]) => { account = a || null; paintWallet(); refreshView() })
+}
+refreshView()
 </script>

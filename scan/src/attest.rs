@@ -218,6 +218,35 @@ impl NodeStatus {
     }
 }
 
+/// Which side a failed check failed on.
+///
+/// Worth separating because conflating them lets our own outage look like a node
+/// being down: a verifier error means the evidence arrived fine and nothing has been
+/// established either way, which is not a statement about the node at all.
+#[derive(Debug)]
+pub enum CheckError {
+    /// The node did not produce evidence — unreachable, no such app, malformed reply.
+    Node(anyhow::Error),
+    /// Evidence was in hand but verification could not be completed: the AS errored,
+    /// its reference-value lookup timed out, its policy failed to evaluate.
+    Verifier(anyhow::Error),
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckError::Node(e) => write!(f, "{e}"),
+            CheckError::Verifier(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl CheckError {
+    pub fn is_verifier(&self) -> bool {
+        matches!(self, CheckError::Verifier(_))
+    }
+}
+
 /// Fetch `app_id`'s evidence from a node.
 async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
     let mut client = TappServiceClient::connect(tee_url.to_string())
@@ -286,17 +315,22 @@ pub async fn check_node(
     as_endpoint: &str,
     ref_sets: &[RefSet],
     now: i64,
-) -> Result<NodeStatus> {
-    let evidence = fetch_evidence(tee_url, app_id).await?;
+) -> Result<NodeStatus, CheckError> {
+    let evidence = fetch_evidence(tee_url, app_id)
+        .await
+        .map_err(CheckError::Node)?;
     tracing::debug!("{tee_url}: {} bytes of evidence", evidence.len());
-    let claims = evaluate(as_endpoint, &evidence).await?;
+    // From here on the node has done its part; anything that goes wrong is ours.
+    let claims = evaluate(as_endpoint, &evidence)
+        .await
+        .map_err(CheckError::Verifier)?;
 
     let cpu = claims
         .pointer("/submods/cpu0")
-        .ok_or_else(|| anyhow!("token has no cpu0 submodule"))?;
+        .ok_or_else(|| CheckError::Verifier(anyhow!("token has no cpu0 submodule")))?;
     let tdx = cpu
         .pointer("/ear.veraison.annotated-evidence/tdx")
-        .ok_or_else(|| anyhow!("token has no tdx evidence"))?;
+        .ok_or_else(|| CheckError::Verifier(anyhow!("token has no tdx evidence")))?;
     let logs: Vec<Value> = tdx
         .get("uefi_event_logs")
         .and_then(Value::as_array)

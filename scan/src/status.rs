@@ -50,6 +50,12 @@ pub struct Entry {
     pub app_latest_block: u64,
     /// `None` when the attempt succeeded; the reason it failed otherwise.
     pub error: Option<String>,
+    /// True when the failure was OURS, not the node's: evidence arrived and the
+    /// verifier could not finish with it. Such a result says nothing about the node,
+    /// must not be presented as one, and is retried rather than held for the age
+    /// backstop — a transient AS hiccup should not hide an app for an hour.
+    #[serde(default)]
+    pub verifier_fault: bool,
     /// `None` when the attempt failed.
     pub attested: Option<Attested>,
 }
@@ -107,6 +113,7 @@ impl Entry {
         app_latest_block: u64,
         checked_at: i64,
         error: String,
+        verifier_fault: bool,
     ) -> Self {
         Self {
             app_id: app_id.to_string(),
@@ -115,6 +122,7 @@ impl Entry {
             checked_at,
             app_latest_block,
             error: Some(error),
+            verifier_fault,
             attested: None,
         }
     }
@@ -143,6 +151,7 @@ impl Entry {
             checked_at: status.checked_at,
             app_latest_block,
             error: None,
+            verifier_fault: false,
             attested: Some(Attested {
             ear_status: status.ear_status.clone(),
             tcb_status: status.tcb_status.clone(),
@@ -189,6 +198,8 @@ pub enum Freshness {
     ChainMoved,
     /// Older than the age backstop.
     Stale,
+    /// The last attempt failed on our side, so nothing was established.
+    VerifierFailed,
     Fresh,
 }
 
@@ -202,6 +213,7 @@ impl Freshness {
             Freshness::Missing => "never attested",
             Freshness::ChainMoved => "app changed on chain since the last check",
             Freshness::Stale => "older than the age limit",
+            Freshness::VerifierFailed => "last attempt failed on the verifier side",
             Freshness::Fresh => "fresh",
         }
     }
@@ -271,6 +283,11 @@ impl Store {
         let Some(entry) = self.get(app_id, signer) else {
             return Freshness::Missing;
         };
+        // Our own failure is not a result to sit on. Retry it next round rather than
+        // holding a transient AS hiccup for the whole age backstop.
+        if entry.verifier_fault {
+            return Freshness::VerifierFailed;
+        }
         if app_latest_block > entry.app_latest_block {
             return Freshness::ChainMoved;
         }
@@ -293,6 +310,7 @@ mod tests {
             checked_at,
             app_latest_block: block,
             error: None,
+            verifier_fault: false,
             attested: Some(Attested {
                 ear_status: "affirming".into(),
                 tcb_status: "UpToDate".into(),
@@ -383,6 +401,7 @@ mod tests {
             100,
             1000,
             "App app not found".into(),
+            false,
         ));
         let e = s.get("app", "0xaaa").expect("cached failure");
         assert_eq!(e.error.as_deref(), Some("App app not found"));
@@ -394,6 +413,31 @@ mod tests {
             s.freshness("app", "0xaaa", 101, 300, 1000),
             Freshness::ChainMoved
         );
+    }
+
+    /// A failure on OUR side is not a result to sit on: it establishes nothing, so
+    /// it is retried next round instead of being held for the age backstop.
+    #[test]
+    fn a_verifier_fault_is_never_fresh() {
+        let mut s = Store::default();
+        s.put(Entry::failed(
+            "app", "0xaaa", "http://node:50051", 100, 1000,
+            "AttestationEvaluate: reference value lookup timed out".into(),
+            true,
+        ));
+        let e = s.get("app", "0xaaa").unwrap();
+        assert!(e.verifier_fault);
+        assert_eq!(
+            s.freshness("app", "0xaaa", 100, 3600, 1001),
+            Freshness::VerifierFailed
+        );
+        assert!(s.freshness("app", "0xaaa", 100, 3600, 1001).needs_check());
+        // A node's own failure stays cached, so readers do not re-trigger it.
+        s.put(Entry::failed(
+            "app", "0xbbb", "http://node:50051", 100, 1000,
+            "App app not found".into(), false,
+        ));
+        assert_eq!(s.freshness("app", "0xbbb", 100, 3600, 1001), Freshness::Fresh);
     }
 
     #[test]

@@ -668,6 +668,26 @@ impl Scanner {
         })
     }
 
+    /// Native balances for the given addresses, in wei, as decimal strings.
+    ///
+    /// A signer is an account that spends gas, so a live one sitting at zero cannot
+    /// transact, and a retired one holding a balance has funds left behind in a key
+    /// that was derived inside an instance which no longer exists. Both are worth
+    /// seeing, and both are plain reads.
+    pub async fn balances(&self, addresses: &[String]) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for address in addresses {
+            let Ok(parsed) = address.parse::<Address>() else { continue };
+            match self.provider.get_balance(parsed, None).await {
+                Ok(wei) => {
+                    out.insert(address.to_lowercase(), wei.to_string());
+                }
+                Err(e) => tracing::debug!("balance of {address}: {e}"),
+            }
+        }
+        out
+    }
+
     /// The `teeUrl` a node was registered with, via `getNode`. This is an
     /// owner-supplied string, NOT an attested fact — it says where to ask for
     /// evidence, and nothing more.

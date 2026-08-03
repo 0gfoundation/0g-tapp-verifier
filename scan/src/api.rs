@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -26,6 +27,13 @@ use crate::{chain, status};
 pub struct Shared {
     pub registry: chain::Registry,
     pub store: status::Store,
+    /// Native balance in wei per signer address, refreshed every round. A plain
+    /// chain read, kept apart from attestation results because it changes on its
+    /// own schedule and costs nothing.
+    pub balances: BTreeMap<String, String>,
+    /// The RPC the page hands to a wallet when adding the chain. Held here rather
+    /// than hardcoded in the page.
+    pub rpc_url: String,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
 }
@@ -63,6 +71,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "apps": s.registry.apps().len(),
         "refreshed_at": s.refreshed_at,
         "now": now(),
+        // Everything a wallet needs to offer a top-up, so the page holds no
+        // hardcoded chain config of its own.
+        "chain": { "id": s.registry.chain_id, "rpc": s.rpc_url },
     }))
 }
 
@@ -89,8 +100,14 @@ struct AppSummary {
     reachable: usize,
     /// Current signers whose boot chain matched a published reference set.
     identified: usize,
-    /// Current signers whose last attempt failed (unreachable, no such app, …).
+    /// Current signers the NODE failed for: unreachable, no such app. This is the
+    /// only failure count that says anything about the app.
     failed: usize,
+    /// Current signers where evidence arrived but WE could not finish verifying —
+    /// an AS error, a reference-value lookup timing out. Counted apart because it
+    /// establishes nothing either way, and reporting it as a node failure would
+    /// dress our own outage up as theirs.
+    verifier_errors: usize,
     /// Age in seconds of the OLDEST cached result, so the listing never looks
     /// fresher than its stalest entry.
     oldest_result_age: Option<i64>,
@@ -127,7 +144,11 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                 latest_block: t.latest_block(),
                 reachable: cached.iter().filter(|e| e.attested.is_some()).count(),
                 identified: cached.iter().filter(|e| e.image().is_some()).count(),
-                failed: cached.iter().filter(|e| e.error.is_some()).count(),
+                failed: cached
+                    .iter()
+                    .filter(|e| e.error.is_some() && !e.verifier_fault)
+                    .count(),
+                verifier_errors: cached.iter().filter(|e| e.verifier_fault).count(),
                 images,
                 oldest_result_age: cached.iter().map(|e| e.age_secs(now)).max(),
                 signers,
@@ -179,6 +200,7 @@ async fn app_detail(
                 "intervals": h.intervals,
                 "code_updates": h.code_updates,
                 "current": h.is_current(),
+                "balance_wei": s.balances.get(&h.signer.to_lowercase()),
                 // A retired signer's RTMRs are gone with its instance.
                 "reverifiable": h.is_current(),
                 "status": status,
