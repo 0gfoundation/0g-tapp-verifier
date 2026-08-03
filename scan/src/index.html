@@ -362,8 +362,13 @@ function signerCard(h, now) {
       ? `${pill('ok', '✓')} every measured operation reproduces its digest`
       : pill('bad', 'mismatch')])
     if (h.trace_events) {
-      rows.push(['trace', `${plural(h.trace_events, 'measured operation')} on this machine
-        <div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
+      // Count what the trace actually shows — this app's operations plus the
+      // unattributable ones. The machine total belongs beside it, not in place of it.
+      const shown = h.trace_shown ?? h.trace_events
+      const others = h.trace_events - shown
+      rows.push(['trace', `${plural(shown, 'measured operation')}` +
+        (others ? ` <span class="dim">· ${others} more from other apps on this machine</span>` : '') +
+        `<div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
     }
     rows.push(['as of', `${age(now - st.checked_at)} <span class="dim mono">(${st.checked_at})</span>`])
   }
