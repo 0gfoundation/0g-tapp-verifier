@@ -9,9 +9,9 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::{chain, status};
+use crate::{chain, keys, status};
 
 /// Shared, in-memory view of both caches. The refresh loop swaps these; readers
 /// only ever take the read lock.
@@ -34,6 +34,18 @@ pub struct Shared {
     /// The RPC the page hands to a wallet when adding the chain. Held here rather
     /// than hardcoded in the page.
     pub rpc_url: String,
+    /// API keys for the one privileged operation here: writing an AS policy.
+    pub api_keys: keys::KeyStore,
+    /// Where those keys are persisted.
+    pub keys_path: std::path::PathBuf,
+    /// The registry's admin address — the only signature that may mint a key. Read
+    /// from the chain at startup so the authority is the one the chain records.
+    pub admin: Option<String>,
+    /// Outstanding issue challenges: nonce → (message, expiry). A challenge makes a
+    /// signature single-use, so one captured off a screen cannot mint a second key.
+    pub challenges: BTreeMap<String, (String, i64)>,
+    /// Shared with the proxy so the authz check is not a public key-testing oracle.
+    pub authz_secret: Option<String>,
     /// Which reference values this instance is comparing against.
     pub reference_values: crate::refvalues::Provenance,
     /// The loaded sets themselves, so a stored measurement can be re-identified
@@ -52,6 +64,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps", get(list_apps))
         .route("/api/apps/:app_id", get(app_detail))
         .route("/api/apps/:app_id/events", get(app_events))
+        // Key management. Minting and revoking require a signature from the
+        // registry's admin; listing is metadata only and carries no secret.
+        .route("/api/keys", get(list_keys).post(issue_key))
+        .route("/api/keys/challenge", post(key_challenge))
+        .route("/api/keys/revoke", post(revoke_key))
+        // Called by the proxy in front of the AS, never by a browser.
+        .route("/internal/authz", get(authz))
         .with_state(state)
 }
 
@@ -347,4 +366,239 @@ async fn app_events(
     Ok(Json(
         json!({"app_id": app_id, "scope": scope, "nodes": nodes, "now": now()}),
     ))
+}
+
+
+// ─── API keys ────────────────────────────────────────────────────────────────
+
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+#[derive(Deserialize)]
+struct ChallengeRequest {
+    /// What the key is for, so the record says who has it.
+    label: String,
+    /// `30`, `90` or `never`.
+    expires: String,
+}
+
+/// Hand out a message for the admin to sign.
+///
+/// The message names the registry, the chain, what will be minted and a nonce, so a
+/// signature authorises exactly one key on exactly one deployment and cannot be
+/// replayed to mint another.
+async fn key_challenge(
+    State(state): State<AppState>,
+    Json(req): Json<ChallengeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let ttl = keys::Ttl::parse(&req.expires).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if req.label.trim().is_empty() || req.label.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "label must be 1-64 chars".into()));
+    }
+    let mut s = state.write().await;
+    let admin = s
+        .admin
+        .clone()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
+    let nonce = random_hex(16);
+    let expires_at = now() + 300;
+    let message = format!(
+        "tappscan: issue policy-write key\n\
+         registry: {}\n\
+         chain: {}\n\
+         label: {}\n\
+         expires: {}\n\
+         nonce: {}",
+        s.registry.contract,
+        s.registry.chain_id,
+        req.label.trim(),
+        ttl.label(),
+        nonce
+    );
+    // Drop challenges nobody signed rather than accumulating them.
+    let cutoff = now();
+    s.challenges.retain(|_, (_, exp)| *exp > cutoff);
+    s.challenges.insert(nonce.clone(), (message.clone(), expires_at));
+    Ok(Json(json!({
+        "message": message,
+        "sign_with": admin,
+        "valid_until": expires_at,
+    })))
+}
+
+#[derive(Deserialize)]
+struct IssueRequest {
+    /// The exact message handed out by the challenge endpoint.
+    message: String,
+    /// Its personal_sign signature, 0x-prefixed.
+    signature: String,
+}
+
+/// Verify an admin signature over an outstanding challenge and mint the key. The
+/// secret is in this response and nowhere else, ever.
+async fn issue_key(
+    State(state): State<AppState>,
+    Json(req): Json<IssueRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut s = state.write().await;
+    let admin = s
+        .admin
+        .clone()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
+
+    // The nonce must be one we issued and have not spent.
+    let nonce = req
+        .message
+        .lines()
+        .find_map(|l| l.strip_prefix("nonce: "))
+        .map(str::to_string)
+        .ok_or((StatusCode::BAD_REQUEST, "message has no nonce".into()))?;
+    let (expected, expiry) = s
+        .challenges
+        .get(&nonce)
+        .cloned()
+        .ok_or((StatusCode::BAD_REQUEST, "unknown or already used challenge".into()))?;
+    if expected != req.message {
+        return Err((StatusCode::BAD_REQUEST, "message does not match the challenge".into()));
+    }
+    if now() > expiry {
+        s.challenges.remove(&nonce);
+        return Err((StatusCode::BAD_REQUEST, "challenge expired".into()));
+    }
+
+    let signature: ethers::types::Signature = req
+        .signature
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "signature is not readable".into()))?;
+    let recovered = signature
+        .recover(req.message.as_str())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "signature does not recover".into()))?;
+    let recovered = format!("0x{}", hex::encode(recovered.as_bytes()));
+    if !recovered.eq_ignore_ascii_case(&admin) {
+        tracing::warn!("key issue refused: signed by {recovered}, admin is {admin}");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the registry admin may issue keys".into(),
+        ));
+    }
+
+    // Spend the challenge before minting, so a retry cannot mint twice.
+    s.challenges.remove(&nonce);
+    let label = req
+        .message
+        .lines()
+        .find_map(|l| l.strip_prefix("label: "))
+        .unwrap_or("unlabelled")
+        .to_string();
+    let ttl = req
+        .message
+        .lines()
+        .find_map(|l| l.strip_prefix("expires: "))
+        .and_then(|v| keys::Ttl::parse(v).ok())
+        .unwrap_or(keys::Ttl::Days30);
+
+    let secret = format!("tsk_{}", random_hex(24));
+    let record = s.api_keys.mint(&label, ttl, &recovered, now(), secret.clone());
+    let path = s.keys_path.clone();
+    if let Err(e) = s.api_keys.save(&path) {
+        tracing::error!("could not persist api keys: {e}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "could not store the key".into()));
+    }
+    tracing::info!("issued key {} ({}) to {recovered}", record.id, ttl.label());
+    Ok(Json(json!({
+        "key": secret,
+        "id": record.id,
+        "label": record.label,
+        "expires_at": record.expires_at,
+        "note": "shown once — it is stored here only as a hash",
+    })))
+}
+
+async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
+    let s = state.read().await;
+    Json(json!({ "admin": s.admin, "keys": s.api_keys.list() }))
+}
+
+#[derive(Deserialize)]
+struct RevokeRequest {
+    id: String,
+    message: String,
+    signature: String,
+}
+
+/// Revoking needs the same authority as issuing, over a message naming the key.
+async fn revoke_key(
+    State(state): State<AppState>,
+    Json(req): Json<RevokeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut s = state.write().await;
+    let admin = s
+        .admin
+        .clone()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
+    if !req.message.contains(&req.id) {
+        return Err((StatusCode::BAD_REQUEST, "message must name the key id".into()));
+    }
+    let signature: ethers::types::Signature = req
+        .signature
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "signature is not readable".into()))?;
+    let recovered = signature
+        .recover(req.message.as_str())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "signature does not recover".into()))?;
+    let recovered = format!("0x{}", hex::encode(recovered.as_bytes()));
+    if !recovered.eq_ignore_ascii_case(&admin) {
+        return Err((StatusCode::FORBIDDEN, "only the registry admin may revoke".into()));
+    }
+    s.api_keys
+        .revoke(&req.id, now())
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let path = s.keys_path.clone();
+    s.api_keys
+        .save(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!("revoked key {}", req.id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The proxy's authorisation subrequest: 204 to let a policy write through, 403 to
+/// refuse. Deliberately says nothing else — it is reachable and must not become a
+/// way to learn about keys.
+async fn authz(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+    let mut s = state.write().await;
+    // Only the proxy may ask, so this cannot be used from outside as an oracle for
+    // testing candidate keys.
+    if let Some(expected) = s.authz_secret.clone() {
+        let given = headers.get("x-authz-secret").and_then(|v| v.to_str().ok());
+        if given != Some(expected.as_str()) {
+            return StatusCode::FORBIDDEN;
+        }
+    }
+    let presented = headers
+        .get("x-forwarded-authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    if presented.is_empty() {
+        return StatusCode::FORBIDDEN;
+    }
+    let now = now();
+    match s.api_keys.accept(presented, now) {
+        Some(key) => {
+            let id = key.id.clone();
+            let path = s.keys_path.clone();
+            // Record the use; failing to persist must not refuse a valid key.
+            if let Err(e) = s.api_keys.save(&path) {
+                tracing::warn!("could not record key use: {e}");
+            }
+            tracing::info!("policy write authorised by key {id}");
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::FORBIDDEN,
+    }
 }

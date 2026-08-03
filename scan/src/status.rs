@@ -282,15 +282,55 @@ impl Store {
         }
     }
 
+    /// Save, keeping whichever copy of each entry is newer.
+    ///
+    /// Two processes legitimately hold this file: a long-running `serve` and an
+    /// operator's one-off `check --force`. Writing the in-memory copy blindly makes
+    /// it last-writer-wins, so a forced re-check against a running instance was
+    /// silently discarded the moment the loop next saved — the check appeared to
+    /// work and changed nothing. Merging costs a read and means either side can
+    /// advance the other.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let mut merged = Store::load(path);
+        for (key, entry) in &self.entries {
+            let newer = merged
+                .entries
+                .get(key)
+                .map(|existing| entry.checked_at >= existing.checked_at)
+                .unwrap_or(true);
+            if newer {
+                merged.entries.insert(key.clone(), entry.clone());
+            }
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&merged)?)
             .with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
         Ok(())
+    }
+
+    /// Take any entry on disk that is newer than the one held here.
+    ///
+    /// The other half of sharing the file: a running instance picks up an operator's
+    /// forced re-check on its next round instead of ignoring it for an hour.
+    pub fn merge_from_disk(&mut self, path: &Path) -> usize {
+        let disk = Store::load(path);
+        let mut taken = 0;
+        for (key, entry) in disk.entries {
+            let newer = self
+                .entries
+                .get(&key)
+                .map(|mine| entry.checked_at > mine.checked_at)
+                .unwrap_or(true);
+            if newer {
+                self.entries.insert(key, entry);
+                taken += 1;
+            }
+        }
+        taken
     }
 
     pub fn get(&self, app_id: &str, signer: &str) -> Option<&Entry> {
@@ -511,6 +551,37 @@ mod tests {
 
     /// A failure on OUR side is not a result to sit on: it establishes nothing, so
     /// it is retried next round instead of being held for the age backstop.
+    /// Sharing the file must not mean losing work: whichever copy of an entry is
+    /// newer survives, in both directions.
+    #[test]
+    fn saving_merges_rather_than_overwrites() {
+        let dir = std::env::temp_dir().join(format!("tappscan-merge-{}", std::process::id()));
+        let path = dir.join("status.json");
+
+        // A long-running instance saves what it has.
+        let mut serve = Store::default();
+        serve.put(entry("app", "0xaaa", 1000, 100));
+        serve.put(entry("app", "0xbbb", 1000, 100));
+        serve.save(&path).unwrap();
+
+        // An operator forces a re-check of one node, from a separate process.
+        let mut cli = Store::load(&path);
+        cli.put(entry("app", "0xaaa", 2000, 100));
+        cli.save(&path).unwrap();
+
+        // The loop saves its own, now-stale copy — and must not undo the operator.
+        serve.save(&path).unwrap();
+        let on_disk = Store::load(&path);
+        assert_eq!(on_disk.get("app", "0xaaa").unwrap().checked_at, 2000);
+        assert_eq!(on_disk.get("app", "0xbbb").unwrap().checked_at, 1000);
+
+        // …and the loop picks the newer result up rather than ignoring it.
+        assert_eq!(serve.merge_from_disk(&path), 1);
+        assert_eq!(serve.get("app", "0xaaa").unwrap().checked_at, 2000);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_verifier_fault_is_never_fresh() {
         let mut s = Store::default();

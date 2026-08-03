@@ -116,7 +116,41 @@ can reach it can overwrite any policy id, and an EAR token records only which
 policy id was used — never a hash of it — so a client cannot detect a swap.
 
 Point `TAPPSCAN_REFVALUES_HOST` at a checkout of
-[`0g-tapp`](https://github.com/0gfoundation/0g-tapp)'s `verifier/reference-values`.
+[`0g-tapp`](https://github.com/0gfoundation/0g-tapp)'s `verifier/reference-values`,
+and set `TAPPSCAN_AUTHZ_SECRET` to any long random string — the proxy and this
+service share it so the authorisation check cannot be probed from outside.
+
+### Writing a policy
+
+Policy writes are the one privileged operation here, and they need a key. Keys are
+issued against the registry's **on-chain `admin`** — the authority the chain already
+records, rather than a second one invented here — and only a hash of each key is
+kept, so `keys.json` is an audit record and not a credential store.
+
+```bash
+# 1. ask for a challenge
+curl -sX POST http://<host>:9090/api/keys/challenge \
+  -H 'content-type: application/json' \
+  -d '{"label":"ci","expires":"90"}'          # 30 | 90 | never
+
+# 2. sign the returned message with the admin key
+cast wallet sign --private-key 0x… "<message>"
+
+# 3. exchange the signature for the key — shown once
+curl -sX POST http://<host>:9090/api/keys \
+  -H 'content-type: application/json' \
+  -d '{"message":"<message>","signature":"0x…"}'
+
+# then, wherever a policy is registered:
+AS_WRITE_KEY=tsk_… verifier/register-shared-as.sh <cloud> <format> <version> <env>
+```
+
+`GET /api/keys` lists every key's metadata (never a hash). `POST /api/keys/revoke`
+takes the same admin signature over a message naming the key id, and takes effect on
+the next request.
+
+A challenge is single-use and lives five minutes, so a signature captured off a
+screen cannot mint a second key.
 
 ## HTTP interface
 

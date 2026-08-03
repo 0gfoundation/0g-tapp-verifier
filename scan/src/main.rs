@@ -8,6 +8,7 @@
 
 mod api;
 mod attest;
+mod keys;
 mod chain;
 mod refvalues;
 mod status;
@@ -148,6 +149,16 @@ enum Command {
         /// Seconds between chain syncs
         #[arg(long, default_value_t = 60)]
         interval: u64,
+
+        /// Where API keys for policy writes are kept. Only hashes are stored.
+        #[arg(long, env = "TAPPSCAN_KEYS", default_value = "tappscan-keys.json")]
+        keys: PathBuf,
+
+        /// Shared with the AS proxy so its authorisation subrequest can be told
+        /// apart from a stranger probing the endpoint. Unset disables the check,
+        /// which is fine when nothing but the proxy can reach this port.
+        #[arg(long, env = "TAPPSCAN_AUTHZ_SECRET")]
+        authz_secret: Option<String>,
     },
 }
 
@@ -396,11 +407,30 @@ async fn main() -> Result<()> {
             attest: opts,
             bind,
             interval,
+            keys: keys_path,
+            authz_secret,
         } => {
             let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
+            // Read once at startup: keys are issued against whoever the chain says
+            // is admin, so that authority is not re-invented here.
+            let admin = match scanner.admin().await {
+                Ok(a) => {
+                    tracing::info!("registry admin is {a} — the only signer that may issue keys");
+                    Some(a)
+                }
+                Err(e) => {
+                    tracing::warn!("could not read admin() ({e}) — key issuing disabled");
+                    None
+                }
+            };
             let shared: api::AppState = std::sync::Arc::new(tokio::sync::RwLock::new(api::Shared {
                 registry,
                 store: status::Store::load(&cli.status),
+                api_keys: keys::KeyStore::load(&keys_path),
+                keys_path,
+                admin,
+                challenges: Default::default(),
+                authz_secret,
                 balances: Default::default(),
                 rpc_url: cli.rpc_url.clone(),
                 reference_values: refvalues::provenance(&opts.reference_values, &ref_sets),
@@ -416,6 +446,14 @@ async fn main() -> Result<()> {
                 let status_path = cli.status.clone();
                 tokio::spawn(async move {
                     loop {
+                        // Pick up anything written by an operator's one-off check.
+                        {
+                            let mut s = shared.write().await;
+                            let taken = s.store.merge_from_disk(&status_path);
+                            if taken > 0 {
+                                tracing::info!("took {taken} externally written result(s)");
+                            }
+                        }
                         let (apps, jobs) = {
                             let s = shared.read().await;
                             let apps = s.registry.apps();

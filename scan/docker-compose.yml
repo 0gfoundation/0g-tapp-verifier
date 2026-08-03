@@ -37,10 +37,15 @@ services:
   # allowed; policy writes are refused.
   as-proxy:
     image: nginx:1.27-alpine
-    depends_on: [as]
+    depends_on: [as, scan]
     ports: ["50004:50004"]
     volumes:
-      - ./nginx-as-readonly.conf:/etc/nginx/nginx.conf:ro
+      # A template, not the final file: the shared authz secret is substituted at
+      # start so it lives in the environment rather than in the repo.
+      - ./nginx-as-readonly.conf:/etc/nginx/templates/nginx.conf.template:ro
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      TAPPSCAN_AUTHZ_SECRET: ${TAPPSCAN_AUTHZ_SECRET:?set this to any long random string, shared with the scan service}
     restart: always
 
   scan:
@@ -62,6 +67,8 @@ services:
       # and token never leave the host.
       TAPPSCAN_AS: as:50004
       TAPPSCAN_REFERENCE_VALUES: /etc/tappscan/reference-values
+      TAPPSCAN_KEYS: /var/lib/tappscan/keys.json
+      TAPPSCAN_AUTHZ_SECRET: ${TAPPSCAN_AUTHZ_SECRET:?set this to any long random string, shared with the as-proxy}
       TAPPSCAN_RPC: ${TAPPSCAN_RPC:-https://evmrpc-testnet.0g.ai}
       TAPPSCAN_CONTRACT: ${TAPPSCAN_CONTRACT:-0x2Ce80374318B1d7Fb3345724457a182E0ad165c9}
       # Earliest event of the contract above; scanning from 0 works but wastes

@@ -668,6 +668,24 @@ impl Scanner {
         })
     }
 
+    /// The registry's `admin` address — the authority API keys are issued against,
+    /// so that permission to redefine "verified" follows the one the chain already
+    /// records rather than a second one invented here.
+    pub async fn admin(&self) -> Result<String> {
+        use ethers::types::{Bytes, TransactionRequest};
+        let tx = TransactionRequest::new()
+            .to(self.contract)
+            .data(Bytes::from(selector("admin()").to_vec()));
+        let out = self.provider.call(&tx.into(), None).await?;
+        let tokens = decode(&[ParamType::Address], &out)?;
+        tokens
+            .into_iter()
+            .next()
+            .and_then(|t| t.into_address())
+            .map(|a| format!("0x{}", hex::encode(a.as_bytes())))
+            .ok_or_else(|| anyhow!("could not decode admin()"))
+    }
+
     /// Native balances for the given addresses, in wei, as decimal strings.
     ///
     /// A signer is an account that spends gas, so a live one sitting at zero cannot
