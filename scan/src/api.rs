@@ -34,6 +34,8 @@ pub struct Shared {
     /// The RPC the page hands to a wallet when adding the chain. Held here rather
     /// than hardcoded in the page.
     pub rpc_url: String,
+    /// Which reference values this instance is comparing against.
+    pub reference_values: crate::refvalues::Provenance,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
 }
@@ -74,6 +76,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         // Everything a wallet needs to offer a top-up, so the page holds no
         // hardcoded chain config of its own.
         "chain": { "id": s.registry.chain_id, "rpc": s.rpc_url },
+        // An "image unknown" verdict is only meaningful next to the set of values it
+        // was compared against.
+        "reference_values": s.reference_values,
     }))
 }
 

@@ -390,6 +390,7 @@ async fn main() -> Result<()> {
                 store: status::Store::load(&cli.status),
                 balances: Default::default(),
                 rpc_url: cli.rpc_url.clone(),
+                reference_values: refvalues::provenance(&opts.reference_values, &ref_sets),
                 refreshed_at: unix_now(),
             }));
 

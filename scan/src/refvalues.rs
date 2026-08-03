@@ -73,7 +73,43 @@ fn key_to_component(key: &str) -> Option<Component> {
     })
 }
 
+/// What was loaded, so a mismatch can be told apart from a stale mount.
+///
+/// Reference values arrive as a mounted checkout. When a new image revision ships
+/// and the mount has not been pulled, every node running it reports "image unknown"
+/// — our staleness wearing the node's clothes. Publishing what is loaded, and how
+/// old the newest file is, makes that diagnosable instead of misleading.
+#[derive(Debug, Clone, Serialize)]
+pub struct Provenance {
+    pub dir: String,
+    pub sets: Vec<String>,
+    /// Unix seconds of the most recently modified reference file.
+    pub newest_file: Option<i64>,
+}
+
+pub fn provenance(dir: &Path, sets: &[RefSet]) -> Provenance {
+    let newest = sets
+        .iter()
+        .filter_map(|s| std::fs::metadata(dir.join(&s.label)).ok())
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .max();
+    Provenance {
+        dir: dir.display().to_string(),
+        sets: sets.iter().map(|s| s.label.clone()).collect(),
+        newest_file: newest,
+    }
+}
+
 /// Load every `*.json` under `dir` (recursively) as a reference set.
+///
+/// Recursive and shape-agnostic on purpose: a published set is identified by its
+/// path (`<cloud>/<boot format>/<version>[-r<rev>]/<env>.json`), and new shapes —
+/// an image revision suffix, a per-owner subdirectory — are picked up without a
+/// code change. That is the payoff of comparing digests here rather than naming an
+/// AS policy: a new revision costs verifiers nothing, where a policy id would have
+/// to be learned by every one of them.
 pub fn load_dir(dir: &Path) -> Result<Vec<RefSet>> {
     let mut sets = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
