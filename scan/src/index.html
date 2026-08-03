@@ -74,6 +74,14 @@
   th:last-child,  td:last-child  { padding-right:var(--s4) }
   .num { text-align:right; font-family:var(--mono); font-size:.84rem }
   tr.row { cursor:pointer; transition:background .15s var(--ease) }
+  /* the payload, laid out under its event rather than hidden behind a click */
+  .payload { display:grid; grid-template-columns:max-content minmax(0,1fr);
+             gap:.1rem .8rem; margin:.25rem 0 0; font-family:var(--mono); font-size:.78rem }
+  .payload > .k { color:var(--dim) }
+  .payload > .v { overflow-wrap:anywhere }
+  .payload .map { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:0 .6rem }
+  .payload .map > span:nth-child(odd) { color:var(--dim) }
+  td.wide { white-space:normal }
   tr.row:hover, tr.row:focus-visible { background:var(--brand-tint); outline:none }
   tr.row:focus-visible td:first-child { box-shadow:inset 3px 0 0 var(--brand) }
   .name { font-weight:500 }
@@ -414,20 +422,15 @@ async function showTrace(appId, signer) {
   const events = (n.events || []).slice().reverse()
   const shared = events.filter(e => !e.payload?.app_id).length
 
-  const rows = events.map(e => {
-    const own = e.payload?.app_id
-    const result = e.payload?.result
-    return `<tr>
+  const rows = events.map(e => `<tr>
       <td class="dim mono">${when(e.payload?.timestamp)}</td>
-      <td>${esc(e.operation)}</td>
-      <td>${own ? esc(own) : `<span class="pill p-dim"
-        title="carries no app id — acts on the CVM, so it belongs to every app on it">shared</span>`}</td>
-      <td>${result
-        ? `<span class="${result === 'success' ? 'ok' : 'bad'}">${esc(result)}</span>`
-        : '<span class="dim">—</span>'}</td>
-      <td class="dim mono">${short(e.digest, 8)}</td>
-      <td>${e.digest_matches ? '' : pill('bad', 'replay ✗')}</td>
-    </tr>`}).join('')
+      <td>${esc(e.operation)}${e.payload?.app_id ? '' : `
+        <div><span class="pill p-dim"
+          title="carries no app id — acts on the CVM, so it belongs to every app on it">shared</span></div>`}</td>
+      <td class="wide">${payloadGrid(e)}</td>
+      <td class="dim mono">${short(e.digest, 8)}${e.digest_matches ? ''
+        : '<div>' + pill('bad', 'does not replay') + '</div>'}</td>
+    </tr>`).join('')
 
   const view = document.getElementById('view')
   view.innerHTML = `
@@ -437,8 +440,8 @@ async function showTrace(appId, signer) {
       ${shared} shared with every app on the machine, out of ${n.trace_total} in the whole
       trace. Newest first.</p>
     ${events.length ? `<div class="panel scroll"><table>
-      <thead><tr><th>when</th><th>operation</th><th>app</th><th>result</th>
-        <th>digest</th><th></th></tr></thead>
+      <thead><tr><th>when</th><th>operation</th><th>payload</th>
+        <th>digest</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`
       : `<div class="panel"><p class="empty">Nothing has been measured for this app on this
          node yet.</p></div>`}`
@@ -533,6 +536,37 @@ async function topUp(signer, og, say) {
   } catch (e) {
     say(esc(e.message || 'wallet refused'), 'bad')
   }
+}
+
+// The payload verbatim, every field of it. This is what the node measured, so the
+// view shows all of it rather than picking favourites — and `volumes_hash` arrives
+// both ways in real traces (a per-file map on current nodes, a single string on
+// older ones), as does anything else a future operation adds.
+function payloadGrid(e) {
+  const p = e.payload
+  if (p == null) return '<span class="dim">—</span>'
+  if (typeof p !== 'object') return `<span class="mono">${esc(String(p))}</span>`
+
+  const cell = (key, value) => {
+    if (value == null) return '<span class="dim">—</span>'
+    if (typeof value === 'object') {
+      const inner = Object.entries(value)
+        .map(([k, v]) => `<span>${esc(k)}</span><span>${esc(String(v))}</span>`).join('')
+      return inner ? `<span class="map">${inner}</span>` : '<span class="dim">empty</span>'
+    }
+    const text = esc(String(value))
+    if (key === 'error') return `<span class="bad">${text}</span>`
+    if (key === 'result') return `<span class="${value === 'success' ? 'ok' : 'bad'}">${text}</span>`
+    return text
+  }
+
+  // operation and timestamp already have columns of their own.
+  const entries = Object.entries(p).filter(([k, v]) =>
+    !['operation', 'timestamp'].includes(k) && v !== null)
+  if (!entries.length) return '<span class="dim">no parameters</span>'
+  return `<div class="payload">${entries
+    .map(([k, v]) => `<span class="k">${esc(k)}</span><span class="v">${cell(k, v)}</span>`)
+    .join('')}</div>`
 }
 
 // One place to report a failed fetch, so no view has to.
