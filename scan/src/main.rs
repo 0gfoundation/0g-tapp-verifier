@@ -10,6 +10,7 @@ mod api;
 mod attest;
 mod keys;
 mod chain;
+mod refsource;
 mod refvalues;
 mod status;
 
@@ -62,9 +63,29 @@ struct AttestOpts {
     #[arg(long, env = "TAPPSCAN_AS", default_value = DEFAULT_AS)]
     as_endpoint: String,
 
-    /// Directory of published reference values, scanned recursively
+    /// A directory of published reference values, scanned recursively. Pins them:
+    /// nothing changes underneath a verdict, and nothing is fetched. Without it the
+    /// values are tracked from the repository below, which is the default because a
+    /// mount left behind reports every node running a newer image as "unknown".
     #[arg(long, env = "TAPPSCAN_REFERENCE_VALUES")]
-    reference_values: PathBuf,
+    reference_values: Option<PathBuf>,
+
+    /// Repository to track reference values from when no directory is given.
+    #[arg(long, env = "TAPPSCAN_REFS_REPO", default_value = "0gfoundation/0g-tapp")]
+    refs_repo: String,
+
+    /// Ref to track. Whoever can merge here decides what counts as verified, which
+    /// is why every verdict is reported with the tree it was reached against.
+    #[arg(long, env = "TAPPSCAN_REFS_REF", default_value = "dev")]
+    refs_ref: String,
+
+    /// Path within the repository.
+    #[arg(long, env = "TAPPSCAN_REFS_PATH", default_value = "verifier/reference-values")]
+    refs_path: String,
+
+    /// Optional GitHub token. Only raises the rate limit; the values are public.
+    #[arg(long, env = "TAPPSCAN_REFS_TOKEN")]
+    refs_token: Option<String>,
 
     /// Backstop for re-attesting when the chain shows no change, in seconds.
     /// A new registry event always forces a re-check regardless of this.
@@ -81,11 +102,8 @@ struct AttestOpts {
 enum Command {
     /// List every app the registry has seen, with its current node signers
     Apps {
-        /// Published reference values, needed to say WHICH image a node runs.
-        /// Without them the listing reports the cached results it has but cannot
-        /// name an image — which is different from not recognising one.
-        #[arg(long, env = "TAPPSCAN_REFERENCE_VALUES")]
-        reference_values: Option<PathBuf>,
+        #[command(flatten)]
+        attest: AttestOpts,
     },
     /// Show one app's update history, split by hardware identity
     History {
@@ -215,17 +233,12 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Apps { reference_values } => {
+        Command::Apps { attest: opts } => {
             let apps = registry.apps();
             let store = status::Store::load(&cli.status);
             let now = unix_now();
-            let ref_sets = match &reference_values {
-                Some(dir) => refvalues::load_dir(dir)?,
-                None => {
-                    tracing::warn!("no --reference-values: images cannot be named");
-                    vec![]
-                }
-            };
+            let tracker = load_ref_sets(&opts).await?;
+            let ref_sets = tracker.sets();
             println!("{} app(s) on {}\n", apps.len(), registry.contract);
             for app in apps {
                 let t = registry.timeline(&app);
@@ -236,7 +249,7 @@ async fn main() -> Result<()> {
                     t.entries.len(),
                     t.signers.len(),
                     signers.len(),
-                    attestation_summary(&store, &app, &signers, &ref_sets, now)
+                    attestation_summary(&store, &app, &signers, ref_sets, now)
                 );
             }
         }
@@ -333,7 +346,8 @@ async fn main() -> Result<()> {
             events,
             scope,
         } => {
-            let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
+            let tracker = load_ref_sets(&opts).await?;
+            let ref_sets = std::sync::Arc::new(tracker.sets().to_vec());
             let mut store = status::Store::load(&cli.status);
 
             let signers = registry.timeline(&app_id).current_signers();
@@ -367,7 +381,9 @@ async fn main() -> Result<()> {
             interval,
             rounds,
         } => {
-            let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
+            let mut tracker = refsource::Tracker::new(opts.source());
+            tracker.refresh(unix_now()).await?;
+            let mut ref_sets = std::sync::Arc::new(tracker.sets().to_vec());
             let mut store = status::Store::load(&cli.status);
             let mut registry = registry;
             let mut round: u64 = 0;
@@ -389,6 +405,9 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_secs(interval)).await;
+                if tracker.refresh(unix_now()).await.is_ok() {
+                    ref_sets = std::sync::Arc::new(tracker.sets().to_vec());
+                }
                 match scanner.sync().await {
                     Ok((r, added)) => {
                         if added > 0 {
@@ -410,7 +429,8 @@ async fn main() -> Result<()> {
             keys: keys_path,
             authz_secret,
         } => {
-            let ref_sets = std::sync::Arc::new(load_ref_sets(&opts)?);
+            let mut tracker = refsource::Tracker::new(opts.source());
+            tracker.refresh(unix_now()).await?;
             // Read once at startup: keys are issued against whoever the chain says
             // is admin, so that authority is not re-invented here.
             let admin = match scanner.admin().await {
@@ -433,8 +453,8 @@ async fn main() -> Result<()> {
                 authz_secret,
                 balances: Default::default(),
                 rpc_url: cli.rpc_url.clone(),
-                reference_values: refvalues::provenance(&opts.reference_values, &ref_sets),
-                ref_sets: ref_sets.clone(),
+                ref_sets: std::sync::Arc::new(tracker.sets().to_vec()),
+                refs_from: tracker.provenance().clone(),
                 refreshed_at: unix_now(),
             }));
 
@@ -465,14 +485,9 @@ async fn main() -> Result<()> {
                             // Work on a copy so readers are never blocked while
                             // megabytes move over the network.
                             let mut store = shared.read().await.store.clone();
-                            let done = run_jobs(
-                                scanner.clone(),
-                                &mut store,
-                                jobs,
-                                &opts,
-                                ref_sets.clone(),
-                            )
-                            .await;
+                            let sets = shared.read().await.ref_sets.clone();
+                            let done =
+                                run_jobs(scanner.clone(), &mut store, jobs, &opts, sets).await;
                             if let Err(e) = store.save(&status_path) {
                                 tracing::warn!("could not save status cache: {e}");
                             }
@@ -482,6 +497,19 @@ async fn main() -> Result<()> {
                             tracing::info!("{done} node(s) attested");
                         } else {
                             shared.write().await.refreshed_at = unix_now();
+                        }
+
+                        // Reference values are re-read every round, so a set
+                        // published upstream takes effect without an ops step — and
+                        // a failed read keeps the last good one rather than turning
+                        // every node "unknown".
+                        match tracker.refresh(unix_now()).await {
+                            Ok(_) => {
+                                let mut s = shared.write().await;
+                                s.ref_sets = std::sync::Arc::new(tracker.sets().to_vec());
+                                s.refs_from = tracker.provenance().clone();
+                            }
+                            Err(e) => tracing::warn!("reference values unavailable: {e}"),
                         }
 
                         // Balances are a plain chain read and change on their own
@@ -568,17 +596,31 @@ fn attestation_summary(
     format!("{state}  (as of {} ago)", human_age(oldest))
 }
 
-fn load_ref_sets(opts: &AttestOpts) -> Result<Vec<refvalues::RefSet>> {
-    let sets = refvalues::load_dir(&opts.reference_values)?;
-    if sets.is_empty() {
-        tracing::warn!(
-            "no reference values under {} — images cannot be identified",
-            opts.reference_values.display()
-        );
-    } else {
-        tracing::info!("{} reference set(s) loaded", sets.len());
+impl AttestOpts {
+    fn source(&self) -> refsource::Source {
+        match &self.reference_values {
+            Some(dir) => refsource::Source::Dir(dir.clone()),
+            None => refsource::Source::Git {
+                repo: self.refs_repo.clone(),
+                git_ref: self.refs_ref.clone(),
+                path: self.refs_path.clone(),
+                token: self.refs_token.clone(),
+            },
+        }
     }
-    Ok(sets)
+}
+
+/// Read the reference values once, for the commands that do not run a loop.
+async fn load_ref_sets(opts: &AttestOpts) -> Result<refsource::Tracker> {
+    let mut tracker = refsource::Tracker::new(opts.source());
+    let count = tracker.refresh(unix_now()).await?;
+    let p = tracker.provenance();
+    tracing::info!(
+        "{count} reference set(s) from {}{}",
+        p.source,
+        p.tree.as_deref().map(|t| format!(" (tree {})", &t[..12.min(t.len())])).unwrap_or_default()
+    );
+    Ok(tracker)
 }
 
 /// One node that needs attesting.

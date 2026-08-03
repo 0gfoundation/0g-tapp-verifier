@@ -47,11 +47,13 @@ pub struct Shared {
     pub spent: BTreeMap<String, i64>,
     /// Shared with the proxy so the authz check is not a public key-testing oracle.
     pub authz_secret: Option<String>,
-    /// Which reference values this instance is comparing against.
-    pub reference_values: crate::refvalues::Provenance,
-    /// The loaded sets themselves, so a stored measurement can be re-identified
-    /// against today's values rather than the ones present when it was taken.
+    /// The reference values in force. Replaced by the refresh loop, so publishing a
+    /// set upstream identifies existing measurements without re-attesting anything.
     pub ref_sets: Arc<Vec<crate::refvalues::RefSet>>,
+    /// Where those values came from and the state they were in — served with every
+    /// verdict, since "unknown image" only means something next to what it was
+    /// compared against.
+    pub refs_from: crate::refsource::Provenance,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
 }
@@ -132,8 +134,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         // hardcoded chain config of its own.
         "chain": { "id": s.registry.chain_id, "rpc": s.rpc_url },
         // An "image unknown" verdict is only meaningful next to the set of values it
-        // was compared against.
-        "reference_values": s.reference_values,
+        // was compared against, and the state they were in.
+        "reference_values": s.refs_from,
     }))
 }
 

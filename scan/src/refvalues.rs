@@ -73,33 +73,24 @@ fn key_to_component(key: &str) -> Option<Component> {
     })
 }
 
-/// What was loaded, so a mismatch can be told apart from a stale mount.
+/// Parse one reference-value file. `None` when it holds no `measurement.*.SHA-384`
+/// entries at all — a README or an unrelated json in the tree is not an error.
 ///
-/// Reference values arrive as a mounted checkout. When a new image revision ships
-/// and the mount has not been pulled, every node running it reports "image unknown"
-/// — our staleness wearing the node's clothes. Publishing what is loaded, and how
-/// old the newest file is, makes that diagnosable instead of misleading.
-#[derive(Debug, Clone, Serialize)]
-pub struct Provenance {
-    pub dir: String,
-    pub sets: Vec<String>,
-    /// Unix seconds of the most recently modified reference file.
-    pub newest_file: Option<i64>,
-}
-
-pub fn provenance(dir: &Path, sets: &[RefSet]) -> Provenance {
-    let newest = sets
-        .iter()
-        .filter_map(|s| std::fs::metadata(dir.join(&s.label)).ok())
-        .filter_map(|m| m.modified().ok())
-        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .max();
-    Provenance {
-        dir: dir.display().to_string(),
-        sets: sets.iter().map(|s| s.label.clone()).collect(),
-        newest_file: newest,
-    }
+/// Shared by both sources so a set read over the network and a set read off disk are
+/// the same thing, parsed the same way.
+pub fn parse_set(label: &str, bytes: &[u8]) -> Option<RefSet> {
+    let parsed: BTreeMap<String, Vec<String>> = serde_json::from_slice(bytes).ok()?;
+    let values: BTreeMap<Component, Vec<String>> = parsed
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let v: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+            (!v.is_empty()).then(|| key_to_component(&k).map(|c| (c, v)))?
+        })
+        .collect();
+    (!values.is_empty()).then(|| RefSet {
+        label: label.to_string(),
+        values,
+    })
 }
 
 /// Load every `*.json` under `dir` (recursively) as a reference set.
@@ -127,32 +118,14 @@ pub fn load_dir(dir: &Path) -> Result<Vec<RefSet>> {
                 continue;
             }
             let raw = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-            let parsed: BTreeMap<String, Vec<String>> = match serde_json::from_slice(&raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    // A README or an unrelated json in the tree is not an error.
-                    tracing::debug!("skipping {} ({e})", p.display());
-                    continue;
-                }
-            };
-            let values: BTreeMap<Component, Vec<String>> = parsed
-                .into_iter()
-                .filter_map(|(k, v)| {
-                    let v: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
-                    (!v.is_empty()).then(|| key_to_component(&k).map(|c| (c, v)))?
-                })
-                .collect();
-            if values.is_empty() {
-                continue;
+            let label = p
+                .strip_prefix(dir)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(set) = parse_set(&label, &raw) {
+                sets.push(set);
             }
-            sets.push(RefSet {
-                label: p
-                    .strip_prefix(dir)
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .into_owned(),
-                values,
-            });
         }
     }
     sets.sort_by(|a, b| a.label.cmp(&b.label));
