@@ -1,0 +1,603 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tappscan</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Palette read out of 0G's own explorer (storagescan-galileo.0g.ai): violet
+     brand, near-black text on white, monospace for identifiers, 10px surfaces,
+     pill badges. Neutrals are tinted toward the brand hue rather than pure grey. */
+  :root {
+    --brand:#9200e1; --brand-2:#b75fff; --brand-tint:#f7f0fe; --brand-tint-2:#f0e2fd;
+    --bg:#fdfcfe; --surface:#ffffff; --fg:#141318; --dim:#5c5566;
+    --line:#eceaf0; --line-2:#ded9e4;
+    --ok:#0e6b45; --ok-tint:#e8f5ee;
+    --bad:#b3261e; --bad-tint:#fdecea;
+    --warn:#7a5300; --warn-tint:#fbf1e0;
+    --mono:"GeistMono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    --sans:"Metropolis", "Regola", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+    /* spacing scale — every gap below comes from this */
+    --s1:.25rem; --s2:.5rem; --s3:.75rem; --s4:1rem; --s5:1.5rem; --s6:2rem; --s7:3rem;
+    --r-surface:10px; --r-pill:9999px;
+    --ease:cubic-bezier(.22,1,.36,1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --brand:#c07cff; --brand-2:#9200e1; --brand-tint:#1d1526; --brand-tint-2:#271a33;
+      --bg:#0f0d13; --surface:#17141c; --fg:#f3f1f6; --dim:#a49bb0;
+      --line:#262231; --line-2:#332d40;
+      --ok:#66d69f; --ok-tint:#11251c;
+      --bad:#ff9a91; --bad-tint:#2c1614;
+      --warn:#e8bd72; --warn-tint:#2a2010;
+    }
+  }
+
+  *, *::before, *::after { box-sizing:border-box }
+  html { -webkit-text-size-adjust:100% }
+  body {
+    margin:0 auto; padding:var(--s6) var(--s5) var(--s7); max-width:1160px;
+    background:var(--bg); color:var(--fg);
+    font:400 15px/1.55 var(--sans); -webkit-font-smoothing:antialiased;
+  }
+  code, .mono { font-family:var(--mono); font-size:.9em; font-variant-ligatures:none }
+
+  /* ── head ─────────────────────────────────────────────────────────────── */
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:var(--s3) }
+  h1 { margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.015em }
+  h1 b { color:var(--brand); font-weight:700 }
+  .meta {
+    margin:var(--s2) 0 var(--s5); color:var(--dim);
+    font-family:var(--mono); font-size:.78rem; line-height:1.7;
+  }
+  .meta b { color:var(--fg); font-weight:600 }
+
+  h2 {
+    margin:var(--s6) 0 var(--s2); font-size:.72rem; font-weight:600;
+    letter-spacing:.09em; text-transform:uppercase; color:var(--dim);
+  }
+  .lede { margin:0 0 var(--s4); color:var(--dim); font-size:.88rem; max-width:64ch }
+  .hint { margin:0 0 var(--s3); color:var(--dim); font-size:.8rem }
+
+  /* ── tables ───────────────────────────────────────────────────────────── */
+  .panel {
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-surface); overflow:hidden;
+  }
+  .scroll { overflow-x:auto; -webkit-overflow-scrolling:touch }
+  table { border-collapse:collapse; width:100%; font-size:.88rem }
+  th, td { text-align:left; padding:.55rem var(--s3); white-space:nowrap }
+  tbody td { border-top:1px solid var(--line) }
+  thead th {
+    font-size:.68rem; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
+    color:var(--dim); padding-top:var(--s3); padding-bottom:var(--s3);
+  }
+  th:first-child, td:first-child { padding-left:var(--s4) }
+  th:last-child,  td:last-child  { padding-right:var(--s4) }
+  .num { text-align:right; font-family:var(--mono); font-size:.84rem }
+  tr.row { cursor:pointer; transition:background .15s var(--ease) }
+  /* the payload, laid out under its event rather than hidden behind a click */
+  .payload { display:grid; grid-template-columns:max-content minmax(0,1fr);
+             gap:.1rem .8rem; margin:.25rem 0 0; font-family:var(--mono); font-size:.78rem }
+  .payload > .k { color:var(--dim) }
+  .payload > .v { overflow-wrap:anywhere }
+  .payload .map { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:0 .6rem }
+  .payload .map > span:nth-child(odd) { color:var(--dim) }
+  td.wide { white-space:normal }
+  tr.row:hover, tr.row:focus-visible { background:var(--brand-tint); outline:none }
+  tr.row:focus-visible td:first-child { box-shadow:inset 3px 0 0 var(--brand) }
+  .name { font-weight:500 }
+
+  /* ── badges ───────────────────────────────────────────────────────────── */
+  .pill {
+    display:inline-block; padding:.1rem .5rem; border-radius:var(--r-pill);
+    font-size:.72rem; font-weight:600; white-space:nowrap; letter-spacing:.01em;
+  }
+  .p-ok   { color:var(--ok);    background:var(--ok-tint) }
+  .p-bad  { color:var(--bad);   background:var(--bad-tint) }
+  .p-warn { color:var(--warn);  background:var(--warn-tint) }
+  .p-dim  { color:var(--dim);   background:var(--line) }
+  .ok { color:var(--ok) } .bad { color:var(--bad) } .dim { color:var(--dim) }
+
+  /* ── signer cards ─────────────────────────────────────────────────────── */
+  .card {
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-surface); padding:var(--s4) var(--s5) var(--s5);
+    margin:0 0 var(--s3);
+  }
+  .card.retired { background:transparent; border-style:dashed }
+  .card > h3 {
+    margin:0; font-family:var(--mono); font-size:.82rem; font-weight:600;
+    overflow-wrap:anywhere; display:flex; flex-wrap:wrap; align-items:center; gap:var(--s2);
+  }
+  dl { display:grid; grid-template-columns:11rem 1fr; gap:var(--s1) var(--s4);
+       margin:var(--s4) 0 0; font-size:.88rem }
+  dt { color:var(--dim); font-size:.72rem; font-weight:600; letter-spacing:.06em;
+       text-transform:uppercase; padding-top:.2rem }
+  dd { margin:0; overflow-wrap:anywhere }
+  dd + dt { border-top:1px solid var(--line); padding-top:var(--s2); margin-top:var(--s1) }
+  dt + dd { border-top:1px solid var(--line); padding-top:var(--s2); margin-top:var(--s1) }
+  dl > dt:first-of-type, dl > dt:first-of-type + dd { border-top:0; padding-top:0; margin-top:0 }
+  @media (max-width:640px) {
+    dl { grid-template-columns:1fr; gap:0 }
+    dt { padding-top:var(--s3) } dt + dd { border-top:0; padding-top:.1rem; margin-top:0 }
+    dd + dt { border-top:1px solid var(--line) }
+  }
+
+  pre {
+    margin:var(--s3) 0 0; padding:var(--s3); overflow-x:auto;
+    font-family:var(--mono); font-size:.75rem; line-height:1.7; color:var(--dim);
+    background:var(--bg); border:1px solid var(--line); border-radius:8px;
+  }
+
+  /* ── controls ─────────────────────────────────────────────────────────── */
+  button {
+    font:inherit; font-size:.8rem; font-weight:500;
+    color:var(--fg); background:var(--surface);
+    border:1px solid var(--line-2); border-radius:var(--r-pill);
+    padding:.3rem .8rem; min-height:32px; cursor:pointer;
+    transition:border-color .15s var(--ease), color .15s var(--ease), background .15s var(--ease);
+  }
+  button:hover { border-color:var(--brand); color:var(--brand) }
+  button:active { background:var(--brand-tint) }
+  :focus-visible { outline:2px solid var(--brand); outline-offset:2px; border-radius:4px }
+  a { color:var(--brand); text-underline-offset:2px }
+  .toolbar { display:flex; flex-wrap:wrap; gap:var(--s2); align-items:center; margin:var(--s3) 0 0 }
+  .empty { color:var(--dim); font-size:.88rem; padding:var(--s5) var(--s4); text-align:center }
+  button.primary { color:#fff; background:var(--brand); border-color:var(--brand) }
+  button.primary:hover { background:var(--brand-2); border-color:var(--brand-2); color:#fff }
+  button[disabled] { opacity:.45; cursor:default }
+  button[disabled]:hover { border-color:var(--line-2); color:var(--fg) }
+  .wallet { margin-left:auto; display:flex; align-items:center; gap:var(--s2);
+            font-size:.8rem; color:var(--dim) }
+  .amount { font:inherit; font-family:var(--mono); font-size:.8rem; width:7rem;
+            padding:.3rem .6rem; color:var(--fg); background:var(--bg);
+            border:1px solid var(--line-2); border-radius:var(--r-pill) }
+  .bal { font-family:var(--mono) }
+  .say { margin:var(--s2) 0 0; font-size:.8rem }
+
+  @media (prefers-reduced-motion:reduce) {
+    * { transition-duration:0s !important; animation-duration:0s !important }
+  }
+</style>
+
+<header>
+  <h1>tapp<b>scan</b></h1>
+  <div class="wallet"><span id="acct"></span><button id="connect">connect wallet</button></div>
+</header>
+<p class="meta" id="meta">loading…</p>
+<main id="view" aria-live="polite"></main>
+
+<script>
+const el = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild }
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+const short = (s, n = 10) => s && s.length > n * 2 + 4 ? s.slice(0, n) + '…' + s.slice(-4) : (s ?? '')
+const pill = (kind, text) => `<span class="pill p-${kind}">${text}</span>`
+const plural = (n, one, many = one + 's') => `${n} ${n === 1 ? one : many}`
+
+function age(secs) {
+  if (secs == null) return '—'
+  if (secs < 60) return secs + 's ago'
+  if (secs < 3600) return Math.round(secs / 60) + 'm ago'
+  if (secs < 86400) return Math.round(secs / 3600) + 'h ago'
+  return Math.round(secs / 86400) + 'd ago'
+}
+
+// Measured timestamps are unix seconds from inside the CVM. Shown as a date, with
+// the raw value on hover — an event log is something people cross-reference.
+function when(ts) {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `<span title="${ts}">${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+         ` ${pad(d.getHours())}:${pad(d.getMinutes())}</span>`
+}
+
+async function get(path) {
+  const r = await fetch(path)
+  if (!r.ok) throw new Error(`${path} → ${r.status}`)
+  return r.json()
+}
+
+// Registered, reachable and verified stay three separate numbers. Registration is
+// what authorises a node — it is how a node obtains the app's KMS key — and says
+// nothing about whether it is up. Verification is an observation made afterwards,
+// on top of being reachable. One combined indicator would hide both gaps.
+function aliveCell(a) {
+  if (!a.signers.length) return pill('dim', 'no node')
+  if (a.reachable) {
+    return pill('ok', a.reachable === a.signers.length ? 'alive' : `alive ${a.reachable}/${a.signers.length}`)
+  }
+  if (a.failed) return pill('bad', 'unreachable')
+  // Evidence arrived and we fell over, or nothing has been tried yet. Either way
+  // this is not a claim about the node.
+  if (a.verifier_errors) return pill('warn', 'not verified here')
+  return pill('dim', 'not checked')
+}
+
+function verifiedCell(a) {
+  if (!a.signers.length) return '<span class="dim">—</span>'
+  if (!a.reachable) {
+    if (a.verifier_errors) return '<span class="dim">verifier error</span>'
+    return a.failed ? '<span class="dim">no evidence</span>' : '<span class="dim">—</span>'
+  }
+  if (a.images.length > 1) return pill('warn', `${a.images.length} different images`)
+  if (!a.identified) return pill('warn', 'image unknown')
+  const badge = a.identified === a.reachable ? pill('ok', '✓') : pill('warn', `${a.identified}/${a.reachable}`)
+  return `${badge} <code>${esc(a.images[0])}</code>`
+}
+
+// An app with no registered node, or whose every registered node failed to answer,
+// is off — hidden unless asked for, so the list is what is actually running. Apps
+// not yet checked stay visible: on a cold start that is all of them.
+// Only the NODE failing counts as off. Our own verifier error must never hide an
+// app — that would let an outage on this side quietly shrink the list.
+const isOff = (a) => !a.signers.length || (a.failed > 0 && a.reachable === 0)
+let showOff = false
+
+async function showList() {
+  history.replaceState(null, '', location.pathname)
+  const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
+  chain = h.chain
+  document.getElementById('meta').innerHTML =
+    `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id}<br>` +
+    `block <b>${h.scanned_to_block.toLocaleString()}</b> · ${plural(h.apps, 'app')} · ` +
+    `${plural(h.events, 'event')} · refreshed ${age(h.now - h.refreshed_at)}`
+
+  const hiddenCount = all.filter(isOff).length
+  const apps = showOff ? all : all.filter(a => !isOff(a))
+
+  const rows = apps.map(a => `
+    <tr class="row" tabindex="0" role="link" data-app="${esc(a.app_id)}"
+        aria-label="${esc(a.app_id)}">
+      <td class="${a.unnamed ? 'mono dim' : 'name'}"
+          ${a.unnamed ? 'title="plaintext app id could not be recovered"' : ''}>
+        ${a.unnamed ? short(a.app_id) : esc(a.app_id)}</td>
+      <td>${aliveCell(a)}</td>
+      <td class="num">${a.signers.length}</td>
+      <td class="num">${a.reachable}</td>
+      <td class="num dim">${a.signers_ever}</td>
+      <td class="num dim">${a.events}</td>
+      <td>${verifiedCell(a)}</td>
+      <td class="dim mono">${age(a.oldest_result_age)}</td>
+    </tr>`).join('')
+
+  const view = document.getElementById('view')
+  view.innerHTML = apps.length ? `
+    <div class="panel scroll"><table>
+      <thead><tr>
+        <th>app</th><th></th>
+        <th class="num" title="current nodes on chain — these, and only these, can obtain the app's KMS key">registered</th>
+        <th class="num" title="of those, how many answered with evidence">reachable</th>
+        <th class="num" title="distinct signers over the app's whole life">signers ever</th>
+        <th class="num">events</th>
+        <th title="boot chain matched a published reference set">verified</th>
+        <th>as of</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    ${hiddenCount ? `<div class="toolbar"><button id="toggle">${showOff
+      ? `hide the ${hiddenCount} that are off`
+      : `show ${hiddenCount} with no reachable node`}</button></div>` : ''}`
+    : `<div class="panel"><p class="empty">Nothing running. ${hiddenCount
+        ? `<button id="toggle">show ${hiddenCount} registered but unreachable</button>`
+        : 'The registry has no apps yet.'}</p></div>`
+
+  view.querySelectorAll('tr.row').forEach(tr => {
+    const open = () => showApp(tr.dataset.app)
+    tr.onclick = open
+    tr.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() } }
+  })
+  const toggle = document.getElementById('toggle')
+  if (toggle) toggle.onclick = () => { showOff = !showOff; render(showList) }
+}
+
+// One card per signer — current or retired, same shape. The signer is the unit that
+// carries a verification status and a trace; the only difference is whether the
+// result can be produced again, since a retired signer's RTMRs are gone with its
+// instance. Different signers are never chained into a longer-lived "node".
+function signerCard(h, now) {
+  const spans = h.intervals
+    .map(i => `${i.from_block.toLocaleString()} → ${i.to_block ? i.to_block.toLocaleString() : '<span class="ok">now</span>'}`)
+    .join('<br>')
+  const st = h.status
+  const a = st?.attested
+
+  const rows = []
+  rows.push(['registered', `<span class="mono">${spans}</span>` +
+    `<div class="dim">${plural(h.code_updates, 'code update')} while serving</div>`])
+
+  // A signer spends gas. Live at zero cannot transact; retired holding a balance has
+  // funds behind in a key derived inside an instance that is gone.
+  const bal = h.balance_wei
+  const note = h.current
+    ? (isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">cannot send transactions</span>` : '')
+    : (isZero(bal) ? '' : `${pill('warn', 'left behind')} <span class="dim">this key was derived
+        inside an instance that no longer exists</span>`)
+  rows.push(['balance', `<span class="bal">${bal == null ? '—' : og(bal) + ' OG'}</span> ${note}
+    ${h.current && eth() ? `<div class="toolbar">
+      <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
+             id="amt-${esc(h.signer)}" aria-label="amount in OG">
+      <button class="primary" data-topup="${esc(h.signer)}"${account ? '' : ' disabled'}>
+        ${account ? 'top up' : 'connect wallet to top up'}</button>
+      </div><p class="say dim" id="say-${esc(h.signer)}"></p>` : ''}`])
+
+  if (!st) {
+    rows.push(['verification', pill('dim', 'never attested')])
+  } else if (!a) {
+    rows.push(['verification', st.verifier_fault
+      ? `${pill('warn', 'not verified here')}
+         <div class="dim">Evidence arrived; this service could not finish verifying it,
+         so nothing is established either way. Retried on the next round.</div>
+         <pre>${esc(st.error || '')}</pre>`
+      : `${pill('bad', 'unreachable')} <span class="dim">${esc(st.error || 'failed')}</span>`])
+    if (st.tee_url) rows.push(['teeUrl', `<span class="mono">${esc(st.tee_url)}</span>`])
+    rows.push(['attempted', age(now - st.checked_at)])
+  } else {
+    rows.push(['teeUrl', `<span class="mono">${esc(st.tee_url)}</span>`])
+    rows.push(['signer bound', a.signer_ok
+      ? `${pill('ok', '✓')} the quote attests this address`
+      : `${pill('bad', 'mismatch')} the quote attests <code>${esc(a.attested_signer || 'nothing')}</code>
+         <div class="dim">The registered identity is not the one this node holds, so neither
+         has standing: the registered signer cannot be attested, and the attested signer is
+         not registered.</div>`])
+    rows.push(['quote', `${pill('ok', '✓')} signature chain verified by the AS`])
+    rows.push(['platform tcb', a.tcb_status === 'UpToDate'
+      ? `${pill('ok', 'UpToDate')}`
+      : `${pill('dim', esc(a.tcb_status))}` + (a.advisories.length
+          ? `<div class="dim">Host firmware predates ${plural(a.advisories.length, 'Intel advisory', 'Intel advisories')}:
+             <span class="mono">${a.advisories.map(esc).join(', ')}</span></div>` : '')])
+
+    const boot = a.image
+      ? `${pill('ok', '✓')} <code>${esc(a.image)}</code>`
+      : a.closest
+        ? `${pill('warn', 'unknown')} closest ${a.closest.hits}/${a.closest.total}:
+           <code>${esc(a.closest.label)}</code>
+           <div class="dim">Differs in <b>${a.closest.failed.map(esc).join(', ')}</b>.</div>`
+        : `${pill('warn', 'unknown')} <span class="dim">no reference set applies</span>`
+    const measured = a.image ? '' : Object.entries(a.measured || {})
+      .flatMap(([k, v]) => v.map(d => `${k.padEnd(15)} ${d}`)).join('\n')
+    rows.push(['boot chain', `${boot} <span class="dim">(${esc(a.boot_format)})</span>` +
+      (measured ? `<pre>${esc(measured)}</pre>` : '')])
+
+    rows.push(['replay', a.runtime_replay_ok
+      ? `${pill('ok', '✓')} every measured operation reproduces its digest`
+      : pill('bad', 'mismatch')])
+    if (h.trace_events) {
+      rows.push(['trace', `${plural(h.trace_events, 'measured operation')} on this machine
+        <div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
+    }
+    rows.push(['as of', `${age(now - st.checked_at)} <span class="dim mono">(${st.checked_at})</span>`])
+  }
+
+  return `<section class="card${h.current ? '' : ' retired'}">
+    <h3>${esc(h.signer)} ${h.current
+      ? pill('ok', 'current')
+      : pill('dim', 'retired · cannot be re-attested')}</h3>
+    <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+  </section>`
+}
+
+async function showApp(appId) {
+  history.replaceState(null, '', '#' + encodeURIComponent(appId))
+  const d = await get('/api/apps/' + encodeURIComponent(appId))
+  const current = d.signers.filter(h => h.current)
+  const retired = d.signers.filter(h => !h.current).reverse()
+
+  const view = document.getElementById('view')
+  view.innerHTML = `
+    <div class="toolbar"><button id="back">← all apps</button></div>
+    <h2>${esc(d.app_id)}</h2>
+    <p class="lede">${current.length
+      ? `${plural(current.length, 'signer')} registered right now — these, and only these,
+         can obtain this app's KMS key.`
+      : 'No node is registered for this app right now.'}</p>
+    ${current.map(h => signerCard(h, d.now)).join('')}
+    ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
+      <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
+      restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
+    ${retired.map(h => signerCard(h, d.now)).join('')}`
+
+  document.getElementById('back').onclick = () => render(showList)
+  view.querySelectorAll('button[data-trace]').forEach(b =>
+    b.onclick = () => render(() => showTrace(appId, b.dataset.trace)))
+  view.querySelectorAll('button[data-topup]').forEach(b => {
+    const signer = b.dataset.topup
+    b.onclick = () => {
+      const box = document.getElementById('say-' + signer)
+      const say = (html, cls) => { box.className = 'say ' + cls; box.innerHTML = html }
+      topUp(signer, document.getElementById('amt-' + signer).value, say)
+    }
+  })
+}
+
+// One signer's trace always reads the same way: the operations measured for THIS
+// app, plus the shared ones. Shared means an operation carrying no app id at all —
+// docker_login, add_to_whitelist, claim_config — which acts on the CVM rather than
+// on one app, and so belongs to every app on it. There is no other way to slice it,
+// so there is nothing to switch between; what the machine's other apps did is on
+// their own pages.
+async function showTrace(appId, signer) {
+  const d = await get(`/api/apps/${encodeURIComponent(appId)}/events` +
+                      `?signer=${encodeURIComponent(signer)}&scope=app&limit=300`)
+  const n = d.nodes[0] || {}
+  const events = (n.events || []).slice().reverse()
+  const shared = events.filter(e => !e.payload?.app_id).length
+
+  const rows = events.map(e => `<tr>
+      <td class="dim mono">${when(e.payload?.timestamp)}</td>
+      <td>${esc(e.operation)}${e.payload?.app_id ? '' : `
+        <div><span class="pill p-dim"
+          title="carries no app id — acts on the CVM, so it belongs to every app on it">shared</span></div>`}</td>
+      <td class="wide">${payloadGrid(e)}</td>
+      <td class="dim mono">${short(e.digest, 8)}${e.digest_matches ? ''
+        : '<div>' + pill('bad', 'does not replay') + '</div>'}</td>
+    </tr>`).join('')
+
+  const view = document.getElementById('view')
+  view.innerHTML = `
+    <div class="toolbar"><button id="back">← ${esc(appId)}</button></div>
+    <h2>trace · <span class="mono">${esc(short(signer, 10))}</span></h2>
+    <p class="lede">${plural(events.length - shared, 'operation')} measured for this app,
+      ${shared} shared with every app on the machine, out of ${n.trace_total} in the whole
+      trace. Newest first.</p>
+    ${events.length ? `<div class="panel scroll"><table>
+      <thead><tr><th>when</th><th>operation</th><th>payload</th>
+        <th>digest</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`
+      : `<div class="panel"><p class="empty">Nothing has been measured for this app on this
+         node yet.</p></div>`}`
+  document.getElementById('back').onclick = () => render(() => showApp(appId))
+}
+
+// ── wallet ───────────────────────────────────────────────────────────────────
+// Reads stay on the server; the only write in this whole service is a top-up, and
+// it happens entirely inside the visitor's wallet. Done with plain EIP-1193 calls
+// so the page keeps needing no libraries and no external assets.
+let chain = null      // { id, rpc } from /api/health
+let account = null
+
+const eth = () => window.ethereum
+const hexChain = (id) => '0x' + id.toString(16)
+
+// Balances are wei as decimal strings — too large for a JS number, so formatted
+// from the digits rather than converted.
+function og(wei, places = 4) {
+  if (wei == null) return null
+  const s = String(wei).padStart(19, '0')
+  const whole = s.slice(0, -18).replace(/^0+(?=\d)/, '')
+  const frac = s.slice(-18).slice(0, places).replace(/0+$/, '')
+  if (frac) return `${whole}.${frac}`
+  // Dust: non-zero, but nothing left after rounding. Showing a flat 0 would read as
+  // an empty account while the "no gas" flag says otherwise.
+  if (whole === '0' && !isZero(wei)) return '<0.' + '0'.repeat(places - 1) + '1'
+  return whole
+}
+const isZero = (wei) => wei == null || /^0*$/.test(String(wei))
+
+function paintWallet() {
+  const btn = document.getElementById('connect')
+  const label = document.getElementById('acct')
+  if (!eth()) {
+    btn.remove()
+    label.textContent = 'no wallet extension'
+    return
+  }
+  if (account) {
+    label.innerHTML = `<span class="mono">${esc(short(account, 6))}</span>`
+    btn.textContent = 'disconnect'
+    btn.onclick = () => { account = null; paintWallet(); refreshView() }
+  } else {
+    label.textContent = ''
+    btn.textContent = 'connect wallet'
+    btn.onclick = connect
+  }
+}
+
+async function connect() {
+  try {
+    const [a] = await eth().request({ method: 'eth_requestAccounts' })
+    account = a
+    paintWallet()
+    refreshView()
+  } catch (e) { alert(e.message || 'wallet refused') }
+}
+
+// A top-up is only meaningful on the chain the registry lives on, so switch (or add)
+// before sending rather than letting a transfer land on whatever was selected.
+async function ensureChain() {
+  const want = hexChain(chain.id)
+  const have = await eth().request({ method: 'eth_chainId' })
+  if (have === want) return
+  try {
+    await eth().request({ method: 'wallet_switchEthereumChain', params: [{ chainId: want }] })
+  } catch (e) {
+    if (e.code !== 4902) throw e
+    await eth().request({ method: 'wallet_addEthereumChain', params: [{
+      chainId: want, chainName: `0G (chain ${chain.id})`,
+      nativeCurrency: { name: 'OG', symbol: 'OG', decimals: 18 },
+      rpcUrls: [chain.rpc],
+    }] })
+  }
+}
+
+async function topUp(signer, og, say) {
+  const amount = Number(og)
+  if (!(amount > 0)) { say('Enter an amount first.', 'bad'); return }
+  try {
+    say('Confirm in your wallet…', 'dim')
+    await ensureChain()
+    // 18 decimals, built as a string so no float rounding reaches the value.
+    const [whole, frac = ''] = String(amount).split('.')
+    const wei = BigInt(whole + frac.padEnd(18, '0').slice(0, 18))
+    const tx = await eth().request({ method: 'eth_sendTransaction', params: [{
+      from: account, to: signer, value: '0x' + wei.toString(16),
+    }] })
+    say(`Sent — <span class="mono">${esc(short(tx, 8))}</span>. The balance here updates
+         on the next refresh round.`, 'ok')
+  } catch (e) {
+    say(esc(e.message || 'wallet refused'), 'bad')
+  }
+}
+
+// The payload verbatim, every field of it. This is what the node measured, so the
+// view shows all of it rather than picking favourites — and `volumes_hash` arrives
+// both ways in real traces (a per-file map on current nodes, a single string on
+// older ones), as does anything else a future operation adds.
+function payloadGrid(e) {
+  const p = e.payload
+  if (p == null) return '<span class="dim">—</span>'
+  if (typeof p !== 'object') return `<span class="mono">${esc(String(p))}</span>`
+
+  const cell = (key, value) => {
+    if (value == null) return '<span class="dim">—</span>'
+    if (typeof value === 'object') {
+      const inner = Object.entries(value)
+        .map(([k, v]) => `<span>${esc(k)}</span><span>${esc(String(v))}</span>`).join('')
+      return inner ? `<span class="map">${inner}</span>` : '<span class="dim">empty</span>'
+    }
+    const text = esc(String(value))
+    if (key === 'error') return `<span class="bad">${text}</span>`
+    if (key === 'result') return `<span class="${value === 'success' ? 'ok' : 'bad'}">${text}</span>`
+    return text
+  }
+
+  // operation and timestamp already have columns of their own.
+  const entries = Object.entries(p).filter(([k, v]) =>
+    !['operation', 'timestamp'].includes(k) && v !== null)
+  if (!entries.length) return '<span class="dim">no parameters</span>'
+  return `<div class="payload">${entries
+    .map(([k, v]) => `<span class="k">${esc(k)}</span><span class="v">${cell(k, v)}</span>`)
+    .join('')}</div>`
+}
+
+// One place to report a failed fetch, so no view has to.
+async function render(fn) {
+  try {
+    await fn()
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  } catch (e) {
+    document.getElementById('view').innerHTML =
+      `<div class="panel"><p class="empty"><span class="bad">${esc(e.message)}</span><br>
+       <span class="dim">tappscan may still be starting its first scan.</span></p></div>`
+  }
+}
+
+// Repaint whatever is on screen after the wallet connects or disconnects.
+const refreshView = () => {
+  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
+  render(app ? () => showApp(app) : showList)
+}
+
+addEventListener('hashchange', () => {
+  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
+  render(app ? () => showApp(app) : showList)
+})
+paintWallet()
+if (eth()) {
+  // Reflect a wallet that is already unlocked, without prompting.
+  eth().request({ method: 'eth_accounts' }).then(([a]) => {
+    if (a) { account = a; paintWallet(); refreshView() }
+  }).catch(() => {})
+  eth().on?.('accountsChanged', ([a]) => { account = a || null; paintWallet(); refreshView() })
+}
+refreshView()
+</script>

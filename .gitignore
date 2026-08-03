@@ -1,0 +1,3 @@
+# Rust build artifacts — hundreds of MB, and a single debug binary exceeds
+# GitHub's per-file limit.
+target/

@@ -1,0 +1,85 @@
+# Hosted deployment: trustee (layer 1 machinery) + tappscan (layer 3), on one host.
+#
+# This is deliberately NOT ../tdx-boot-chain/docker-compose.yml. That one is for
+# running a verifier locally and publishes the AS on :50004 so run.sh can drive
+# it — correct for a stack you own and reach over loopback. In a hosted stack the
+# AS must NOT be publicly writable, because SetAttestationPolicy has no
+# authentication whatsoever: anyone who can reach it can overwrite any policy id.
+# So here the AS stays on the internal network and everything public goes through
+# a proxy that refuses the write method.
+#
+#   docker compose -f scan/docker-compose.yml up -d --build   (from the repo root)
+
+services:
+  rvps:
+    image: ghcr.io/confidential-containers/staged-images/rvps:latest
+    volumes:
+      - ../tdx-boot-chain/rvps-data:/opt/confidential-containers/attestation-service/reference_values:rw
+      - ../tdx-boot-chain/rvps.json:/etc/rvps.json:ro
+    command: ["rvps", "--address", "0.0.0.0:50003", "--config", "/etc/rvps.json"]
+    restart: always
+    # Not published: nothing outside this network needs to reach RVPS, and its
+    # register API is unauthenticated.
+
+  as:
+    image: ghcr.io/confidential-containers/staged-images/coco-as-grpc:latest
+    depends_on: [rvps]
+    volumes:
+      - ../tdx-boot-chain/as-data:/var/lib/attestation-service:rw
+      - ../tdx-boot-chain/as-config.json:/etc/as-config.json:ro
+      - ../tdx-boot-chain/keys:/keys:rw
+    command: ["grpc-as", "--socket", "0.0.0.0:50004", "--config-file", "/etc/as-config.json"]
+    restart: always
+    # Not published either — reachable only via as-proxy below.
+
+  # Public AS endpoint for anyone verifying a node themselves (layer 2:
+  # `tapp-cli verify-app --as-endpoint <host>:50004`). Evaluate and challenge are
+  # allowed; policy writes are refused.
+  as-proxy:
+    image: nginx:1.27-alpine
+    depends_on: [as, scan]
+    ports: ["50004:50004"]
+    volumes:
+      # A template, not the final file: the shared authz secret is substituted at
+      # start so it lives in the environment rather than in the repo.
+      - ./nginx-as-readonly.conf:/etc/nginx/templates/nginx.conf.template:ro
+    environment:
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      TAPPSCAN_AUTHZ_SECRET: ${TAPPSCAN_AUTHZ_SECRET:?set this to any long random string, shared with the scan service}
+    restart: always
+
+  scan:
+    build:
+      context: ..
+      dockerfile: scan/Dockerfile
+    depends_on: [as]
+    # Host port is overridable because 9090 is a popular one to already have taken.
+    ports: ["${TAPPSCAN_PORT:-9090}:9090"]
+    volumes:
+      - tappscan-data:/var/lib/tappscan
+      # Published reference values, read at startup to identify CVM images. Kept
+      # a mount rather than baked in so a new release only needs a file update:
+      # git clone https://github.com/0gfoundation/0g-tapp and point this at
+      # its verifier/reference-values.
+      - ${TAPPSCAN_REFVALUES_HOST:-../../0g-tapp/verifier/reference-values}:/etc/tappscan/reference-values:ro
+    environment:
+      # Talks to the AS over the internal network, so the multi-megabyte evidence
+      # and token never leave the host.
+      TAPPSCAN_AS: as:50004
+      TAPPSCAN_REFERENCE_VALUES: /etc/tappscan/reference-values
+      TAPPSCAN_KEYS: /var/lib/tappscan/keys.json
+      TAPPSCAN_AUTHZ_SECRET: ${TAPPSCAN_AUTHZ_SECRET:?set this to any long random string, shared with the as-proxy}
+      TAPPSCAN_RPC: ${TAPPSCAN_RPC:-https://evmrpc-testnet.0g.ai}
+      TAPPSCAN_CONTRACT: ${TAPPSCAN_CONTRACT:-0x2Ce80374318B1d7Fb3345724457a182E0ad165c9}
+      # Earliest event of the contract above; scanning from 0 works but wastes
+      # ~40M blocks of splitting. MUST be changed together with the contract —
+      # a from-block later than a registry's first event silently loses history,
+      # and it cannot be detected automatically: the 0G public RPC is pruned, so
+      # eth_getCode at a historical block returns "state is not available" and a
+      # deployment-block search would converge on the chain head.
+      TAPPSCAN_FROM_BLOCK: ${TAPPSCAN_FROM_BLOCK:-40273630}
+      RUST_LOG: ${RUST_LOG:-tappscan=info}
+    restart: always
+
+volumes:
+  tappscan-data:
