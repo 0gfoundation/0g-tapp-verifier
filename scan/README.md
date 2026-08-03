@@ -131,21 +131,33 @@ Signed requests follow the convention tapp-server already uses — the message i
 `method:args…:unix_timestamp`, signed with personal_sign and accepted inside a
 ±120s window — so there is no challenge to fetch first.
 
+[`as-key.sh`](as-key.sh) does the signing:
+
 ```bash
-MSG="issue_key:ci:90:$(date +%s)"                       # expiry: 30 | 90 | never
-SIG=$(cast wallet sign --private-key 0x<admin> "$MSG")
+export TAPPSCAN=<host>:9090 ADMIN_KEY=0x<admin>   # or CAST_WALLET_ARGS='--account admin'
 
-curl -sX POST http://<host>:9090/api/keys \
-  -H 'content-type: application/json' \
-  -d "{\"message\":\"$MSG\",\"signature\":\"$SIG\"}"     # the key is shown once
-
-# then, wherever a policy is registered:
-AS_WRITE_KEY=tsk_… verifier/register-shared-as.sh <cloud> <format> <version> <env>
+scan/as-key.sh issue ci never > /root/as-write-key   # expiry: 30 | 90 | never
+scan/as-key.sh list
+scan/as-key.sh revoke <key-id>                       # bites on the next request
 ```
 
-`GET /api/keys` lists every key's metadata (never a hash). Revoking is the same
-shape — `revoke_key:<id>:<timestamp>` to `POST /api/keys/revoke` — and bites on the
-next request.
+An issued key goes to **stdout and nothing else does**, so it can be moved without
+being displayed:
+
+```bash
+gh secret set AS_WRITE_KEY -R 0gfoundation/0g-tapp < /root/as-write-key
+```
+
+That split is not fastidiousness. A key shown once and then pasted into a terminal
+lives on in scrollback, and the copy someone reaches for later is whichever one they
+can still see — which is how a revoked key ends up in CI while the live one sits in
+a file. Keep the metadata (`issue`'s id and expiry, `list`'s table) and the secret on
+separate channels and that cannot happen.
+
+For the same reason a refused write says only 403: `list` shows metadata but never a
+hash, and `last_used` records successes only, so a rejected key leaves no trace to
+correlate. When CI is refused, reissue rather than guess — and keep exactly one key
+active per consumer, so "which key was that" has no answer to get wrong.
 
 A window alone would leave a signature replayable until it expired, which for issuing
 would mint duplicate keys, so spent signatures are remembered for the width of the
