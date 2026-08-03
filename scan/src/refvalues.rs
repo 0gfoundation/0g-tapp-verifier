@@ -176,7 +176,28 @@ impl SetMatch {
     }
 }
 
-/// Compare measurements against every reference set, best match first.
+impl RefSet {
+    /// Which boot format this set describes, from the components it constrains: a
+    /// UKI set pins the one fused measurement, a grub set pins shim/grub/kernel/…
+    pub fn boot_format(&self) -> &'static str {
+        if self.values.keys().any(|c| c == "grub" || c == "shim") {
+            "grub"
+        } else {
+            "uki"
+        }
+    }
+}
+
+/// Compare measurements against EVERY reference set, best match first.
+///
+/// Deliberately exhaustive rather than narrowed by a lookup. There is information
+/// that could narrow it — boot format is structural, the EFI directory name gives
+/// the distro, a kernel version appears in the grub commands — but all of it is
+/// inference, and inferring wrongly would skip the set that would have matched and
+/// report "unknown image": our own heuristic blaming the node. Comparing everything
+/// cannot fail that way, and costs microseconds on data already in hand.
+///
+/// Narrowing does belong in the DIAGNOSTIC, though — see `closest`.
 pub fn match_sets(measured: &Measured, sets: &[RefSet]) -> Vec<SetMatch> {
     let mut out: Vec<SetMatch> = sets
         .iter()
@@ -208,6 +229,29 @@ pub fn match_sets(measured: &Measured, sets: &[RefSet]) -> Vec<SetMatch> {
             .then(a.label.cmp(&b.label))
     });
     out
+}
+
+/// The best set to point at when nothing matched fully.
+///
+/// Only sets that could plausibly apply: same boot format, and at least one
+/// component in common. Ranking purely by hit count once named a UKI set as the
+/// closest thing to a grub node at 0 of 1 components — worse than saying nothing,
+/// because it sends the reader to the wrong file.
+pub fn closest<'a>(
+    measured: &Measured,
+    sets: &'a [RefSet],
+    matches: &'a [SetMatch],
+) -> Option<&'a SetMatch> {
+    let format = measured.boot_format();
+    let comparable: std::collections::HashSet<&str> = sets
+        .iter()
+        .filter(|s| s.boot_format() == format)
+        .map(|s| s.label.as_str())
+        .collect();
+    matches
+        .iter()
+        .filter(|m| !m.matched && m.hits() > 0 && comparable.contains(m.label.as_str()))
+        .max_by_key(|m| m.hits())
 }
 
 #[cfg(test)]
@@ -285,6 +329,36 @@ mod tests {
         let mut uki = Measured::default();
         uki.add(ANY_BSA, "u");
         assert_eq!(uki.boot_format(), "uki");
+    }
+
+    /// A grub node must never be told its closest reference is a UKI set, and a set
+    /// sharing nothing with it is not a lead worth following.
+    #[test]
+    fn closest_only_offers_a_comparable_set() {
+        let mut m = Measured::default();
+        m.add("shim", "s1");
+        m.add("grub", "g1");
+        m.add("kernel", "k-actual");
+        m.add(ANY_BSA, "s1");
+
+        let sets = vec![
+            set("ali/uki/v0.3.0/dev.json", &[(ANY_BSA, &["u-other"])]),
+            set("gcp/grub/v0.2.0/dev.json",
+                &[("shim", &["s1"]), ("grub", &["g1"]), ("kernel", &["k-published"])]),
+            set("gcp/grub/v0.1.0/dev.json",
+                &[("shim", &["nope"]), ("grub", &["nope"]), ("kernel", &["nope"])]),
+        ];
+        let matches = match_sets(&m, &sets);
+        assert!(matches.iter().all(|x| !x.matched));
+
+        let c = closest(&m, &sets, &matches).expect("a comparable set");
+        assert_eq!(c.label, "gcp/grub/v0.2.0/dev.json");
+        assert_eq!(c.hits(), 2); // shim + grub; kernel is the one that differs
+
+        // Nothing comparable at all → no lead, rather than a misleading one.
+        let uki_only = vec![set("ali/uki/v0.3.0/dev.json", &[(ANY_BSA, &["u-other"])])];
+        let m2 = match_sets(&m, &uki_only);
+        assert!(closest(&m, &uki_only, &m2).is_none());
     }
 
     #[test]

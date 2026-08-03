@@ -60,22 +60,38 @@ pub struct Entry {
     pub attested: Option<Attested>,
 }
 
-/// What a successful attestation established.
+/// What one attestation OBSERVED — and only that.
+///
+/// The test for belonging here is whether recomputing it later could give a
+/// different answer. These cannot: they were read out of a signed token at
+/// `checked_at`, and re-reading that same evidence a year from now yields the same
+/// values.
+///
+/// Anything that compares an observation against something outside it is derived
+/// and is NOT stored, because the outside thing moves and a stored answer then goes
+/// quietly stale:
+///
+/// * which image this is, and which set it came closest to — needs the published
+///   reference values, which change (and a set published later identifies these
+///   measurements retroactively, retired signers included);
+/// * whether the attested signer matches its registration — needs the chain, where
+///   a node can be removed or replaced.
+///
+/// Both are recomputed on read. Storing them once cost a day of chasing verdicts
+/// that were frozen against values that had since moved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attested {
-    pub ear_status: String,
+    /// Platform TCB level as the AS reported it, and the advisories it names.
     pub tcb_status: String,
     pub advisories: Vec<String>,
+    /// The address in the quote's report_data. Whether it MATCHES the registration
+    /// is derived — the chain moves.
     pub attested_signer: Option<String>,
-    pub signer_ok: bool,
+    /// grub or uki, decided structurally from `measured` alone.
     pub boot_format: String,
-    /// Label of the reference set that fully matched, if any.
-    pub image: Option<String>,
-    /// Best partial match when nothing matched fully — the useful diagnostic.
-    pub closest: Option<ClosestMatch>,
-    /// The digests this node actually measured, component → digests. Kept even
-    /// though it is derivable from the evidence: when an image does not match,
-    /// this is what someone needs in order to fix a reference value.
+    /// Boot-chain digests this node measured, component → digests. The whole map,
+    /// pseudo-components included: filtering here is what once made a UKI node —
+    /// whose only component is a pseudo-component — store nothing at all.
     pub measured: BTreeMap<String, Vec<String>>,
     pub runtime_replay_ok: bool,
 
@@ -103,6 +119,49 @@ pub struct ClosestMatch {
     pub total: usize,
 }
 
+impl Attested {
+    /// Whether the quote's address is the one registered on chain for this node.
+    /// Derived, not stored: a registration can be replaced or removed.
+    pub fn signer_ok(&self, registered: &str) -> bool {
+        self.attested_signer
+            .as_deref()
+            .map(|a| a.eq_ignore_ascii_case(registered))
+            .unwrap_or(false)
+    }
+
+    /// Re-derive the verdict from the stored measurements against the reference
+    /// values loaded right now.
+    pub fn identify(
+        &self,
+        sets: &[crate::refvalues::RefSet],
+    ) -> (Option<String>, Option<ClosestMatch>) {
+        let mut measured = crate::refvalues::Measured::default();
+        for (component, digests) in &self.measured {
+            for d in digests {
+                measured.add(component, d);
+            }
+        }
+        let matches = crate::refvalues::match_sets(&measured, sets);
+        let image = matches.iter().find(|m| m.matched).map(|m| m.label.clone());
+        let closest = if image.is_some() {
+            None
+        } else {
+            crate::refvalues::closest(&measured, sets, &matches).map(|m| ClosestMatch {
+                label: m.label.clone(),
+                failed: m
+                    .components
+                    .iter()
+                    .filter(|(_, ok)| !ok)
+                    .map(|(c, _)| c.clone())
+                    .collect(),
+                hits: m.hits(),
+                total: m.components.len(),
+            })
+        };
+        (image, closest)
+    }
+}
+
 impl Entry {
     /// Record a failed attempt so the explorer can show it and readers stop
     /// retrying it until the chain moves or the age limit passes.
@@ -128,22 +187,6 @@ impl Entry {
     }
 
     pub fn from_status(status: &NodeStatus, app_id: &str, app_latest_block: u64) -> Self {
-        let closest = status
-            .matches
-            .iter()
-            .find(|m| !m.matched)
-            .filter(|_| status.image.is_none())
-            .map(|m| ClosestMatch {
-                label: m.label.clone(),
-                failed: m
-                    .components
-                    .iter()
-                    .filter(|(_, ok)| !ok)
-                    .map(|(c, _)| c.clone())
-                    .collect(),
-                hits: m.hits(),
-                total: m.components.len(),
-            });
         Self {
             app_id: app_id.to_string(),
             signer: status.signer.clone(),
@@ -153,19 +196,17 @@ impl Entry {
             error: None,
             verifier_fault: false,
             attested: Some(Attested {
-            ear_status: status.ear_status.clone(),
             tcb_status: status.tcb_status.clone(),
             advisories: status.advisories.clone(),
             attested_signer: status.attested_signer.clone(),
-            signer_ok: status.signer_ok,
             boot_format: status.boot_format.to_string(),
-            image: status.image.clone(),
-            closest,
+            // Every component, the ANY_BSA pseudo-component included: it is what a
+            // UKI reference value matches against, so dropping it would make a
+            // re-identification impossible. Display filters it, storage does not.
             measured: status
                 .measured
                 .0
                 .iter()
-                .filter(|(component, _)| !component.starts_with('_'))
                 .map(|(component, digests)| {
                     (component.clone(), digests.iter().cloned().collect())
                 })
@@ -182,10 +223,10 @@ impl Entry {
         (now - self.checked_at).max(0)
     }
 
-    /// The image this node was identified as, if the attempt succeeded and a
-    /// reference set fully matched.
-    pub fn image(&self) -> Option<&str> {
-        self.attested.as_ref()?.image.as_deref()
+    /// The image this node is identified as against the reference values given.
+    /// Derived on every call — see [`Attested`] for why it is not stored.
+    pub fn image(&self, sets: &[crate::refvalues::RefSet]) -> Option<String> {
+        self.attested.as_ref()?.identify(sets).0
     }
 }
 
@@ -312,14 +353,10 @@ mod tests {
             error: None,
             verifier_fault: false,
             attested: Some(Attested {
-                ear_status: "affirming".into(),
                 tcb_status: "UpToDate".into(),
                 advisories: vec![],
                 attested_signer: Some(signer.to_lowercase()),
-                signer_ok: true,
                 boot_format: "uki".into(),
-                image: Some("gcp/uki/v0.3.0/dev.json".into()),
-                closest: None,
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
                 event_count: 0,
@@ -377,6 +414,63 @@ mod tests {
         assert_eq!(mine[0].signer, "0xaaa");
     }
 
+    /// The round trip, which nothing covered before: a UKI node's measurements go
+    /// through the store and must still identify afterwards.
+    ///
+    /// This is the shape that broke. A UKI image measures exactly one component, and
+    /// it is the ANY_BSA pseudo-component; storage used to drop names starting with
+    /// `_` — a display decision applied at write time — so a UKI node persisted an
+    /// EMPTY measurement map. Nothing noticed while the verdict was computed at check
+    /// time and stored beside it. The moment the verdict was derived from storage
+    /// instead, every UKI node became unidentifiable.
+    #[test]
+    fn a_uki_measurement_survives_storage_and_still_identifies() {
+        use crate::refvalues::{RefSet, ANY_BSA};
+
+        let mut measured = crate::refvalues::Measured::default();
+        measured.add(ANY_BSA, "u-digest");
+        let status = crate::attest::NodeStatus {
+            signer: "0xaaa".into(),
+            tee_url: "http://node:50051".into(),
+            checked_at: 1000,
+            tcb_status: "OutOfDate".into(),
+            advisories: vec![],
+            attested_signer: Some("0xaaa".into()),
+            boot_format: "uki",
+            measured,
+            matches: vec![],
+            runtime_events: vec![],
+            replay_mismatches: 0,
+            note: String::new(),
+        };
+
+        let dir = std::env::temp_dir().join(format!("tappscan-uki-{}", std::process::id()));
+        let path = dir.join("status.json");
+        let mut store = Store::default();
+        store.put(Entry::from_status(&status, "app", 1));
+        store.save(&path).unwrap();
+
+        let reloaded = Store::load(&path);
+        let entry = reloaded.get("app", "0xaaa").expect("entry survived");
+        let attested = entry.attested.as_ref().expect("attested survived");
+        assert!(
+            attested.measured.contains_key(ANY_BSA),
+            "the only component a UKI node measures must be stored, or it can never \
+             be identified again: {:?}",
+            attested.measured
+        );
+
+        let sets = vec![RefSet {
+            label: "ali/uki/v0.3.0/dev.json".into(),
+            values: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+        }];
+        let (image, closest) = attested.identify(&sets);
+        assert_eq!(image.as_deref(), Some("ali/uki/v0.3.0/dev.json"));
+        assert!(closest.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("tappscan-test-{}", std::process::id()));
@@ -406,7 +500,7 @@ mod tests {
         let e = s.get("app", "0xaaa").expect("cached failure");
         assert_eq!(e.error.as_deref(), Some("App app not found"));
         assert!(e.attested.is_none());
-        assert_eq!(e.image(), None);
+        assert_eq!(e.image(&[]), None);
         assert_eq!(s.freshness("app", "0xaaa", 100, 300, 1000), Freshness::Fresh);
         // …but a chain change still forces a retry.
         assert_eq!(

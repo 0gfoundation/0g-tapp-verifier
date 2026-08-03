@@ -36,6 +36,9 @@ pub struct Shared {
     pub rpc_url: String,
     /// Which reference values this instance is comparing against.
     pub reference_values: crate::refvalues::Provenance,
+    /// The loaded sets themselves, so a stored measurement can be re-identified
+    /// against today's values rather than the ones present when it was taken.
+    pub ref_sets: Arc<Vec<crate::refvalues::RefSet>>,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
 }
@@ -54,6 +57,26 @@ pub fn router(state: AppState) -> Router {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("index.html"))
+}
+
+/// Re-derive `image` and `closest` from the stored measurements against the
+/// currently loaded reference values, so a verdict is never older than the values
+/// it was reached against. Also hides the ANY_BSA pseudo-component, which is a
+/// matching device rather than something a node measured under that name.
+fn refreshed_verdict(entry: &status::Entry, sets: &[crate::refvalues::RefSet]) -> serde_json::Value {
+    let mut v = serde_json::to_value(entry).unwrap_or(json!({}));
+    let Some(a) = &entry.attested else { return v };
+    let (image, closest) = a.identify(sets);
+    if let Some(obj) = v.get_mut("attested").and_then(|a| a.as_object_mut()) {
+        obj.insert("image".into(), json!(image));
+        obj.insert("closest".into(), json!(closest));
+        // Also derived: the registration this is compared against can change.
+        obj.insert("signer_ok".into(), json!(a.signer_ok(&entry.signer)));
+        if let Some(m) = obj.get_mut("measured").and_then(|m| m.as_object_mut()) {
+            m.retain(|k, _| !k.starts_with('_'));
+        }
+    }
+    v
 }
 
 fn now() -> i64 {
@@ -136,10 +159,11 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                 .iter()
                 .filter_map(|signer| s.store.get(&app_id, signer))
                 .collect();
-            let mut images: Vec<String> = cached
+            let identified: Vec<Option<String>> = cached
                 .iter()
-                .filter_map(|e| e.image().map(str::to_string))
+                .map(|e| e.image(&s.ref_sets))
                 .collect();
+            let mut images: Vec<String> = identified.iter().flatten().cloned().collect();
             images.sort();
             images.dedup();
             AppSummary {
@@ -148,7 +172,7 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                 signers_ever: t.signers.len(),
                 latest_block: t.latest_block(),
                 reachable: cached.iter().filter(|e| e.attested.is_some()).count(),
-                identified: cached.iter().filter(|e| e.image().is_some()).count(),
+                identified: identified.iter().flatten().count(),
                 failed: cached
                     .iter()
                     .filter(|e| e.error.is_some() && !e.verifier_fault)
@@ -189,7 +213,7 @@ async fn app_detail(
         .map(|h| {
             let entry = s.store.get(&app_id, &h.signer);
             let mut status = entry
-                .map(|e| serde_json::to_value(e).unwrap_or(json!({})))
+                .map(|e| refreshed_verdict(e, &s.ref_sets))
                 .unwrap_or(json!(null));
             let mut trace_events = 0;
             if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {

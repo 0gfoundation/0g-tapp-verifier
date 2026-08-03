@@ -187,19 +187,18 @@ pub struct NodeStatus {
     /// this moment — attestation is a snapshot, not a standing property.
     pub checked_at: i64,
 
-    pub ear_status: String,
     pub tcb_status: String,
     pub advisories: Vec<String>,
-    /// Signer attested in the quote, and whether it equals the on-chain signer.
+    /// Signer attested in the quote. Whether it EQUALS the registered one is derived
+    /// where it is used — the registration can change.
     pub attested_signer: Option<String>,
-    pub signer_ok: bool,
 
     pub boot_format: &'static str,
     pub measured: Measured,
-    /// Reference sets, best match first.
+    /// How the measurements compared against each reference set at check time.
+    /// Informational only: the verdict is re-derived wherever it is shown, since
+    /// the published values move (see [`crate::status::Attested`]).
     pub matches: Vec<SetMatch>,
-    /// Label of the image whose reference values fully matched, if any.
-    pub image: Option<String>,
 
     pub runtime_events: Vec<RuntimeEvent>,
     /// Event-log entries whose digest the AS could not reproduce. Firmware
@@ -349,11 +348,6 @@ pub async fn check_node(
         signer: signer.to_lowercase(),
         tee_url: tee_url.to_string(),
         checked_at: now,
-        ear_status: cpu
-            .get("ear.status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
         tcb_status: tdx
             .get("tcb_status")
             .and_then(Value::as_str)
@@ -369,13 +363,8 @@ pub async fn check_node(
                     .collect()
             })
             .unwrap_or_default(),
-        signer_ok: attested
-            .as_deref()
-            .map(|a| a.eq_ignore_ascii_case(signer))
-            .unwrap_or(false),
         attested_signer: attested,
         boot_format: measured.boot_format(),
-        image: matches.iter().find(|m| m.matched).map(|m| m.label.clone()),
         matches,
         measured,
         replay_mismatches: logs

@@ -79,7 +79,13 @@ struct AttestOpts {
 #[derive(Subcommand)]
 enum Command {
     /// List every app the registry has seen, with its current node signers
-    Apps,
+    Apps {
+        /// Published reference values, needed to say WHICH image a node runs.
+        /// Without them the listing reports the cached results it has but cannot
+        /// name an image — which is different from not recognising one.
+        #[arg(long, env = "TAPPSCAN_REFERENCE_VALUES")]
+        reference_values: Option<PathBuf>,
+    },
     /// Show one app's update history, split by hardware identity
     History {
         /// App id (or its 0x… hash, for apps whose name could not be recovered)
@@ -198,10 +204,17 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
-        Command::Apps => {
+        Command::Apps { reference_values } => {
             let apps = registry.apps();
             let store = status::Store::load(&cli.status);
             let now = unix_now();
+            let ref_sets = match &reference_values {
+                Some(dir) => refvalues::load_dir(dir)?,
+                None => {
+                    tracing::warn!("no --reference-values: images cannot be named");
+                    vec![]
+                }
+            };
             println!("{} app(s) on {}\n", apps.len(), registry.contract);
             for app in apps {
                 let t = registry.timeline(&app);
@@ -212,7 +225,7 @@ async fn main() -> Result<()> {
                     t.entries.len(),
                     t.signers.len(),
                     signers.len(),
-                    attestation_summary(&store, &app, &signers, now)
+                    attestation_summary(&store, &app, &signers, &ref_sets, now)
                 );
             }
         }
@@ -325,14 +338,14 @@ async fn main() -> Result<()> {
                 force,
                 unix_now(),
             );
-            run_jobs(scanner.clone(), &mut store, jobs, &opts, ref_sets).await;
+            run_jobs(scanner.clone(), &mut store, jobs, &opts, ref_sets.clone()).await;
             store.save(&cli.status)?;
 
             println!("{app_id}  —  {} active node(s)\n", signers.len());
             let now = unix_now();
             for signer in &signers {
                 match store.get(&app_id, signer) {
-                    Some(entry) => print_entry(entry, now, events, scope, &app_id),
+                    Some(entry) => print_entry(entry, now, events, scope, &app_id, &ref_sets),
                     None => println!("  {signer}\n    ✗ never attested (see log above)\n"),
                 }
             }
@@ -391,6 +404,7 @@ async fn main() -> Result<()> {
                 balances: Default::default(),
                 rpc_url: cli.rpc_url.clone(),
                 reference_values: refvalues::provenance(&opts.reference_values, &ref_sets),
+                ref_sets: ref_sets.clone(),
                 refreshed_at: unix_now(),
             }));
 
@@ -488,6 +502,7 @@ fn attestation_summary(
     store: &status::Store,
     app_id: &str,
     signers: &[String],
+    ref_sets: &[refvalues::RefSet],
     now: i64,
 ) -> String {
     if signers.is_empty() {
@@ -498,9 +513,12 @@ fn attestation_summary(
         return "not attested yet".to_string();
     }
     let failed = cached.iter().filter(|e| e.error.is_some()).count();
-    let identified = cached.iter().filter(|e| e.image().is_some()).count();
+    // Identity is a comparison against today's reference values, so it is derived
+    // here rather than read back from the cache.
+    let named: Vec<Option<String>> = cached.iter().map(|e| e.image(ref_sets)).collect();
+    let identified = named.iter().flatten().count();
     let images: std::collections::BTreeSet<&str> =
-        cached.iter().filter_map(|e| e.image()).collect();
+        named.iter().flatten().map(String::as_str).collect();
     let oldest = cached.iter().map(|e| e.age_secs(now)).max().unwrap_or(0);
     let state = match (failed, images.len()) {
         (f, _) if f == cached.len() => "✗ all attempts failed".to_string(),
@@ -666,6 +684,7 @@ fn print_entry(
     event_limit: usize,
     scope: EventScope,
     app_id: &str,
+    ref_sets: &[refvalues::RefSet],
 ) {
     println!("  {}", s.signer);
     println!("    teeUrl     : {}", s.tee_url);
@@ -689,7 +708,7 @@ fn print_entry(
     // identity and the one the node holds are two different things, and neither has
     // standing: the registered signer cannot be attested (it exists nowhere) and
     // the attested one is not registered (so it has no claim on the app's key).
-    if a.signer_ok {
+    if a.signer_ok(&s.signer) {
         println!("    signer     : ✓ the quote attests this address");
     } else {
         println!(
@@ -718,7 +737,8 @@ fn print_entry(
 
     // Boot chain: a partial match ("this image except its initrd") is the useful
     // diagnostic, so report which component differs rather than pass/fail.
-    match (&a.image, &a.closest) {
+    let (image, closest) = a.identify(ref_sets);
+    match (&image, &closest) {
         (Some(label), _) => println!("    image      : ✓ {label}  ({} boot)", a.boot_format),
         (None, Some(c)) => {
             println!(
