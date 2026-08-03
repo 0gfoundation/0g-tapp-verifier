@@ -429,7 +429,7 @@ async fn main() -> Result<()> {
                 api_keys: keys::KeyStore::load(&keys_path),
                 keys_path,
                 admin,
-                challenges: Default::default(),
+                spent: Default::default(),
                 authz_secret,
                 balances: Default::default(),
                 rpc_url: cli.rpc_url.clone(),

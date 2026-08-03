@@ -41,9 +41,10 @@ pub struct Shared {
     /// The registry's admin address — the only signature that may mint a key. Read
     /// from the chain at startup so the authority is the one the chain records.
     pub admin: Option<String>,
-    /// Outstanding issue challenges: nonce → (message, expiry). A challenge makes a
-    /// signature single-use, so one captured off a screen cannot mint a second key.
-    pub challenges: BTreeMap<String, (String, i64)>,
+    /// Signatures already spent, digest → when seen. A timestamp window alone lets
+    /// the same signature be replayed until it expires; remembering it for the width
+    /// of the window makes each one single-use without a round trip.
+    pub spent: BTreeMap<String, i64>,
     /// Shared with the proxy so the authz check is not a public key-testing oracle.
     pub authz_secret: Option<String>,
     /// Which reference values this instance is comparing against.
@@ -67,7 +68,6 @@ pub fn router(state: AppState) -> Router {
         // Key management. Minting and revoking require a signature from the
         // registry's admin; listing is metadata only and carries no secret.
         .route("/api/keys", get(list_keys).post(issue_key))
-        .route("/api/keys/challenge", post(key_challenge))
         .route("/api/keys/revoke", post(revoke_key))
         // Called by the proxy in front of the AS, never by a browser.
         .route("/internal/authz", get(authz))
@@ -378,137 +378,104 @@ fn random_hex(bytes: usize) -> String {
     hex::encode(buf)
 }
 
-#[derive(Deserialize)]
-struct ChallengeRequest {
-    /// What the key is for, so the record says who has it.
-    label: String,
-    /// `30`, `90` or `never`.
-    expires: String,
-}
-
-/// Hand out a message for the admin to sign.
-///
-/// The message names the registry, the chain, what will be minted and a nonce, so a
-/// signature authorises exactly one key on exactly one deployment and cannot be
-/// replayed to mint another.
-async fn key_challenge(
-    State(state): State<AppState>,
-    Json(req): Json<ChallengeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let ttl = keys::Ttl::parse(&req.expires).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    if req.label.trim().is_empty() || req.label.len() > 64 {
-        return Err((StatusCode::BAD_REQUEST, "label must be 1-64 chars".into()));
-    }
-    let mut s = state.write().await;
-    let admin = s
-        .admin
-        .clone()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
-    let nonce = random_hex(16);
-    let expires_at = now() + 300;
-    let message = format!(
-        "tappscan: issue policy-write key\n\
-         registry: {}\n\
-         chain: {}\n\
-         label: {}\n\
-         expires: {}\n\
-         nonce: {}",
-        s.registry.contract,
-        s.registry.chain_id,
-        req.label.trim(),
-        ttl.label(),
-        nonce
-    );
-    // Drop challenges nobody signed rather than accumulating them.
-    let cutoff = now();
-    s.challenges.retain(|_, (_, exp)| *exp > cutoff);
-    s.challenges.insert(nonce.clone(), (message.clone(), expires_at));
-    Ok(Json(json!({
-        "message": message,
-        "sign_with": admin,
-        "valid_until": expires_at,
-    })))
-}
+/// Signed requests follow the convention tapp-server already uses: the message is
+/// `method:args…:unix_timestamp`, signed with personal_sign, accepted inside a
+/// window. No challenge round trip — a caller builds the message itself.
+const SIGN_WINDOW_SECS: i64 = 120;
 
 #[derive(Deserialize)]
-struct IssueRequest {
-    /// The exact message handed out by the challenge endpoint.
+struct SignedRequest {
+    /// The exact signed message.
     message: String,
     /// Its personal_sign signature, 0x-prefixed.
     signature: String,
 }
 
-/// Verify an admin signature over an outstanding challenge and mint the key. The
-/// secret is in this response and nowhere else, ever.
-async fn issue_key(
-    State(state): State<AppState>,
-    Json(req): Json<IssueRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+/// Verify a signed request came from the registry admin, recently, and only once.
+///
+/// A timestamp window on its own leaves the signature replayable until it expires,
+/// which for key issuing would mint duplicates; spent signatures are therefore
+/// remembered for the width of the window. That is all the state a challenge
+/// endpoint was buying, without the extra round trip.
+async fn admin_says(
+    state: &AppState,
+    expect_method: &str,
+    req: &SignedRequest,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
     let mut s = state.write().await;
     let admin = s
         .admin
         .clone()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
 
-    // The nonce must be one we issued and have not spent.
-    let nonce = req
-        .message
-        .lines()
-        .find_map(|l| l.strip_prefix("nonce: "))
-        .map(str::to_string)
-        .ok_or((StatusCode::BAD_REQUEST, "message has no nonce".into()))?;
-    let (expected, expiry) = s
-        .challenges
-        .get(&nonce)
-        .cloned()
-        .ok_or((StatusCode::BAD_REQUEST, "unknown or already used challenge".into()))?;
-    if expected != req.message {
-        return Err((StatusCode::BAD_REQUEST, "message does not match the challenge".into()));
+    let parts: Vec<String> = req.message.split(':').map(str::to_string).collect();
+    if parts.len() < 2 || parts[0] != expect_method {
+        return Err(bad(&format!("message must start with {expect_method}:")));
     }
-    if now() > expiry {
-        s.challenges.remove(&nonce);
-        return Err((StatusCode::BAD_REQUEST, "challenge expired".into()));
+    let timestamp: i64 = parts
+        .last()
+        .and_then(|t| t.trim().parse().ok())
+        .ok_or_else(|| bad("message must end with a unix timestamp"))?;
+    let now = now();
+    if (now - timestamp).abs() > SIGN_WINDOW_SECS {
+        return Err(bad("timestamp outside the accepted window"));
     }
 
     let signature: ethers::types::Signature = req
         .signature
         .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "signature is not readable".into()))?;
+        .map_err(|_| bad("signature is not readable"))?;
     let recovered = signature
         .recover(req.message.as_str())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "signature does not recover".into()))?;
+        .map_err(|_| bad("signature does not recover"))?;
     let recovered = format!("0x{}", hex::encode(recovered.as_bytes()));
     if !recovered.eq_ignore_ascii_case(&admin) {
-        tracing::warn!("key issue refused: signed by {recovered}, admin is {admin}");
+        tracing::warn!("{expect_method} refused: signed by {recovered}, admin is {admin}");
         return Err((
             StatusCode::FORBIDDEN,
-            "only the registry admin may issue keys".into(),
+            "only the registry admin may do this".into(),
         ));
     }
 
-    // Spend the challenge before minting, so a retry cannot mint twice.
-    s.challenges.remove(&nonce);
-    let label = req
-        .message
-        .lines()
-        .find_map(|l| l.strip_prefix("label: "))
-        .unwrap_or("unlabelled")
-        .to_string();
-    let ttl = req
-        .message
-        .lines()
-        .find_map(|l| l.strip_prefix("expires: "))
-        .and_then(|v| keys::Ttl::parse(v).ok())
-        .unwrap_or(keys::Ttl::Days30);
+    // Single use. Prune first so the set stays the size of one window.
+    s.spent.retain(|_, seen| now - *seen <= SIGN_WINDOW_SECS);
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(req.signature.as_bytes()));
+    if s.spent.insert(digest, now).is_some() {
+        return Err(bad("this signature has already been used"));
+    }
+    Ok(parts)
+}
 
+/// Mint a key for `issue_key:<label>:<30|90|never>:<timestamp>`. The secret is in
+/// this response and nowhere else, ever.
+async fn issue_key(
+    State(state): State<AppState>,
+    Json(req): Json<SignedRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let parts = admin_says(&state, "issue_key", &req).await?;
+    if parts.len() != 4 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "expected issue_key:<label>:<30|90|never>:<timestamp>".into(),
+        ));
+    }
+    let label = parts[1].trim().to_string();
+    if label.is_empty() || label.len() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "label must be 1-64 chars".into()));
+    }
+    let ttl = keys::Ttl::parse(&parts[2]).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let mut s = state.write().await;
+    let issued_by = s.admin.clone().unwrap_or_default();
     let secret = format!("tsk_{}", random_hex(24));
-    let record = s.api_keys.mint(&label, ttl, &recovered, now(), secret.clone());
+    let record = s.api_keys.mint(&label, ttl, &issued_by, now(), secret.clone());
     let path = s.keys_path.clone();
     if let Err(e) = s.api_keys.save(&path) {
         tracing::error!("could not persist api keys: {e}");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "could not store the key".into()));
     }
-    tracing::info!("issued key {} ({}) to {recovered}", record.id, ttl.label());
+    tracing::info!("issued key {} ({}) to {issued_by}", record.id, ttl.label());
     Ok(Json(json!({
         "key": secret,
         "id": record.id,
@@ -523,45 +490,28 @@ async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "admin": s.admin, "keys": s.api_keys.list() }))
 }
 
-#[derive(Deserialize)]
-struct RevokeRequest {
-    id: String,
-    message: String,
-    signature: String,
-}
-
-/// Revoking needs the same authority as issuing, over a message naming the key.
+/// Revoke, from `revoke_key:<id>:<timestamp>` — the same authority as issuing.
 async fn revoke_key(
     State(state): State<AppState>,
-    Json(req): Json<RevokeRequest>,
+    Json(req): Json<SignedRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let parts = admin_says(&state, "revoke_key", &req).await?;
+    if parts.len() != 3 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "expected revoke_key:<id>:<timestamp>".into(),
+        ));
+    }
+    let id = parts[1].clone();
     let mut s = state.write().await;
-    let admin = s
-        .admin
-        .clone()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin address unknown".into()))?;
-    if !req.message.contains(&req.id) {
-        return Err((StatusCode::BAD_REQUEST, "message must name the key id".into()));
-    }
-    let signature: ethers::types::Signature = req
-        .signature
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "signature is not readable".into()))?;
-    let recovered = signature
-        .recover(req.message.as_str())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "signature does not recover".into()))?;
-    let recovered = format!("0x{}", hex::encode(recovered.as_bytes()));
-    if !recovered.eq_ignore_ascii_case(&admin) {
-        return Err((StatusCode::FORBIDDEN, "only the registry admin may revoke".into()));
-    }
     s.api_keys
-        .revoke(&req.id, now())
+        .revoke(&id, now())
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     let path = s.keys_path.clone();
     s.api_keys
         .save(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tracing::info!("revoked key {}", req.id);
+    tracing::info!("revoked key {id}");
     Ok(StatusCode::NO_CONTENT)
 }
 

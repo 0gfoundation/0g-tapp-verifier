@@ -127,30 +127,29 @@ issued against the registry's **on-chain `admin`** — the authority the chain a
 records, rather than a second one invented here — and only a hash of each key is
 kept, so `keys.json` is an audit record and not a credential store.
 
+Signed requests follow the convention tapp-server already uses — the message is
+`method:args…:unix_timestamp`, signed with personal_sign and accepted inside a
+±120s window — so there is no challenge to fetch first.
+
 ```bash
-# 1. ask for a challenge
-curl -sX POST http://<host>:9090/api/keys/challenge \
-  -H 'content-type: application/json' \
-  -d '{"label":"ci","expires":"90"}'          # 30 | 90 | never
+MSG="issue_key:ci:90:$(date +%s)"                       # expiry: 30 | 90 | never
+SIG=$(cast wallet sign --private-key 0x<admin> "$MSG")
 
-# 2. sign the returned message with the admin key
-cast wallet sign --private-key 0x… "<message>"
-
-# 3. exchange the signature for the key — shown once
 curl -sX POST http://<host>:9090/api/keys \
   -H 'content-type: application/json' \
-  -d '{"message":"<message>","signature":"0x…"}'
+  -d "{\"message\":\"$MSG\",\"signature\":\"$SIG\"}"     # the key is shown once
 
 # then, wherever a policy is registered:
 AS_WRITE_KEY=tsk_… verifier/register-shared-as.sh <cloud> <format> <version> <env>
 ```
 
-`GET /api/keys` lists every key's metadata (never a hash). `POST /api/keys/revoke`
-takes the same admin signature over a message naming the key id, and takes effect on
-the next request.
+`GET /api/keys` lists every key's metadata (never a hash). Revoking is the same
+shape — `revoke_key:<id>:<timestamp>` to `POST /api/keys/revoke` — and bites on the
+next request.
 
-A challenge is single-use and lives five minutes, so a signature captured off a
-screen cannot mint a second key.
+A window alone would leave a signature replayable until it expired, which for issuing
+would mint duplicate keys, so spent signatures are remembered for the width of the
+window. Each signature is therefore good for exactly one key.
 
 ## HTTP interface
 
