@@ -1,0 +1,5 @@
+target/
+# Local caches written by `tappscan` when run outside a container.
+tappscan-cache.json
+tappscan-status.json
+tappscan-keys.json
