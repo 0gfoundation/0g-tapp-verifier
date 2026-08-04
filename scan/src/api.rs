@@ -249,13 +249,9 @@ async fn app_detail(
             let mut status = entry
                 .map(|e| refreshed_verdict(e, &s.ref_sets))
                 .unwrap_or(json!(null));
-            let mut trace_events = 0;
+            let (trace_events, trace_shown) = trace_counts(entry, &app_id);
+            // The payloads themselves are served by /events, not duplicated here.
             if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
-                trace_events = a
-                    .get("events")
-                    .and_then(|e| e.as_array())
-                    .map(|e| e.len())
-                    .unwrap_or(0);
                 a.remove("events");
             }
             json!({
@@ -268,6 +264,7 @@ async fn app_detail(
                 "reverifiable": h.is_current(),
                 "status": status,
                 "trace_events": trace_events,
+                "trace_shown": trace_shown,
             })
         })
         .collect();
@@ -315,6 +312,27 @@ fn in_scope(scope: &str, event_app: Option<&str>, app_id: &str) -> bool {
         // "app" and anything unrecognised.
         (_, Some(a)) => a == app_id,
     }
+}
+
+/// `(measured on this machine, what the trace shows for this app)`.
+///
+/// Both numbers come from one list through one filter — the same `in_scope` the
+/// events endpoint applies — because the label sits directly above those rows. Counting
+/// the machine there instead once printed "5 measured operations" above three rows: the
+/// two events belonging to another app on the same CVM were counted but not shown.
+fn trace_counts(entry: Option<&status::Entry>, app_id: &str) -> (usize, usize) {
+    entry
+        .and_then(|e| e.attested.as_ref())
+        .map(|a| {
+            (
+                a.events.len(),
+                a.events
+                    .iter()
+                    .filter(|ev| in_scope("app", ev.app_id(), app_id))
+                    .count(),
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 /// The measured runtime event log, newest last. Paged because a long-lived node's
@@ -565,5 +583,87 @@ async fn authz(State(state): State<AppState>, headers: HeaderMap) -> StatusCode 
             StatusCode::NO_CONTENT
         }
         None => StatusCode::FORBIDDEN,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attest::RuntimeEvent;
+    use std::collections::BTreeMap;
+
+    fn ev(operation: &str, app: Option<&str>) -> RuntimeEvent {
+        let payload = match app {
+            Some(a) => json!({"operation": operation, "app_id": a}),
+            // docker_login, claim_config, … carry no app id at all.
+            None => json!({"operation": operation}),
+        };
+        RuntimeEvent {
+            operation: operation.into(),
+            payload,
+            digest: None,
+            digest_matches: true,
+        }
+    }
+
+    fn entry_with(events: Vec<RuntimeEvent>) -> status::Entry {
+        status::Entry {
+            app_id: "mine".into(),
+            signer: "0xaaa".into(),
+            tee_url: "http://node:50051".into(),
+            checked_at: 1,
+            app_latest_block: 1,
+            error: None,
+            verifier_fault: false,
+            attested: Some(status::Attested {
+                tcb_status: "UpToDate".into(),
+                advisories: vec![],
+                attested_signer: Some("0xaaa".into()),
+                boot_format: "uki".into(),
+                measured: BTreeMap::new(),
+                runtime_replay_ok: true,
+                event_count: events.len(),
+                events,
+                note: String::new(),
+            }),
+        }
+    }
+
+    /// The label above the trace must count the rows the trace will render. A
+    /// machine-wide total there reads as a claim about this app: a node that had run
+    /// a previous app id showed "5 measured operations" over three rows.
+    #[test]
+    fn the_trace_label_counts_only_what_the_trace_shows() {
+        let e = entry_with(vec![
+            ev("claim_config", None),
+            ev("docker_login", None),
+            ev("start_app", Some("other")),
+            ev("stop_app", Some("other")),
+            ev("start_app", Some("mine")),
+        ]);
+        let (total, shown) = trace_counts(Some(&e), "mine");
+        assert_eq!(total, 5);
+        // This app's one operation, plus the two that belong to no app.
+        assert_eq!(shown, 3);
+    }
+
+    /// Every event is either shown here or attributed to another app — the difference
+    /// the page prints as "N more from other apps" must not include the shared ones,
+    /// which are shown under every app on the machine.
+    #[test]
+    fn the_remainder_is_exactly_the_other_apps_events() {
+        let events = vec![
+            ev("docker_login", None),
+            ev("start_app", Some("mine")),
+            ev("start_app", Some("other")),
+        ];
+        let e = entry_with(events);
+        let (total, shown) = trace_counts(Some(&e), "mine");
+        assert_eq!(total - shown, 1);
+    }
+
+    #[test]
+    fn a_node_that_never_attested_counts_nothing() {
+        assert_eq!(trace_counts(None, "mine"), (0, 0));
     }
 }

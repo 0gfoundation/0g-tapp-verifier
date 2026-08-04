@@ -42,7 +42,12 @@
 
   /* ── head ─────────────────────────────────────────────────────────────── */
   header { display:flex; flex-wrap:wrap; align-items:center; gap:var(--s3) }
-  h1 { margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.015em }
+  h1 {
+    margin:0; font-weight:700; letter-spacing:-.025em; line-height:1;
+    /* The one piece of branding on the page, so it gets to be the largest thing
+       on it — and it scales with the viewport rather than sitting at one size. */
+    font-size:clamp(1.75rem, 1.2rem + 1.8vw, 2.5rem);
+  }
   h1 b { color:var(--brand); font-weight:700 }
   .meta {
     margin:var(--s2) 0 var(--s5); color:var(--dim);
@@ -234,7 +239,6 @@ const isOff = (a) => !a.signers.length || (a.failed > 0 && a.reachable === 0)
 let showOff = false
 
 async function showList() {
-  history.replaceState(null, '', location.pathname)
   const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
   chain = h.chain
   document.getElementById('meta').innerHTML =
@@ -282,7 +286,7 @@ async function showList() {
         : 'The registry has no apps yet.'}</p></div>`
 
   view.querySelectorAll('tr.row').forEach(tr => {
-    const open = () => showApp(tr.dataset.app)
+    const open = () => go(tr.dataset.app)
     tr.onclick = open
     tr.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() } }
   })
@@ -362,8 +366,13 @@ function signerCard(h, now) {
       ? `${pill('ok', '✓')} every measured operation reproduces its digest`
       : pill('bad', 'mismatch')])
     if (h.trace_events) {
-      rows.push(['trace', `${plural(h.trace_events, 'measured operation')} on this machine
-        <div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
+      // Count what the trace actually shows — this app's operations plus the
+      // unattributable ones. The machine total belongs beside it, not in place of it.
+      const shown = h.trace_shown ?? h.trace_events
+      const others = h.trace_events - shown
+      rows.push(['trace', `${plural(shown, 'measured operation')}` +
+        (others ? ` <span class="dim">· ${others} more from other apps on this machine</span>` : '') +
+        `<div class="toolbar"><button data-trace="${esc(h.signer)}">open trace</button></div>`])
     }
     rows.push(['as of', `${age(now - st.checked_at)} <span class="dim mono">(${st.checked_at})</span>`])
   }
@@ -377,7 +386,6 @@ function signerCard(h, now) {
 }
 
 async function showApp(appId) {
-  history.replaceState(null, '', '#' + encodeURIComponent(appId))
   const d = await get('/api/apps/' + encodeURIComponent(appId))
   const current = d.signers.filter(h => h.current)
   const retired = d.signers.filter(h => !h.current).reverse()
@@ -396,9 +404,9 @@ async function showApp(appId) {
       restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
     ${retired.map(h => signerCard(h, d.now)).join('')}`
 
-  document.getElementById('back').onclick = () => render(showList)
+  document.getElementById('back').onclick = () => go('')
   view.querySelectorAll('button[data-trace]').forEach(b =>
-    b.onclick = () => render(() => showTrace(appId, b.dataset.trace)))
+    b.onclick = () => go(appId, b.dataset.trace))
   view.querySelectorAll('button[data-topup]').forEach(b => {
     const signer = b.dataset.topup
     b.onclick = () => {
@@ -445,7 +453,7 @@ async function showTrace(appId, signer) {
       <tbody>${rows}</tbody></table></div>`
       : `<div class="panel"><p class="empty">Nothing has been measured for this app on this
          node yet.</p></div>`}`
-  document.getElementById('back').onclick = () => render(() => showApp(appId))
+  document.getElementById('back').onclick = () => go(appId)
 }
 
 // ── wallet ───────────────────────────────────────────────────────────────────
@@ -581,16 +589,35 @@ async function render(fn) {
   }
 }
 
-// Repaint whatever is on screen after the wallet connects or disconnects.
-const refreshView = () => {
-  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
-  render(app ? () => showApp(app) : showList)
+// ── routing ──────────────────────────────────────────────────────────────────
+// Every view has a URL: '' is the list, '#<app>' one app, '#<app>/<signer>' that
+// signer's trace. Navigation happens by assigning the hash, which is what makes the
+// browser's own Back button work — it had been replaceState, so each view overwrote
+// the last and Back left the site entirely. It also makes every view linkable.
+
+// Signers are hex and app ids can contain anything, so only the app id is encoded;
+// '/' separates the two and must survive that encoding.
+const go = (appId, signer) => {
+  const hash = appId ? encodeURIComponent(appId) + (signer ? '/' + signer : '') : ''
+  if (hash === location.hash.slice(1)) return render(route())   // same URL: repaint
+  location.hash = hash
 }
 
-addEventListener('hashchange', () => {
-  const app = location.hash ? decodeURIComponent(location.hash.slice(1)) : null
-  render(app ? () => showApp(app) : showList)
-})
+const route = () => {
+  const raw = location.hash.slice(1)
+  if (!raw) return showList
+  const cut = raw.lastIndexOf('/')
+  // A trailing '/…' is a signer only if it looks like one; an app id containing a
+  // slash must not be mistaken for a route.
+  const signer = cut > 0 && /^0x[0-9a-fA-F]{40}$/.test(raw.slice(cut + 1)) ? raw.slice(cut + 1) : null
+  const app = decodeURIComponent(signer ? raw.slice(0, cut) : raw)
+  return signer ? () => showTrace(app, signer) : () => showApp(app)
+}
+
+// Repaint whatever is on screen after the wallet connects or disconnects.
+const refreshView = () => render(route())
+
+addEventListener('hashchange', () => render(route()))
 paintWallet()
 if (eth()) {
   // Reflect a wallet that is already unlocked, without prompting.
