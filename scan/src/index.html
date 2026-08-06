@@ -218,16 +218,20 @@ function aliveCell(a) {
   return pill('dim', 'not checked')
 }
 
+// The boot chain is a property of one machine, and an app's nodes may run on
+// different machines — different clouds, different image versions, all fine. So
+// the listing only counts nodes whose boot chain matched a published reference
+// set; WHICH image each node runs is on that node's card in the app view.
 function verifiedCell(a) {
   if (!a.signers.length) return '<span class="dim">—</span>'
   if (!a.reachable) {
     if (a.verifier_errors) return '<span class="dim">verifier error</span>'
     return a.failed ? '<span class="dim">no evidence</span>' : '<span class="dim">—</span>'
   }
-  if (a.images.length > 1) return pill('warn', `${a.images.length} different images`)
   if (!a.identified) return pill('warn', 'image unknown')
-  const badge = a.identified === a.reachable ? pill('ok', '✓') : pill('warn', `${a.identified}/${a.reachable}`)
-  return `${badge} <code>${esc(a.images[0])}</code>`
+  return a.identified === a.reachable
+    ? pill('ok', a.reachable === 1 ? '✓' : `✓ ${a.identified}/${a.reachable}`)
+    : pill('warn', `${a.identified}/${a.reachable}`)
 }
 
 // An app with no registered node, or whose every registered node failed to answer,
