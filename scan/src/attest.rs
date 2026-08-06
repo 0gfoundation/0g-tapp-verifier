@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 
 use crate::refvalues::{self, Measured, RefSet, SetMatch, ANY_BSA};
 
@@ -162,17 +163,90 @@ fn boot_digests(logs: &[Value]) -> Measured {
 
 // ─── Quote ───────────────────────────────────────────────────────────────────
 
-/// The signer address the node attested, taken from the quote's report_data as
-/// the AS parsed it. The on-chain node signer must appear here — that binding is
-/// what ties a piece of hardware to an app's on-chain registration.
-fn attested_signer(tdx: &Value) -> Option<String> {
-    let hex_rd = tdx
+/// What the quote's `report_data` committed to. The on-chain node signer must
+/// appear here — that binding is what ties a piece of hardware to an app's
+/// on-chain registration.
+struct ReportData {
+    signer: Option<String>,
+    /// sha256 of the app's TLS public key (hex), when the node attested one.
+    tls_public_key: Option<String>,
+    note: String,
+}
+
+/// Read the identity out of the quote, in whichever era's format applies.
+///
+/// Which era is decided by PRESENCE — a `runtime_data` field beside the quote in
+/// the evidence — never guessed from the bytes:
+///
+/// - absent (tapp-server ≤0.3.x): `report_data` is the bare 20-byte signer
+///   address, left-aligned and zero-padded.
+/// - present (≥0.4.0): `report_data` is `sha512(runtime_data)`. Recompute over
+///   the bytes AS RECEIVED — never re-serialise: both sides hash the transmitted
+///   bytes, which is what removes any need for a canonical JSON form. Only a
+///   match makes anything inside believable, the signer included — a structure
+///   swapped for one naming a different address stops hashing correctly, and
+///   reading the signer out of it anyway would defeat the point.
+///
+/// The wrinkle: `report_data` comes out of the AS token (whose quote signature
+/// the AS verified), while `runtime_data` rides in the raw evidence this service
+/// fetched from the node. The comparison spans both, which is why the raw
+/// evidence is a parameter here.
+fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
+    let mut out = ReportData {
+        signer: None,
+        tls_public_key: None,
+        note: String::new(),
+    };
+    let Some(rd) = tdx
         .pointer("/quote/body/reportdata")
         .or_else(|| tdx.pointer("/quote/body/report_data"))
-        .and_then(Value::as_str)?;
-    let bytes = hex::decode(hex_rd.trim_start_matches("0x")).ok()?;
-    // report_data is 64 bytes with the 20-byte EVM address at the front.
-    (bytes.len() >= 20).then(|| format!("0x{}", hex::encode(&bytes[..20])))
+        .and_then(Value::as_str)
+        .and_then(|h| hex::decode(h.trim_start_matches("0x")).ok())
+        .filter(|b| b.len() >= 20)
+    else {
+        out.note = "could not read report_data from the token; ".into();
+        return out;
+    };
+
+    let runtime_data_b64 = serde_json::from_slice::<Value>(evidence)
+        .ok()
+        .and_then(|e| e.get("runtime_data").and_then(Value::as_str).map(String::from));
+    let Some(runtime_data_b64) = runtime_data_b64 else {
+        out.signer = Some(format!("0x{}", hex::encode(&rd[..20])));
+        return out;
+    };
+
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&runtime_data_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            out.note = format!("runtime_data base64: {e}; ");
+            return out;
+        }
+    };
+    if sha2::Sha512::digest(&bytes).as_slice() != rd.as_slice() {
+        out.note =
+            "runtime_data does not hash to the quote's report_data — nothing in it can be believed; "
+                .into();
+        return out;
+    }
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) => {
+            out.signer = v
+                .get("signer")
+                .and_then(Value::as_str)
+                .map(str::to_lowercase);
+            out.tls_public_key = v
+                .get("tls_public_key")
+                .and_then(Value::as_str)
+                .map(str::to_lowercase)
+                .filter(|k| !k.is_empty());
+            if out.signer.is_none() {
+                out.note = "runtime_data verified but names no signer; ".into();
+            }
+        }
+        Err(e) => out.note = format!("runtime_data parse: {e}; "),
+    }
+    out
 }
 
 // ─── Node status ─────────────────────────────────────────────────────────────
@@ -192,6 +266,9 @@ pub struct NodeStatus {
     /// Signer attested in the quote. Whether it EQUALS the registered one is derived
     /// where it is used — the registration can change.
     pub attested_signer: Option<String>,
+    /// sha256 of the app's TLS public key (hex), when the node attested one
+    /// (tapp-server ≥0.4.0 with a TLS certificate issued).
+    pub tls_public_key: Option<String>,
 
     pub boot_format: &'static str,
     pub measured: Measured,
@@ -252,6 +329,12 @@ async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
         .await
         .with_context(|| format!("connect {tee_url}"))?
         .max_decoding_message_size(MAX_MSG_BYTES);
+    // GetEvidence (≥0.4.0) accepts a challenge that the node echoes into
+    // runtime_data — that is how a caller tells a fresh quote from a replayed
+    // one. NONE IS SENT HERE ON PURPOSE, not as an oversight: this service
+    // fetches once and serves the result to many readers, and its whole
+    // contract is "as of checked_at". A nonce would prove freshness only to
+    // this service while making the answer un-cacheable for everyone else.
     let resp = client
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
             app_id: app_id.to_string(),
@@ -338,11 +421,8 @@ pub async fn check_node(
 
     let measured = boot_digests(&logs);
     let matches = refvalues::match_sets(&measured, ref_sets);
-    let attested = attested_signer(tdx);
-    let mut note = String::new();
-    if attested.is_none() {
-        note.push_str("could not read report_data from the token; ");
-    }
+    let rd = read_report_data(tdx, &evidence);
+    let note = rd.note;
 
     Ok(NodeStatus {
         signer: signer.to_lowercase(),
@@ -363,7 +443,8 @@ pub async fn check_node(
                     .collect()
             })
             .unwrap_or_default(),
-        attested_signer: attested,
+        attested_signer: rd.signer,
+        tls_public_key: rd.tls_public_key,
         boot_format: measured.boot_format(),
         matches,
         measured,
@@ -380,6 +461,62 @@ pub async fn check_node(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn token(rd_hex: &str) -> Value {
+        json!({"quote": {"body": {"reportdata": rd_hex}}})
+    }
+
+    #[test]
+    fn report_data_without_runtime_data_is_the_bare_address() {
+        let rd_hex = format!("2bb10b0a9994d2a34da9c5c75c433a5a882ec0df{}", "00".repeat(44));
+        let out = read_report_data(&token(&rd_hex), br#"{"quote":"q","cc_eventlog":"e"}"#);
+        assert_eq!(
+            out.signer.as_deref(),
+            Some("0x2bb10b0a9994d2a34da9c5c75c433a5a882ec0df")
+        );
+        assert!(out.tls_public_key.is_none());
+        assert!(out.note.is_empty());
+    }
+
+    #[test]
+    fn report_data_with_runtime_data_reads_signer_and_tls_key() {
+        // Mixed case in, lowercase out; hash computed over the bytes as sent.
+        let runtime = br#"{"signer":"0x4DECAFBB35ad669871bd8a4beb8b4f8dfd0d9ff1","tls_public_key":"0x70CF27808f9764c920f17da56aa88caefbe9baddb9c2fdb0de344dc5624bbaa7"}"#;
+        let rd_hex = hex::encode(sha2::Sha512::digest(runtime.as_slice()));
+        let evidence = serde_json::to_vec(&json!({
+            "quote": "q",
+            "runtime_data": base64::engine::general_purpose::STANDARD.encode(runtime),
+        }))
+        .unwrap();
+        let out = read_report_data(&token(&rd_hex), &evidence);
+        assert_eq!(
+            out.signer.as_deref(),
+            Some("0x4decafbb35ad669871bd8a4beb8b4f8dfd0d9ff1")
+        );
+        assert_eq!(
+            out.tls_public_key.as_deref(),
+            Some("0x70cf27808f9764c920f17da56aa88caefbe9baddb9c2fdb0de344dc5624bbaa7")
+        );
+        assert!(out.note.is_empty());
+    }
+
+    #[test]
+    fn tampered_runtime_data_is_believed_nowhere() {
+        // The structure names a signer, but report_data hashes something else.
+        // Falling back to "read it anyway" (or to the leading 20 bytes, which
+        // here are hash bytes) would be exactly the bug this format prevents.
+        let runtime = br#"{"signer":"0x1111111111111111111111111111111111111111"}"#;
+        let rd_hex = hex::encode(sha2::Sha512::digest(b"something else entirely"));
+        let evidence = serde_json::to_vec(&json!({
+            "quote": "q",
+            "runtime_data": base64::engine::general_purpose::STANDARD.encode(runtime),
+        }))
+        .unwrap();
+        let out = read_report_data(&token(&rd_hex), &evidence);
+        assert!(out.signer.is_none());
+        assert!(out.tls_public_key.is_none());
+        assert!(out.note.contains("does not hash"));
+    }
 
     fn bsa(digest: &str, path: &str) -> Value {
         json!({
@@ -469,14 +606,9 @@ mod tests {
     }
 
     #[test]
-    fn attested_signer_takes_the_leading_20_bytes_of_report_data() {
-        let mut rd = "11".repeat(20);
-        rd.push_str(&"00".repeat(44));
-        let tdx = json!({"quote": {"body": {"reportdata": rd}}});
-        assert_eq!(
-            attested_signer(&tdx).as_deref(),
-            Some("0x1111111111111111111111111111111111111111")
-        );
-        assert_eq!(attested_signer(&json!({})), None);
+    fn unreadable_report_data_yields_no_signer() {
+        let out = read_report_data(&json!({}), b"{}");
+        assert!(out.signer.is_none());
+        assert!(out.note.contains("report_data"));
     }
 }

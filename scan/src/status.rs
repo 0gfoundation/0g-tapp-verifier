@@ -87,6 +87,12 @@ pub struct Attested {
     /// The address in the quote's report_data. Whether it MATCHES the registration
     /// is derived — the chain moves.
     pub attested_signer: Option<String>,
+    /// sha256 of the app's TLS public key (hex), when the node attested one
+    /// (tapp-server ≥0.4.0 with a TLS certificate issued). App-level in practice
+    /// but attested per signer — two signers of one app reporting different keys
+    /// is an anomaly to show, not to average away.
+    #[serde(default)]
+    pub tls_public_key: Option<String>,
     /// grub or uki, decided structurally from `measured` alone.
     pub boot_format: String,
     /// Boot-chain digests this node measured, component → digests. The whole map,
@@ -199,6 +205,7 @@ impl Entry {
             tcb_status: status.tcb_status.clone(),
             advisories: status.advisories.clone(),
             attested_signer: status.attested_signer.clone(),
+            tls_public_key: status.tls_public_key.clone(),
             boot_format: status.boot_format.to_string(),
             // Every component, the ANY_BSA pseudo-component included: it is what a
             // UKI reference value matches against, so dropping it would make a
@@ -396,6 +403,7 @@ mod tests {
                 tcb_status: "UpToDate".into(),
                 advisories: vec![],
                 attested_signer: Some(signer.to_lowercase()),
+                tls_public_key: None,
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
@@ -476,6 +484,7 @@ mod tests {
             tcb_status: "OutOfDate".into(),
             advisories: vec![],
             attested_signer: Some("0xaaa".into()),
+            tls_public_key: None,
             boot_format: "uki",
             measured,
             matches: vec![],

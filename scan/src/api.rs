@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -66,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/apps", get(list_apps))
         .route("/api/apps/:app_id", get(app_detail))
+        .route("/api/apps/:app_id/cert", get(app_cert))
         .route("/api/apps/:app_id/events", get(app_events))
         // Key management. Minting and revoking require a signature from the
         // registry's admin; listing is metadata only and carries no secret.
@@ -266,13 +268,85 @@ async fn app_detail(
         })
         .collect();
 
+    // App-level in practice, attested per signer: one value is served only when
+    // every current signer that attested a TLS key attested the SAME one. Two
+    // signers disagreeing is an anomaly the per-signer entries must show — it is
+    // never averaged away here.
+    let tls_keys = current_tls_keys(&s, &app_id);
     Ok(Json(json!({
         "app_id": timeline.app_id,
         "signers": signers,
         "history": timeline.entries,
         "current_signers": timeline.current_signers(),
+        "tls_public_key": (tls_keys.len() == 1).then(|| tls_keys[0].clone()),
         "now": now(),
     })))
+}
+
+/// Distinct TLS public-key hashes attested by the app's CURRENT signers.
+fn current_tls_keys(s: &Shared, app_id: &str) -> Vec<String> {
+    let mut keys: Vec<String> = s
+        .registry
+        .timeline(app_id)
+        .current_signers()
+        .iter()
+        .filter_map(|signer| s.store.get(app_id, signer))
+        .filter_map(|e| e.attested.as_ref())
+        .filter_map(|a| a.tls_public_key.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The app's TLS public-key hash in exactly the shape pinning tools consume:
+/// `sha256//<base64>`, one line, text/plain. The whole point is a consumer that
+/// needs no tooling —
+///
+///   curl --pinnedpubkey "$(curl -s https://scan/api/apps/X/cert)" https://node:8443/
+///
+/// Base64, not the hex we store: curl's `--pinnedpubkey`, okhttp's
+/// `CertificatePinner` and Go's `VerifyPeerCertificate` all take base64 of the
+/// sha256, and publishing hex would put a conversion step back into every
+/// consumer — and then it is not one command any more.
+async fn app_cert(
+    State(state): State<AppState>,
+    Path(app_id): Path<String>,
+) -> (StatusCode, String) {
+    let s = state.read().await;
+    if s.registry.timeline(&app_id).entries.is_empty() {
+        return (StatusCode::NOT_FOUND, "no such app\n".into());
+    }
+    let keys = current_tls_keys(&s, &app_id);
+    match keys.as_slice() {
+        [] => (
+            StatusCode::NOT_FOUND,
+            "no attested TLS key for this app (nodes predate 0.4.0, or no certificate was issued)\n"
+                .into(),
+        ),
+        [key] => match hex::decode(key.trim_start_matches("0x")) {
+            Ok(bytes) => (
+                StatusCode::OK,
+                format!(
+                    "sha256//{}\n",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                ),
+            ),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored TLS key is not hex\n".into(),
+            ),
+        },
+        // Refusing to pick is the feature: serving either key would quietly
+        // vouch for a node the other one may be impersonating.
+        many => (
+            StatusCode::CONFLICT,
+            format!(
+                "this app's nodes attest DIFFERENT TLS keys — refusing to pick one:\n{}\n",
+                many.join("\n")
+            ),
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -616,6 +690,7 @@ mod tests {
                 tcb_status: "UpToDate".into(),
                 advisories: vec![],
                 attested_signer: Some("0xaaa".into()),
+                tls_public_key: None,
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,

@@ -302,7 +302,14 @@ async function showList() {
 // carries a verification status and a trace; the only difference is whether the
 // result can be produced again, since a retired signer's RTMRs are gone with its
 // instance. Different signers are never chained into a longer-lived "node".
-function signerCard(h, now) {
+// hex sha256 → the `sha256//<base64>` shape every pinning tool takes (curl
+// --pinnedpubkey, okhttp CertificatePinner, Go VerifyPeerCertificate).
+function pin(hex) {
+  const bytes = hex.replace(/^0x/, '').match(/.{2}/g).map(b => parseInt(b, 16))
+  return 'sha256//' + btoa(String.fromCharCode(...bytes))
+}
+
+function signerCard(h, now, appId) {
   const spans = h.intervals
     .map(i => `${i.from_block.toLocaleString()} → ${i.to_block ? i.to_block.toLocaleString() : '<span class="ok">now</span>'}`)
     .join('<br>')
@@ -348,6 +355,12 @@ function signerCard(h, now) {
          has standing: the registered signer cannot be attested, and the attested signer is
          not registered.</div>`])
     rows.push(['quote', `${pill('ok', '✓')} signature chain verified by the AS`])
+    // Attested per signer (it is in this node's quote), app-level in practice:
+    // /api/apps/:id/cert serves it for pinning when every node agrees.
+    if (a.tls_public_key) rows.push(['tls key', `<code>${esc(pin(a.tls_public_key))}</code>
+      <div class="dim">sha256 of the TLS public key this node attested. A client that pins it
+      — <span class="mono">curl --pinnedpubkey "$(curl -s ${esc(location.origin)}/api/apps/${esc(encodeURIComponent(appId))}/cert)" …</span>
+      — reaches a TEE serving this app, with no CA in the loop.</div>`])
     rows.push(['platform tcb', a.tcb_status === 'UpToDate'
       ? `${pill('ok', 'UpToDate')}`
       : `${pill('dim', esc(a.tcb_status))}` + (a.advisories.length
@@ -394,6 +407,11 @@ async function showApp(appId) {
   const current = d.signers.filter(h => h.current)
   const retired = d.signers.filter(h => !h.current).reverse()
 
+  // The TLS key is app-level in practice but attested per signer, so agreement is
+  // checked rather than assumed: two nodes attesting different keys means one of
+  // them is not serving the app people think it is.
+  const pins = [...new Set(current.map(h => h.status?.attested?.tls_public_key).filter(Boolean))]
+
   const view = document.getElementById('view')
   view.innerHTML = `
     <div class="toolbar"><button id="back">← all apps</button></div>
@@ -402,11 +420,14 @@ async function showApp(appId) {
       ? `${plural(current.length, 'signer')} registered right now — these, and only these,
          can obtain this app's KMS key.`
       : 'No node is registered for this app right now.'}</p>
-    ${current.map(h => signerCard(h, d.now)).join('')}
+    ${pins.length > 1 ? `<p class="lede">${pill('bad', 'tls keys disagree')}
+      This app's nodes attest <b>different</b> TLS keys — <span class="mono">/cert</span>
+      refuses to serve one until they agree. Each key is on its signer's card below.</p>` : ''}
+    ${current.map(h => signerCard(h, d.now, appId)).join('')}
     ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
       <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
       restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
-    ${retired.map(h => signerCard(h, d.now)).join('')}`
+    ${retired.map(h => signerCard(h, d.now, appId)).join('')}`
 
   document.getElementById('back').onclick = () => go('')
   view.querySelectorAll('button[data-trace]').forEach(b =>
