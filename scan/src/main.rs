@@ -802,6 +802,20 @@ fn print_entry(
     // AS DEFAULT policy's opinion, which does not include the boot-chain check
     // this tool actually makes — its `executables` claim is always "warning" here.
     println!("    quote      : ✓ signature chain verified by the AS");
+    // ≥0.4.0 with a TLS certificate issued. Printed in the exact shape pinning
+    // tools take, so it can go straight into curl --pinnedpubkey.
+    if let Some(key) = &a.tls_public_key {
+        match hex::decode(key.trim_start_matches("0x")) {
+            Ok(bytes) => println!(
+                "    tls key    : sha256//{}  (pin with curl --pinnedpubkey)",
+                {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                }
+            ),
+            Err(_) => println!("    tls key    : {key} (not hex?)"),
+        }
+    }
     // Host firmware is the cloud provider's to update, not the app owner's, so a
     // stale platform TCB is reported as a fact rather than folded into a verdict.
     // The advisory ids are listed because they differ wildly in relevance.

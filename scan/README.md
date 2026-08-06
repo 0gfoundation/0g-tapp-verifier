@@ -173,7 +173,20 @@ All reads are served from memory; nothing here can trigger evidence fetching.
 | `GET /api/health` | contract, chain, scanned block, last refresh |
 | `GET /api/apps` | every app with its cached attestation state |
 | `GET /api/apps/:app_id` | per-signer registration, status and trace size; full event history |
+| `GET /api/apps/:app_id/cert` | the app's attested TLS key as `sha256//<base64>`, text/plain |
 | `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
+
+`/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
+commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
+expensive attestation once, and any client can then reach a TEE serving the app
+with no CA and no verifier of its own:
+
+```bash
+curl --pinnedpubkey "$(curl -s https://scan/api/apps/X/cert)" https://node:8443/
+```
+
+It answers 404 while no current node attests a key, and 409 — refusing to pick —
+if the app's nodes attest different keys, which is an anomaly, not a choice.
 
 `scope` selects a slice of the machine's trace: `app` (this app plus the
 machine-scoped operations, the default), `others`, or `all`. The trace belongs to
