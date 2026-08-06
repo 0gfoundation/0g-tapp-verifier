@@ -153,8 +153,6 @@ struct AppSummary {
     /// the count of VERIFIED ones are reported separately and never merged.
     signers: Vec<String>,
     latest_block: u64,
-    /// Distinct images identified across this app's nodes.
-    images: Vec<String>,
     /// Current signers that answered with evidence. Registration alone says
     /// nothing about whether a node is up — most registered nodes on the live
     /// registry cannot be reached at all — so "alive" means reachable, not
@@ -193,13 +191,13 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                 .iter()
                 .filter_map(|signer| s.store.get(&app_id, signer))
                 .collect();
+            // The image itself is deliberately NOT summarised here: it belongs to
+            // one machine, and an app's nodes may run on different machines. The
+            // per-signer detail is where an image is named.
             let identified: Vec<Option<String>> = cached
                 .iter()
                 .map(|e| e.image(&s.ref_sets))
                 .collect();
-            let mut images: Vec<String> = identified.iter().flatten().cloned().collect();
-            images.sort();
-            images.dedup();
             AppSummary {
                 unnamed: app_id.starts_with("0x") && app_id.len() == 66,
                 events: t.entries.len(),
@@ -212,7 +210,6 @@ async fn list_apps(State(state): State<AppState>) -> impl IntoResponse {
                     .filter(|e| e.error.is_some() && !e.verifier_fault)
                     .count(),
                 verifier_errors: cached.iter().filter(|e| e.verifier_fault).count(),
-                images,
                 oldest_result_age: cached.iter().map(|e| e.age_secs(now)).max(),
                 signers,
                 app_id,

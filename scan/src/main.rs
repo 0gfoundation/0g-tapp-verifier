@@ -583,15 +583,15 @@ fn attestation_summary(
     // here rather than read back from the cache.
     let named: Vec<Option<String>> = cached.iter().map(|e| e.image(ref_sets)).collect();
     let identified = named.iter().flatten().count();
-    let images: std::collections::BTreeSet<&str> =
-        named.iter().flatten().map(String::as_str).collect();
     let oldest = cached.iter().map(|e| e.age_secs(now)).max().unwrap_or(0);
-    let state = match (failed, images.len()) {
+    // No image is named at the app level: the boot chain belongs to one machine,
+    // and an app's nodes may run on different machines with different images.
+    // `attest <app>` names each node's image next to its signer.
+    let state = match (failed, identified) {
         (f, _) if f == cached.len() => "✗ all attempts failed".to_string(),
-        (0, 1) => format!("✓ {}", images.iter().next().unwrap()),
         (0, 0) => "image unknown".to_string(),
-        (0, n) => format!("{n} different images"),
-        (f, _) => format!("{identified}/{} identified, {f} failed", signers.len()),
+        (0, i) if i == cached.len() => format!("✓ {i}/{i} boot chains identified"),
+        (f, i) => format!("{i}/{} identified, {f} failed", signers.len()),
     };
     format!("{state}  (as of {} ago)", human_age(oldest))
 }
