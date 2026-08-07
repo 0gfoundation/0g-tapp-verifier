@@ -268,10 +268,11 @@ async fn app_detail(
         })
         .collect();
 
-    // App-level in practice, attested per signer: one value is served only when
-    // every current signer that attested a TLS key attested the SAME one. Two
-    // signers disagreeing is an anomaly the per-signer entries must show — it is
-    // never averaged away here.
+    // Attested per signer, and only app-level under `kms`. One value is served when
+    // every current signer that attested a key attested the same one; otherwise the
+    // per-signer entries are the answer and are never averaged away here.
+    // `tls_key_source` says how to read several: expected under `local`, a finding
+    // under `kms`.
     let tls_keys = current_tls_keys(&s, &app_id);
     Ok(Json(json!({
         "app_id": timeline.app_id,
@@ -279,6 +280,7 @@ async fn app_detail(
         "history": timeline.entries,
         "current_signers": timeline.current_signers(),
         "tls_public_key": (tls_keys.len() == 1).then(|| tls_keys[0].clone()),
+        "tls_key_source": app_key_source(&s, &app_id),
         "now": now(),
     })))
 }
@@ -297,6 +299,62 @@ fn current_tls_keys(s: &Shared, app_id: &str) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+/// Where this app's nodes derive their TLS key — which decides whether several
+/// distinct keys is an anomaly or the normal state.
+///
+/// `kms` derives from `(app_id, "tls")`, so every node of the app holds the same key
+/// and two of them differing means something is wrong. `local` derives from each
+/// node's own signer, which is per-node and re-derived at every boot, so a multi-node
+/// app has as many keys as nodes and always will. Treating that as disagreement would
+/// condemn every `local` app, including the KMS cluster — which cannot use `kms` at
+/// all, since deriving that key means reaching the cluster it is part of.
+///
+/// Read from the `claim_config` event, because `report_data` does not carry it:
+/// `runtime_data` holds only nonce, signer and tls_public_key.
+///
+/// Answers `kms` only when every current signer that attested a key says so. A node
+/// claimed before the field existed reports nothing and is read as `local`, which is
+/// what such a node actually does — `local` has always been the default.
+fn app_key_source(s: &Shared, app_id: &str) -> &'static str {
+    let mut saw_signer = false;
+    let all_kms = s
+        .registry
+        .timeline(app_id)
+        .current_signers()
+        .iter()
+        .filter_map(|signer| s.store.get(app_id, signer))
+        .filter_map(|e| e.attested.as_ref())
+        .filter(|a| a.tls_public_key.is_some())
+        .all(|a| {
+            saw_signer = true;
+            node_key_source(&a.events) == "kms"
+        });
+    if saw_signer && all_kms {
+        "kms"
+    } else {
+        "local"
+    }
+}
+
+/// One node's key source, from the newest `claim_config` in its trace. Kept apart
+/// from the app-level rollup so the reading itself can be tested.
+///
+/// Newest wins: `claim_config` can appear more than once in a boot (the pre-baked
+/// mode re-claims when the process restarts), and it is the last one that describes
+/// how the node is running now.
+fn node_key_source(events: &[crate::attest::RuntimeEvent]) -> &'static str {
+    match events
+        .iter()
+        .rev()
+        .find(|e| e.operation == "claim_config")
+        .and_then(|e| e.payload.get("tls_key_source"))
+        .and_then(|v| v.as_str())
+    {
+        Some("kms") => "kms",
+        _ => "local",
+    }
 }
 
 /// The app's TLS public-key hash in exactly the shape pinning tools consume:
@@ -337,15 +395,47 @@ async fn app_cert(
                 "stored TLS key is not hex\n".into(),
             ),
         },
-        // Refusing to pick is the feature: serving either key would quietly
-        // vouch for a node the other one may be impersonating.
-        many => (
-            StatusCode::CONFLICT,
-            format!(
-                "this app's nodes attest DIFFERENT TLS keys — refusing to pick one:\n{}\n",
-                many.join("\n")
+        // Several keys means opposite things depending on where they came from, so
+        // this branches rather than condemning both cases.
+        many => match app_key_source(&s, &app_id) {
+            // Normal, and permanent: a local key is derived per node and re-derived
+            // every boot, so a multi-node app has one key per node and always will.
+            // All of them are legitimate, which curl can express directly —
+            // --pinnedpubkey takes several hashes separated by ';' and accepts a peer
+            // matching any. Refusing here would leave every local-key app, the KMS
+            // cluster included, with no way to be pinned at all.
+            "local" => {
+                let mut pins = Vec::with_capacity(many.len());
+                for key in many {
+                    match hex::decode(key.trim_start_matches("0x")) {
+                        Ok(bytes) => pins.push(format!(
+                            "sha256//{}",
+                            base64::engine::general_purpose::STANDARD.encode(bytes)
+                        )),
+                        Err(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "stored TLS key is not hex\n".into(),
+                            )
+                        }
+                    }
+                }
+                (StatusCode::OK, format!("{}\n", pins.join(";")))
+            }
+            // A kms key is derived from (app_id, "tls"), so every node of the app
+            // should hold the same one. Two that differ is a real finding, and
+            // refusing to pick is the point: serving either would quietly vouch for
+            // a node the other may be impersonating.
+            _ => (
+                StatusCode::CONFLICT,
+                format!(
+                    "this app's nodes derive their TLS key from the KMS, so they should all \
+                     hold the SAME one — these differ, and picking between them is not this \
+                     service's call:\n{}\n",
+                    many.join("\n")
+                ),
             ),
-        ),
+        },
     }
 }
 
@@ -675,6 +765,60 @@ mod tests {
             digest: None,
             digest_matches: true,
         }
+    }
+
+    /// A claim_config event that states a key source, as tapp-server measures it.
+    fn claim_with_source(source: &str) -> RuntimeEvent {
+        RuntimeEvent {
+            operation: "claim_config".into(),
+            payload: json!({
+                "operation": "claim_config",
+                "owner": "0xowner",
+                "tls_key_source": source,
+            }),
+            digest: None,
+            digest_matches: true,
+        }
+    }
+
+    #[test]
+    fn a_node_that_claimed_kms_is_read_as_kms() {
+        assert_eq!(node_key_source(&[claim_with_source("kms")]), "kms");
+    }
+
+    #[test]
+    fn a_claim_without_the_field_reads_as_local() {
+        // Nodes claimed before tls_key_source existed say nothing, and local has
+        // always been the default — so that is what they are actually doing.
+        assert_eq!(node_key_source(&[ev("claim_config", None)]), "local");
+    }
+
+    #[test]
+    fn a_node_that_never_claimed_reads_as_local() {
+        assert_eq!(node_key_source(&[ev("start_app", Some("mine"))]), "local");
+    }
+
+    #[test]
+    fn the_newest_claim_decides() {
+        // Pre-baked mode re-claims on a process restart, so several claim_config
+        // events in one boot are normal. The last one is how the node is running.
+        assert_eq!(
+            node_key_source(&[claim_with_source("kms"), claim_with_source("local")]),
+            "local"
+        );
+        assert_eq!(
+            node_key_source(&[claim_with_source("local"), claim_with_source("kms")]),
+            "kms"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_source_reads_as_local_rather_than_kms() {
+        // Refusing to serve a pin is the consequence of reading "kms", so a value
+        // nobody recognises must not land there: a typo would take every local app
+        // with it.
+        assert_eq!(node_key_source(&[claim_with_source("KMS")]), "local");
+        assert_eq!(node_key_source(&[claim_with_source("")]), "local");
     }
 
     fn entry_with(events: Vec<RuntimeEvent>) -> status::Entry {
