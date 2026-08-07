@@ -420,9 +420,16 @@ async function showApp(appId) {
       ? `${plural(current.length, 'signer')} registered right now — these, and only these,
          can obtain this app's KMS key.`
       : 'No node is registered for this app right now.'}</p>
-    ${pins.length > 1 ? `<p class="lede">${pill('bad', 'tls keys disagree')}
-      This app's nodes attest <b>different</b> TLS keys — <span class="mono">/cert</span>
-      refuses to serve one until they agree. Each key is on its signer's card below.</p>` : ''}
+    ${pins.length > 1 ? (d.tls_key_source === 'kms'
+      ? `<p class="lede">${pill('bad', 'tls keys disagree')}
+         These nodes derive their TLS key from the KMS, so they should all hold the
+         <b>same</b> one — they do not. <span class="mono">/cert</span> will not pick between
+         them. Each key is on its signer's card below.</p>`
+      : `<p class="lede">${pill('ok', 'one tls key per node')}
+         Expected: a <span class="mono">local</span> key is derived from each node's own signer
+         and re-derived at every boot, so these differ and always will.
+         <span class="mono">/cert</span> returns all of them, which
+         <span class="mono">curl --pinnedpubkey</span> accepts as a set.</p>`) : ''}
     ${current.map(h => signerCard(h, d.now, appId)).join('')}
     ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
       <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
