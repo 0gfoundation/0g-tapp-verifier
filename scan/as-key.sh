@@ -20,7 +20,7 @@
 # without ever landing in a log or a terminal scrollback:
 #
 #   AS_WRITE_KEY=$(scan/as-key.sh issue ci 90) \
-#     ../0g-tapp/verifier/register-shared-as.sh gcp uki v0.3.0-r2 dev <as-host>:50004
+#     ../0g-tapp/verifier/register-shared-as.sh gcp uki v0.3.0-r2 dev https://<as-host>:50004
 #
 # Only a hash of the key is kept server-side, so a lost key is reissued, never
 # recovered — and `list` can show metadata but never the secret.
@@ -29,13 +29,21 @@
 #   ADMIN_KEY  admin private key (0x + 64 hex). Omit to sign with a keystore or a
 #              hardware wallet instead, through CAST_WALLET_ARGS (e.g.
 #              CAST_WALLET_ARGS='--account admin', or '--ledger').
-#   TAPPSCAN   host:port of the scan service (default 34.171.164.181:9090)
+#   TAPPSCAN   the scan service (default https://35.253.66.70). Give the scheme: scan
+#              serves TLS with its own attested, self-signed certificate, so requests use
+#              curl -k — no CA will ever vouch for it, and what identifies it is the
+#              attested public key. A local plaintext instance still works as http://host:port.
 #
 # Prereqs: cast (foundry), curl, python3.
 # =============================================================================
 set -euo pipefail
 
-TAPPSCAN="${TAPPSCAN:-34.171.164.181:9090}"
+TAPPSCAN="${TAPPSCAN:-https://35.253.66.70}"
+# Default to https when no scheme is given, rather than the http that was hardcoded here:
+# the shared instance moved to TLS and a plaintext request to it simply hangs up.
+case "$TAPPSCAN" in http://*|https://*) ;; *) TAPPSCAN="https://$TAPPSCAN" ;; esac
+INSECURE=()
+case "$TAPPSCAN" in https://*) INSECURE=(-k) ;; esac
 U="usage: as-key.sh issue <label> <30|90|never> | list | revoke <key-id>"
 
 # Human-readable output goes to stderr throughout, so stdout carries only the
@@ -65,10 +73,10 @@ req() {
 		local sig
 		sig=$(sign "$2")
 		out=$(python3 -c 'import json,sys; print(json.dumps({"message":sys.argv[1],"signature":sys.argv[2]}))' "$2" "$sig" |
-			curl -sS --max-time 30 -X POST "http://${TAPPSCAN}$1" \
+			curl -sS "${INSECURE[@]}" --max-time 30 -X POST "${TAPPSCAN}$1" \
 				-H 'content-type: application/json' -d @- -w '\n%{http_code}')
 	else
-		out=$(curl -sS --max-time 30 "http://${TAPPSCAN}$1" -w '\n%{http_code}')
+		out=$(curl -sS "${INSECURE[@]}" --max-time 30 "${TAPPSCAN}$1" -w '\n%{http_code}')
 	fi
 	printf '%s\n%s' "${out##*$'\n'}" "${out%$'\n'*}"
 }
