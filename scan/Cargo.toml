@@ -1,6 +1,6 @@
 [package]
 name = "tappscan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "TappRegistry explorer: on-chain app history + attestation status (trust layer 3)"
 license = "Apache-2.0"
