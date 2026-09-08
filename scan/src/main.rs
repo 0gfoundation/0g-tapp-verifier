@@ -8,6 +8,7 @@
 
 mod api;
 mod attest;
+mod tls;
 mod keys;
 mod chain;
 mod refsource;

@@ -325,10 +325,20 @@ impl CheckError {
 
 /// Fetch `app_id`'s evidence from a node.
 async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
-    let mut client = TappServiceClient::connect(tee_url.to_string())
-        .await
-        .with_context(|| format!("connect {tee_url}"))?
-        .max_decoding_message_size(MAX_MSG_BYTES);
+    // An https teeUrl (nodes ≥0g-tapp#110 register their baked :50052 front) is
+    // encryption without authentication — the certificate is self-signed and
+    // accepted unseen, which is sound here because evidence authenticates itself
+    // (Intel-signed) and this fetch sends no secret. See tls.rs.
+    let channel = if tee_url.starts_with("https://") {
+        crate::tls::grpc_channel_any(tee_url).await?
+    } else {
+        tonic::transport::Endpoint::from_shared(tee_url.to_string())
+            .with_context(|| format!("endpoint {tee_url}"))?
+            .connect()
+            .await
+            .with_context(|| format!("connect {tee_url}"))?
+    };
+    let mut client = TappServiceClient::new(channel).max_decoding_message_size(MAX_MSG_BYTES);
     // GetEvidence (≥0.4.0) accepts a challenge that the node echoes into
     // runtime_data — that is how a caller tells a fresh quote from a replayed
     // one. NONE IS SENT HERE ON PURPOSE, not as an oversight: this service
