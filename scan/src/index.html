@@ -697,4 +697,8 @@ if (eth()) {
   eth().on?.('accountsChanged', ([a]) => { account = a || null; paintWallet(); refreshView() })
 }
 refreshView()
+// Boot-time health probe, independent of the route: deep links (#app, #app/signer)
+// never pass through showList, which would leave the network pill on the URL
+// guess and the wallet without a chain. One fetch closes both gaps.
+get('/api/health').then(h => { chain = h.chain; paintNet(h.chain_id) }).catch(() => {})
 </script>
