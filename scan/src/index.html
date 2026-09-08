@@ -187,10 +187,24 @@
 // pasted link opens on the network it was looking at.
 const NET = new URLSearchParams(location.search).get('net') === 'mainnet' ? 'mainnet' : 'testnet'
 const API = NET === 'mainnet' ? '/mainnet' : ''
+// The pill must agree with the DATA, not the URL: a mainnet instance reached
+// directly (its own port, no ?net=) is still mainnet. /api/health names the
+// chain, and 16661 is mainnet; until it answers, the URL is the best guess.
+function paintNet(chainId) {
+  const shown = chainId == null ? NET : (chainId === 16661 ? 'mainnet' : 'testnet')
+  document.querySelectorAll('.net button').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.net === shown)))
+}
+paintNet(null)
 document.querySelectorAll('.net button').forEach(b => {
-  b.setAttribute('aria-pressed', b.dataset.net === NET)
-  b.onclick = () => { if (b.dataset.net !== NET) location.href =
-    location.pathname + (b.dataset.net === 'mainnet' ? '?net=mainnet' : '') + location.hash }
+  b.onclick = () => {
+    if (b.getAttribute('aria-pressed') === 'true') return
+    // Keep the URL honest: switching to testnet from a /mainnet-prefixed page
+    // goes to /, so the path never names a network the page is not showing.
+    const path = b.dataset.net === 'testnet' && location.pathname.startsWith('/mainnet')
+      ? '/' : location.pathname
+    location.href = path + (b.dataset.net === 'mainnet' ? '?net=mainnet' : '') + location.hash
+  }
 })
 
 const el = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild }
@@ -266,6 +280,7 @@ let showOff = false
 async function showList() {
   const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
   chain = h.chain
+  paintNet(h.chain_id)
   document.getElementById('meta').innerHTML =
     `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id}<br>` +
     `block <b>${h.scanned_to_block.toLocaleString()}</b> · ${plural(h.apps, 'app')} · ` +
