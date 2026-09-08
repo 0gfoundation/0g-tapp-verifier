@@ -153,6 +153,11 @@
   button[disabled]:hover { border-color:var(--line-2); color:var(--fg) }
   .wallet { margin-left:auto; display:flex; align-items:center; gap:var(--s2);
             font-size:.8rem; color:var(--dim) }
+  /* network switch — a segmented pill, the selected side filled with the brand */
+  .net { display:flex; border:1px solid var(--line-2); border-radius:var(--r-pill); overflow:hidden }
+  .net button { border:0; border-radius:0; min-height:28px; padding:.15rem .7rem }
+  .net button[aria-pressed="true"] { color:#fff; background:var(--brand) }
+  .net button[aria-pressed="true"]:hover { color:#fff; background:var(--brand) }
   .amount { font:inherit; font-family:var(--mono); font-size:.8rem; width:7rem;
             padding:.3rem .6rem; color:var(--fg); background:var(--bg);
             border:1px solid var(--line-2); border-radius:var(--r-pill) }
@@ -166,12 +171,42 @@
 
 <header>
   <h1>tapp<b>scan</b></h1>
+  <nav class="net" aria-label="network">
+    <button data-net="testnet">testnet</button>
+    <button data-net="mainnet">mainnet</button>
+  </nav>
   <div class="wallet"><span id="acct"></span><button id="connect">connect wallet</button></div>
 </header>
 <p class="meta" id="meta">loading…</p>
 <main id="view" aria-live="polite"></main>
 
 <script>
+// One tappscan process watches one chain, so "network" is really "which instance
+// this page reads": testnet is the instance serving this page, mainnet a second
+// one proxied under /mainnet. The choice rides in ?net= rather than storage so a
+// pasted link opens on the network it was looking at.
+const NET = new URLSearchParams(location.search).get('net') === 'mainnet' ? 'mainnet' : 'testnet'
+const API = NET === 'mainnet' ? '/mainnet' : ''
+// The pill must agree with the DATA, not the URL: a mainnet instance reached
+// directly (its own port, no ?net=) is still mainnet. /api/health names the
+// chain, and 16661 is mainnet; until it answers, the URL is the best guess.
+function paintNet(chainId) {
+  const shown = chainId == null ? NET : (chainId === 16661 ? 'mainnet' : 'testnet')
+  document.querySelectorAll('.net button').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.net === shown)))
+}
+paintNet(null)
+document.querySelectorAll('.net button').forEach(b => {
+  b.onclick = () => {
+    if (b.getAttribute('aria-pressed') === 'true') return
+    // Keep the URL honest: switching to testnet from a /mainnet-prefixed page
+    // goes to /, so the path never names a network the page is not showing.
+    const path = b.dataset.net === 'testnet' && location.pathname.startsWith('/mainnet')
+      ? '/' : location.pathname
+    location.href = path + (b.dataset.net === 'mainnet' ? '?net=mainnet' : '') + location.hash
+  }
+})
+
 const el = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild }
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
 const short = (s, n = 10) => s && s.length > n * 2 + 4 ? s.slice(0, n) + '…' + s.slice(-4) : (s ?? '')
@@ -197,7 +232,7 @@ function when(ts) {
 }
 
 async function get(path) {
-  const r = await fetch(path)
+  const r = await fetch(API + path)
   if (!r.ok) throw new Error(`${path} → ${r.status}`)
   return r.json()
 }
@@ -245,6 +280,7 @@ let showOff = false
 async function showList() {
   const [h, all] = await Promise.all([get('/api/health'), get('/api/apps')])
   chain = h.chain
+  paintNet(h.chain_id)
   document.getElementById('meta').innerHTML =
     `registry <b>${esc(h.contract)}</b> · chain ${h.chain_id}<br>` +
     `block <b>${h.scanned_to_block.toLocaleString()}</b> · ${plural(h.apps, 'app')} · ` +
@@ -359,7 +395,7 @@ function signerCard(h, now, appId) {
     // /api/apps/:id/cert serves it for pinning when every node agrees.
     if (a.tls_public_key) rows.push(['tls key', `<code>${esc(pin(a.tls_public_key))}</code>
       <div class="dim">sha256 of the TLS public key this node attested. A client that pins it
-      — <span class="mono">curl --pinnedpubkey "$(curl -s ${esc(location.origin)}/api/apps/${esc(encodeURIComponent(appId))}/cert)" …</span>
+      — <span class="mono">curl --pinnedpubkey "$(curl -s ${esc(location.origin + API)}/api/apps/${esc(encodeURIComponent(appId))}/cert)" …</span>
       — reaches a TEE serving this app, with no CA in the loop.</div>`])
     rows.push(['platform tcb', a.tcb_status === 'UpToDate'
       ? `${pill('ok', 'UpToDate')}`
@@ -617,7 +653,9 @@ async function render(fn) {
   } catch (e) {
     document.getElementById('view').innerHTML =
       `<div class="panel"><p class="empty"><span class="bad">${esc(e.message)}</span><br>
-       <span class="dim">tappscan may still be starting its first scan.</span></p></div>`
+       <span class="dim">${NET === 'mainnet'
+         ? 'No mainnet instance is answering behind /mainnet on this host.'
+         : 'tappscan may still be starting its first scan.'}</span></p></div>`
   }
 }
 
@@ -659,4 +697,8 @@ if (eth()) {
   eth().on?.('accountsChanged', ([a]) => { account = a || null; paintWallet(); refreshView() })
 }
 refreshView()
+// Boot-time health probe, independent of the route: deep links (#app, #app/signer)
+// never pass through showList, which would leave the network pill on the URL
+// guess and the wallet without a chain. One fetch closes both gaps.
+get('/api/health').then(h => { chain = h.chain; paintNet(h.chain_id) }).catch(() => {})
 </script>
