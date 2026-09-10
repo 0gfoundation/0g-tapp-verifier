@@ -570,6 +570,17 @@ function paintWallet() {
 
 async function connect() {
   try {
+    // wallet_requestPermissions forces the account picker, so "disconnect →
+    // connect" can actually switch accounts; a bare eth_requestAccounts silently
+    // reuses the previous grant. Wallets without the method fall through.
+    try {
+      await eth().request({
+        method: 'wallet_requestPermissions',
+        params: [{ eth_accounts: {} }],
+      })
+    } catch (e) {
+      if (e.code === 4001) throw e // user said no — respect it, don't re-prompt
+    }
     const [a] = await eth().request({ method: 'eth_requestAccounts' })
     account = a
     paintWallet()
@@ -606,6 +617,11 @@ async function topUp(signer, og, say) {
     const wei = BigInt(whole + frac.padEnd(18, '0').slice(0, 18))
     const tx = await eth().request({ method: 'eth_sendTransaction', params: [{
       from: account, to: signer, value: '0x' + wei.toString(16),
+      // 0G enforces a minimum gas tip of 2 gwei; wallets routinely estimate just
+      // under it and the RPC refuses the transaction ("gas tip cap … minimum
+      // needed 2000000000"). Setting the floor here costs nothing on a chain
+      // this cheap; the wallet still derives maxFeePerGas on top of it.
+      maxPriorityFeePerGas: '0x77359400',
     }] })
     say(`Sent — <span class="mono">${esc(short(tx, 8))}</span>. The balance here updates
          on the next refresh round.`, 'ok')
