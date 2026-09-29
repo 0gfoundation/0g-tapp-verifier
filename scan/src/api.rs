@@ -1,23 +1,27 @@
-//! Read-only HTTP interface over the caches.
+//! HTTP interface over the caches.
 //!
-//! Every response is served from memory. Nothing here fetches evidence or calls
-//! the Attestation Service — that only happens in the background refresh loop, so
-//! no amount of reading can be turned into load on the nodes or the AS.
+//! Every read is served from memory: reads never fetch evidence or call the
+//! Attestation Service, so no amount of reading can be turned into load on the
+//! nodes or the AS. The one exception is `POST /api/verify`, which exists
+//! precisely to do that work on demand — and is therefore bounded three ways
+//! (per-target cooldown with single-flight, chain-registered targets only, a
+//! global concurrency cap) plus per-caller quotas. See [`verify`].
 //!
 //! Every attestation result is reported with the time it was taken. A cached
 //! result describes the node as it was at that moment and nothing more.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,9 +61,88 @@ pub struct Shared {
     pub refs_from: crate::refsource::Provenance,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
+    /// For the on-demand endpoint only: reading teeUrls and syncing the chain.
+    pub scanner: Arc<chain::Scanner>,
+    /// For the on-demand endpoint only: where evidence is evaluated.
+    pub as_endpoint: String,
+    /// The on-demand endpoint's own bounds. An `Arc` so a handler can clone it
+    /// out and wait on its locks without holding this `RwLock` across the wait.
+    pub verify: Arc<VerifyState>,
 }
 
 pub type AppState = Arc<RwLock<Shared>>;
+
+// ─── On-demand verification ──────────────────────────────────────────────────
+
+/// Seconds a fresh result answers repeat requests for the same (app_id, signer).
+/// This is what makes the endpoint safe to expose: a node that just rebooted is
+/// discovered by all five KMS nodes at once, and one attestation must serve all
+/// of them rather than five concurrent quote generations hitting the node.
+const VERIFY_COOLDOWN_SECS: i64 = 60;
+
+/// Per-caller request metering, fixed one-minute windows. The quotas are QoS
+/// tiers, not a security boundary — authorisation comes from the structural
+/// limits (cooldown, chain-registered targets only, the concurrency cap), so a
+/// stolen key yields nothing but a bigger quota.
+const QUOTA_WINDOW_SECS: i64 = 60;
+const ANON_PER_WINDOW: u32 = 6;
+const KEYED_PER_WINDOW: u32 = 60;
+
+/// A forced chain sync (for a target the cached registry does not know yet) runs
+/// at most this often, whoever asks.
+const FORCED_SYNC_MIN_SECS: i64 = 10;
+
+/// Everything that bounds `POST /api/verify`.
+pub struct VerifyState {
+    /// Global cap on targets being attested on demand at once — the same kind of
+    /// limit the refresh loop runs under, protecting this service, the AS and
+    /// the nodes. Over capacity answers 429 rather than queueing without bound.
+    slots: tokio::sync::Semaphore,
+    /// Single-flight per (app_id, signer): concurrent requests for one target
+    /// serialise on its lock, and the latecomers find the fresh result inside
+    /// the cooldown instead of repeating the work. Entries are only created for
+    /// targets the chain knows, so the map is bounded by the registry.
+    targets: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Request counters per caller, pruned as windows expire.
+    quota: tokio::sync::Mutex<HashMap<String, Window>>,
+    /// When a forced chain sync last ran.
+    last_sync: tokio::sync::Mutex<i64>,
+}
+
+struct Window {
+    start: i64,
+    count: u32,
+}
+
+impl VerifyState {
+    pub fn new(concurrency: usize) -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(concurrency),
+            targets: Default::default(),
+            quota: Default::default(),
+            last_sync: tokio::sync::Mutex::new(0),
+        }
+    }
+}
+
+/// Count one request against a caller's window. `Err(seconds)` when over quota —
+/// the time until that window ends, for a Retry-After header.
+fn count_request(
+    windows: &mut HashMap<String, Window>,
+    caller: &str,
+    limit: u32,
+    now: i64,
+) -> Result<(), i64> {
+    windows.retain(|_, w| now - w.start < QUOTA_WINDOW_SECS);
+    let w = windows
+        .entry(caller.to_string())
+        .or_insert(Window { start: now, count: 0 });
+    if w.count >= limit {
+        return Err((w.start + QUOTA_WINDOW_SECS - now).max(1));
+    }
+    w.count += 1;
+    Ok(())
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -69,6 +152,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps/:app_id", get(app_detail))
         .route("/api/apps/:app_id/cert", get(app_cert))
         .route("/api/apps/:app_id/events", get(app_events))
+        // The one endpoint that does work instead of reading a cache.
+        .route("/api/verify", post(verify))
         // Key management. Minting and revoking require a signature from the
         // registry's admin; listing is metadata only and carries no secret.
         .route("/api/keys", get(list_keys).post(issue_key))
@@ -563,6 +648,193 @@ async fn app_events(
 }
 
 
+#[derive(Deserialize)]
+struct VerifyRequest {
+    app_id: String,
+    signer: String,
+}
+
+/// Attest one node now and return the verdict — for consumers whose decision
+/// cannot wait for the polling loop. A tapp node re-derives its signer on every
+/// restart, so anything gating on "this signer is verified" (the KMS admitting a
+/// freshly rebooted node, for one) would otherwise stall until the next round.
+///
+/// Public by design. What keeps that safe is structural, not caller identity:
+///
+/// 1. a fresh result inside [`VERIFY_COOLDOWN_SECS`] is returned as-is, and
+///    concurrent requests for one target single-flight into one attestation;
+/// 2. the target must be a CURRENT node of the app on chain, and its teeUrl is
+///    read from the chain — a URL in the request would be an SSRF primitive, so
+///    there is none, and unregistered targets are refused before any fetch;
+/// 3. at most [`VerifyState::slots`] attestations run at once; over capacity is
+///    429, not a queue.
+///
+/// The API key (`Authorization: Bearer`) only selects a bigger request quota.
+async fn verify(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyRequest>,
+) -> Response {
+    let signer = req.signer.trim().to_lowercase();
+    if signer.parse::<ethers::types::Address>().is_err() {
+        return (StatusCode::BAD_REQUEST, "signer must be a 0x… address\n").into_response();
+    }
+    let app_id = req.app_id.trim().to_string();
+    if app_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "app_id must not be empty\n").into_response();
+    }
+
+    // Caller class. A presented key that verifies buys the keyed quota; anything
+    // else — no key, bad key — is metered per IP, so this is not a key-testing
+    // oracle: guessing is capped by the anonymous quota itself. The forwarded
+    // header is spoofable by a direct caller, but a spoofed identity buys only
+    // the anonymous quota again; the structural limits do not care who asks.
+    let verify_state = state.read().await.verify.clone();
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let (caller, limit) = match presented {
+        Some(secret) => match state.write().await.api_keys.accept(secret, now()) {
+            Some(key) => (format!("key:{}", key.id), KEYED_PER_WINDOW),
+            None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
+        },
+        None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
+    };
+    {
+        let mut windows = verify_state.quota.lock().await;
+        if let Err(retry) = count_request(&mut windows, &caller, limit, now()) {
+            return too_many(retry);
+        }
+    }
+
+    // The target must be on chain. The cached registry lags the chain by up to
+    // one sync interval, and "this signer just changed" is exactly when this
+    // endpoint gets called — so an unknown target forces one sync (rate-limited
+    // globally) before it is refused.
+    let mut latest_block = current_target_block(&state, &app_id, &signer).await;
+    if latest_block.is_none() {
+        let due = {
+            let mut last = verify_state.last_sync.lock().await;
+            let n = now();
+            (n - *last >= FORCED_SYNC_MIN_SECS).then(|| *last = n).is_some()
+        };
+        if due {
+            let scanner = state.read().await.scanner.clone();
+            match scanner.sync().await {
+                Ok((registry, added)) => {
+                    if added > 0 {
+                        tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
+                    }
+                    state.write().await.registry = registry;
+                }
+                Err(e) => tracing::warn!("forced chain sync failed: {e}"),
+            }
+            latest_block = current_target_block(&state, &app_id, &signer).await;
+        }
+    }
+    let Some(latest_block) = latest_block else {
+        return (
+            StatusCode::NOT_FOUND,
+            "not a current node of this app on chain\n",
+        )
+            .into_response();
+    };
+
+    // Single-flight: whoever holds the target's lock does the work; the others
+    // wait here and then hit the cooldown check below.
+    let flight = {
+        let mut targets = verify_state.targets.lock().await;
+        targets
+            .entry(format!("{app_id}|{signer}"))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _flight = flight.lock().await;
+
+    {
+        let s = state.read().await;
+        if let Some(entry) = s.store.get(&app_id, &signer) {
+            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS {
+                return verdict_response(&s, entry, true);
+            }
+        }
+    }
+
+    let Ok(_permit) = verify_state.slots.try_acquire() else {
+        return too_many(5);
+    };
+
+    let (scanner, as_endpoint, ref_sets) = {
+        let s = state.read().await;
+        (s.scanner.clone(), s.as_endpoint.clone(), s.ref_sets.clone())
+    };
+    let entry =
+        crate::attest_one(&scanner, &app_id, &signer, latest_block, &as_endpoint, &ref_sets).await;
+
+    // Into the shared store, so the page and the summaries serve it too. Not
+    // saved to disk here: the refresh loop persists on its own schedule, and a
+    // lost on-demand result is regenerated by the next request.
+    let mut s = state.write().await;
+    s.store.put(entry.clone());
+    let s = s.downgrade();
+    verdict_response(&s, &entry, false)
+}
+
+/// `Some(latest registry block for the app)` when the signer is one of the app's
+/// CURRENT nodes in the cached registry, `None` otherwise. Current is the bar:
+/// a removed or replaced signer has no claim on anything, however recently.
+async fn current_target_block(state: &AppState, app_id: &str, signer: &str) -> Option<u64> {
+    let s = state.read().await;
+    let t = s.registry.timeline(app_id);
+    t.current_signers()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(signer))
+        .then(|| t.latest_block())
+}
+
+/// The anonymous caller identity: first hop of X-Forwarded-For when a proxy put
+/// one there, the socket peer otherwise.
+fn anon_caller(headers: &HeaderMap, peer: SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|ip| format!("ip:{}", ip.trim()))
+        .unwrap_or_else(|| format!("ip:{}", peer.ip()))
+}
+
+fn too_many(retry_after: i64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
+        "over quota or capacity — try again later\n",
+    )
+        .into_response()
+}
+
+/// One node's verdict, without the trace: the events run to thousands of entries
+/// and megabytes, and an admission decision needs none of them — they stay on
+/// the events endpoint.
+fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool) -> Response {
+    let mut status = refreshed_verdict(entry, &s.ref_sets);
+    if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
+        a.remove("events");
+    }
+    Json(json!({
+        "app_id": entry.app_id,
+        "signer": entry.signer,
+        "cached": cached,
+        "status": status,
+        "reference_values": s.refs_from,
+        "now": now(),
+    }))
+    .into_response()
+}
+
 // ─── API keys ────────────────────────────────────────────────────────────────
 
 fn random_hex(bytes: usize) -> String {
@@ -881,5 +1153,44 @@ mod tests {
     #[test]
     fn a_node_that_never_attested_counts_nothing() {
         assert_eq!(trace_counts(None, "mine"), (0, 0));
+    }
+
+    // ─── /api/verify quotas ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_quota_refuses_the_request_after_the_limit_with_a_sane_retry() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).is_ok());
+        }
+        let retry = count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1030).unwrap_err();
+        // The window opened at 1000, so it ends at 1060 — 30s from now.
+        assert_eq!(retry, 30);
+        // Retry-After must never be zero or negative, even at the window's edge.
+        let retry = count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1059).unwrap_err();
+        assert!(retry >= 1);
+    }
+
+    #[test]
+    fn a_new_window_starts_clean() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).unwrap();
+        }
+        assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000 + QUOTA_WINDOW_SECS).is_ok());
+        // …and the expired windows were pruned rather than accumulating forever.
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn callers_are_metered_apart() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).unwrap();
+        }
+        assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).is_err());
+        // A different IP, and a key holder, are unaffected.
+        assert!(count_request(&mut w, "ip:5.6.7.8", ANON_PER_WINDOW, 1000).is_ok());
+        assert!(count_request(&mut w, "key:kabc", KEYED_PER_WINDOW, 1000).is_ok());
     }
 }

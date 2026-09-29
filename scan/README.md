@@ -181,7 +181,9 @@ window. Each signature is therefore good for exactly one key.
 
 ## HTTP interface
 
-All reads are served from memory; nothing here can trigger evidence fetching.
+All reads are served from memory; no read can trigger evidence fetching. The one
+endpoint that does work on demand is `POST /api/verify`, bounded as described in
+its own section below.
 
 | Endpoint | |
 |---|---|
@@ -191,6 +193,7 @@ All reads are served from memory; nothing here can trigger evidence fetching.
 | `GET /api/apps/:app_id` | per-signer registration, status and trace size; full event history |
 | `GET /api/apps/:app_id/cert` | the app's attested TLS key as `sha256//<base64>`, text/plain |
 | `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
+| `POST /api/verify` | attest one `{app_id, signer}` now and return the verdict |
 
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
@@ -209,6 +212,88 @@ machine-scoped operations, the default), `others`, or `all`. The trace belongs t
 the CVM, not to one app — every app on a machine measures into the same RTMR3, and
 operations like `docker_login` or `claim_config` carry no app id, so they are shown
 under every app on that machine rather than hidden or arbitrarily assigned.
+
+## On-demand verification: `POST /api/verify`
+
+The polling loop makes conclusions up to `--interval` + `--max-age` old, and a
+tapp node re-derives its signer on **every restart** — so a consumer that gates on
+"this signer is verified" (the KMS admitting a freshly rebooted node before
+serving its keys) would stall until the next round. `POST /api/verify` moves one
+target to the front: fetch its evidence now, verify, answer.
+
+```bash
+curl -s -X POST https://scan/api/verify \
+  -H 'content-type: application/json' \
+  -d '{"app_id": "0g-kms", "signer": "0x…"}'
+```
+
+The response carries `cached` (whether this is a fresh attestation or one inside
+the cooldown), `status` in the same shape as `/api/apps/:app_id` serves per
+signer — `attested.signer_ok`, `attested.image`, `error`, `checked_at` — minus
+the runtime trace, which stays on the events endpoint, and `reference_values`,
+the provenance of the set the verdict was reached against.
+
+The endpoint is **public**. What keeps that safe is structural, not caller
+identity:
+
+1. **Per-target cooldown + single-flight.** A result younger than 60s answers
+   repeats as-is, and concurrent requests for one target collapse into one
+   attestation. The forcing scenario: a node reboots with a new signer, all five
+   KMS nodes notice at once — one quote generation must serve all five, not five
+   concurrent ones hitting a node that just came up.
+2. **Targets come from the chain, never from the request.** The signer must be a
+   CURRENT node of the app on chain, and its teeUrl is read via `getNode` — a
+   URL parameter would be an SSRF primitive, so there is none, and unregistered
+   targets are refused before any fetch (which also keeps stored negatives
+   bounded). A target the cached registry does not know yet forces one chain
+   sync (globally rate-limited) before it is refused, because "this signer just
+   changed" is exactly when this endpoint gets called.
+3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
+   own fan-out) protects this service, the AS and the nodes. Over capacity is
+   `429` + `Retry-After`, not an unbounded queue.
+
+An API key (`Authorization: Bearer`, the same keys [`as-key.sh`](as-key.sh)
+issues) only selects a bigger request quota — anonymous callers are metered per
+IP at 6/min, key holders at 60/min (a KMS node warming its cache after a restart
+may need to verify tens of signers quickly). The key is **not a security
+boundary**: all authorisation lives in the three limits above, a stolen key
+yields nothing but quota, so it may sit in plaintext config and be rotated
+freely.
+
+## Verifying tappscan itself
+
+Everything above has this instance vouching for other apps. Who vouches for it?
+Not itself — a scan consuming its own conclusions would be circular — and not
+the chain either. The trust model, explicitly:
+
+```
+human review           ← the only step that makes content trustworthy
+                         (code → reproducible build → reference hash)
+declarations (chain,   ← publication channels; they add no trustworthiness
+ this repo)              of their own
+TEE + verification     ← proves "what runs == what was declared",
+                         never that what was declared is good
+```
+
+tappscan's job is to make "runs == declared" machine-checkable for every app, so
+that the object a human must review shrinks to one: **this service**. Verify it
+the way it verifies others, with your own client and the reference values in
+this repository:
+
+```bash
+tapp-cli verify-app --app-id <this instance's app_id> --server <its teeUrl> \
+  --reference-values ./verifier/reference-values
+```
+
+(or fetch the evidence yourself and follow
+[`0g-tapp/docs/EVIDENCE_AND_AS_VERIFICATION.md`](https://github.com/0gfoundation/0g-tapp/blob/main/docs/EVIDENCE_AND_AS_VERIFICATION.md)).
+A passing check proves this instance runs the measured image and compose this
+repository declares — and nothing more. Whether the declared code deserves the
+trust is exactly the part no machine can add: it comes from the people who have
+reviewed it, which is why every consumer doing this check once is not a
+formality but the audit itself. Consumers that pin this instance's attested TLS
+key (the KMS does) re-run this verification whenever the instance's identity
+rotates, and update their pin only after it passes.
 
 ## The signer is the unit
 
