@@ -152,8 +152,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps/:app_id", get(app_detail))
         .route("/api/apps/:app_id/cert", get(app_cert))
         .route("/api/apps/:app_id/events", get(app_events))
-        // The one endpoint that does work instead of reading a cache.
+        // The one endpoint that does work instead of reading a cache. Mounted
+        // twice: consumers configure a base URL and POST `{base}/verify`, and a
+        // base of the bare host must work as well as one ending in /api.
         .route("/api/verify", post(verify))
+        .route("/verify", post(verify))
         // Key management. Minting and revoking require a signature from the
         // registry's admin; listing is metadata only and carries no secret.
         .route("/api/keys", get(list_keys).post(issue_key))
@@ -669,7 +672,8 @@ struct VerifyRequest {
 /// 3. at most [`VerifyState::slots`] attestations run at once; over capacity is
 ///    429, not a queue.
 ///
-/// The API key (`Authorization: Bearer`) only selects a bigger request quota.
+/// The API key (`Authorization: Bearer` or `x-api-key`) only selects a bigger
+/// request quota.
 async fn verify(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -687,19 +691,12 @@ async fn verify(
 
     // Caller class. A presented key that verifies buys the keyed quota; anything
     // else — no key, bad key — is metered per IP, so this is not a key-testing
-    // oracle: guessing is capped by the anonymous quota itself. The forwarded
-    // header is spoofable by a direct caller, but a spoofed identity buys only
-    // the anonymous quota again; the structural limits do not care who asks.
+    // oracle: guessing is capped by the anonymous quota itself. The key check is
+    // read-only (no last-used stamp) so the hot path never takes the write lock.
     let verify_state = state.read().await.verify.clone();
-    let presented = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let (caller, limit) = match presented {
-        Some(secret) => match state.write().await.api_keys.accept(secret, now()) {
-            Some(key) => (format!("key:{}", key.id), KEYED_PER_WINDOW),
+    let (caller, limit) = match presented_key(&headers) {
+        Some(secret) => match state.read().await.api_keys.check(secret, now()) {
+            Some(id) => (format!("key:{id}"), KEYED_PER_WINDOW),
             None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
         },
         None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
@@ -729,7 +726,11 @@ async fn verify(
                     if added > 0 {
                         tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
                     }
-                    state.write().await.registry = registry;
+                    // Never roll the shared view back behind a concurrent sync.
+                    let mut s = state.write().await;
+                    if registry.scanned_to >= s.registry.scanned_to {
+                        s.registry = registry;
+                    }
                 }
                 Err(e) => tracing::warn!("forced chain sync failed: {e}"),
             }
@@ -796,13 +797,30 @@ async fn current_target_block(state: &AppState, app_id: &str, signer: &str) -> O
         .then(|| t.latest_block())
 }
 
-/// The anonymous caller identity: first hop of X-Forwarded-For when a proxy put
-/// one there, the socket peer otherwise.
+/// The API key a request presents: `Authorization: Bearer …` or `x-api-key` —
+/// the KMS sends the latter, tooling tends to send the former.
+fn presented_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// The anonymous caller identity: the LAST hop of X-Forwarded-For when a proxy
+/// put one there, the socket peer otherwise. Last, not first: the standard
+/// appending proxy (`$proxy_add_x_forwarded_for`) puts the address it actually
+/// saw at the end, while everything before it is client-supplied — metering the
+/// first hop would let each spoofed value mint its own quota. A caller reaching
+/// this port directly can still write the header; see the README for what the
+/// quota does and does not promise.
 fn anon_caller(headers: &HeaderMap, peer: SocketAddr) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.split(',').next_back())
         .map(|ip| format!("ip:{}", ip.trim()))
         .unwrap_or_else(|| format!("ip:{}", peer.ip()))
 }
@@ -820,19 +838,82 @@ fn too_many(retry_after: i64) -> Response {
 /// and megabytes, and an admission decision needs none of them — they stay on
 /// the events endpoint.
 fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool) -> Response {
-    let mut status = refreshed_verdict(entry, &s.ref_sets);
+    let (code, mut body) = verdict_parts(entry, &s.ref_sets, cached);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("reference_values".into(), json!(s.refs_from));
+    }
+    (code, Json(body)).into_response()
+}
+
+/// The wire contract, as a pure function so it has tests. Top-level `verified` +
+/// `reason` are what an admission gate consumes (0g-kms reads exactly these);
+/// `status` is the full per-signer shape `/api/apps/:app_id` serves, minus the
+/// trace, for consumers that want the evidence behind the bool.
+///
+/// `verified` means all of: evidence obtained and quote verified, the quote
+/// attests the registered signer, the runtime event log replays, and the boot
+/// chain matches a published reference set. That last one is deliberate — the
+/// bar is "runs what was declared", and an image nobody published values for
+/// was not declared.
+///
+/// A failure on OUR side (`verifier_fault`: chain RPC down, AS hiccup) is 503,
+/// never a 200 verdict: such a result says nothing about the node, and a gate
+/// reading 200+false as a definite negative would blame the node for this
+/// service's outage. A node-fault failure (unreachable, no such app) IS a
+/// statement about the node: 200, `verified: false`, the error as the reason.
+fn verdict_parts(
+    entry: &status::Entry,
+    sets: &[crate::refvalues::RefSet],
+    cached: bool,
+) -> (StatusCode, serde_json::Value) {
+    let mut status = refreshed_verdict(entry, sets);
     if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
         a.remove("events");
     }
-    Json(json!({
-        "app_id": entry.app_id,
-        "signer": entry.signer,
-        "cached": cached,
-        "status": status,
-        "reference_values": s.refs_from,
-        "now": now(),
-    }))
-    .into_response()
+    let (verified, reason) = match &entry.attested {
+        None => (
+            false,
+            entry
+                .error
+                .clone()
+                .unwrap_or_else(|| "attestation failed".into()),
+        ),
+        Some(a) if !a.signer_ok(&entry.signer) => (
+            false,
+            format!(
+                "the quote attests {}, not the registered signer",
+                a.attested_signer.as_deref().unwrap_or("nothing")
+            ),
+        ),
+        Some(a) if !a.runtime_replay_ok => (
+            false,
+            "the runtime event log does not replay against the signed RTMRs".into(),
+        ),
+        Some(a) => match a.identify(sets).0 {
+            Some(_) => (true, String::new()),
+            None => (
+                false,
+                "the boot chain matches no published reference set".into(),
+            ),
+        },
+    };
+    let code = if entry.error.is_some() && entry.verifier_fault {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        json!({
+            "app_id": entry.app_id,
+            "signer": entry.signer,
+            "cached": cached,
+            "verified": verified,
+            "reason": reason,
+            "status": status,
+            "now": now(),
+        }),
+    )
 }
 
 // ─── API keys ────────────────────────────────────────────────────────────────
@@ -1192,5 +1273,113 @@ mod tests {
         // A different IP, and a key holder, are unaffected.
         assert!(count_request(&mut w, "ip:5.6.7.8", ANON_PER_WINDOW, 1000).is_ok());
         assert!(count_request(&mut w, "key:kabc", KEYED_PER_WINDOW, 1000).is_ok());
+    }
+
+    // ─── /api/verify wire contract ───────────────────────────────────────────
+    //
+    // The consumer (0g-kms's admission gate) reads exactly: HTTP status, then
+    // top-level `verified` and `reason`. These tests pin that shape — each side
+    // testing only against its own mock is how the seam breaks.
+
+    use crate::refvalues::{RefSet, ANY_BSA};
+
+    fn matching_set() -> Vec<RefSet> {
+        vec![RefSet {
+            label: "gcp/uki/v0.8.0/prod.json".into(),
+            values: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+        }]
+    }
+
+    fn good_entry() -> status::Entry {
+        status::Entry {
+            app_id: "mine".into(),
+            signer: "0xaaa".into(),
+            tee_url: "https://node:50052".into(),
+            checked_at: 1000,
+            app_latest_block: 1,
+            error: None,
+            verifier_fault: false,
+            attested: Some(status::Attested {
+                tcb_status: "UpToDate".into(),
+                advisories: vec![],
+                attested_signer: Some("0xAAA".into()),
+                tls_public_key: None,
+                boot_format: "uki".into(),
+                measured: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+                runtime_replay_ok: true,
+                event_count: 3,
+                events: vec![
+                    ev("claim_config", None),
+                    ev("start_app", Some("mine")),
+                    ev("get_app_secret_key", Some("mine")),
+                ],
+                note: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_good_node_is_verified_with_an_empty_reason_and_no_trace() {
+        let (code, body) = verdict_parts(&good_entry(), &matching_set(), false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(true));
+        assert_eq!(body["reason"], json!(""));
+        assert_eq!(body["cached"], json!(false));
+        // The megabytes stay on the events endpoint.
+        assert!(body["status"]["attested"].get("events").is_none());
+        // …but the evidence behind the bool is served.
+        assert_eq!(body["status"]["attested"]["signer_ok"], json!(true));
+        assert_eq!(
+            body["status"]["attested"]["image"],
+            json!("gcp/uki/v0.8.0/prod.json")
+        );
+    }
+
+    #[test]
+    fn each_failed_check_reads_as_a_definite_negative_with_its_reason() {
+        // Signer mismatch: the registered identity is not the one in the quote.
+        let mut e = good_entry();
+        e.attested.as_mut().unwrap().attested_signer = Some("0xbbb".into());
+        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert!(body["reason"].as_str().unwrap().contains("0xbbb"));
+
+        // Unknown image: runs something nobody published values for.
+        let (code, body) = verdict_parts(&good_entry(), &[], false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert!(body["reason"].as_str().unwrap().contains("reference set"));
+
+        // Replay mismatch.
+        let mut e = good_entry();
+        e.attested.as_mut().unwrap().runtime_replay_ok = false;
+        let (_, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(body["verified"], json!(false));
+    }
+
+    #[test]
+    fn a_node_fault_is_a_200_negative_but_our_fault_is_a_503() {
+        // The node's failure is a statement about the node.
+        let e = status::Entry::failed(
+            "mine", "0xaaa", "https://node:50052", 1, 1000,
+            "connection refused".into(), false,
+        );
+        let (code, body) = verdict_parts(&e, &matching_set(), true);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert_eq!(body["reason"], json!("connection refused"));
+        assert_eq!(body["cached"], json!(true));
+
+        // Our failure says nothing about the node and must not read as a
+        // verdict: the consumer's 5xx path serves stale positives instead of
+        // caching a negative.
+        let e = status::Entry::failed(
+            "mine", "0xaaa", "", 1, 1000,
+            "cannot read teeUrl from chain: RPC down".into(), true,
+        );
+        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["verified"], json!(false));
     }
 }

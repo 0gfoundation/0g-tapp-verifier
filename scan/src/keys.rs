@@ -160,6 +160,18 @@ impl KeyStore {
         record
     }
 
+    /// Look a secret up WITHOUT recording the use — for paths where the key only
+    /// selects a quota tier and taking a write lock per request would serialize
+    /// the endpoint on bookkeeping. `Some(key id)` when usable.
+    pub fn check(&self, secret: &str, now: i64) -> Option<String> {
+        let digest = hash_of(secret);
+        self.keys
+            .iter()
+            .find(|k| same_digest(&k.hash, &digest))
+            .filter(|k| k.usable_at(now))
+            .map(|k| k.id.clone())
+    }
+
     /// Look a secret up and mark it used. `None` means refused — the caller is told
     /// nothing more than that.
     pub fn accept(&mut self, secret: &str, now: i64) -> Option<&ApiKey> {

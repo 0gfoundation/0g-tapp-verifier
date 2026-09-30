@@ -459,8 +459,9 @@ async fn main() -> Result<()> {
                 refreshed_at: unix_now(),
                 scanner: scanner.clone(),
                 as_endpoint: opts.as_endpoint.clone(),
-                // The same knob as the refresh loop's own fan-out: both are load
-                // on this service, the AS and the nodes, so they share one cap.
+                // The same knob as the refresh loop's fan-out but a SEPARATE
+                // pool — a background round at full tilt cannot starve the
+                // admission path this endpoint exists for.
                 verify: std::sync::Arc::new(api::VerifyState::new(opts.concurrency.max(1))),
             }));
 
@@ -554,7 +555,14 @@ async fn main() -> Result<()> {
                                 if added > 0 {
                                     tracing::info!("{added} new chain event(s)");
                                 }
-                                shared.write().await.registry = r;
+                                // Same discipline as the store: never roll the
+                                // view back. A forced sync from the on-demand
+                                // endpoint may have advanced it while this round
+                                // was reading logs.
+                                let mut s = shared.write().await;
+                                if r.scanned_to >= s.registry.scanned_to {
+                                    s.registry = r;
+                                }
                             }
                             Err(e) => tracing::warn!("chain sync failed: {e}"),
                         }

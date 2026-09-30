@@ -227,11 +227,24 @@ curl -s -X POST https://scan/api/verify \
   -d '{"app_id": "0g-kms", "signer": "0x…"}'
 ```
 
-The response carries `cached` (whether this is a fresh attestation or one inside
-the cooldown), `status` in the same shape as `/api/apps/:app_id` serves per
-signer — `attested.signer_ok`, `attested.image`, `error`, `checked_at` — minus
-the runtime trace, which stays on the events endpoint, and `reference_values`,
-the provenance of the set the verdict was reached against.
+(`/verify` is mounted too, so a consumer configured with a base URL of the bare
+host works the same as one ending in `/api`.)
+
+An admission gate needs exactly three things, and they are top-level:
+the **HTTP status** (200 = a verdict about the node; **503** = *this service*
+could not establish anything — chain RPC or AS trouble — which a consumer must
+treat as "verifier unavailable", never as a negative), **`verified`**, and
+**`reason`** (empty when verified). `verified` means all of: quote verified and
+the registered signer attested, runtime event log replays, and the boot chain
+matches a **published reference set** — running an image nobody published values
+for was not declared, so it does not pass. A node-side failure (unreachable, no
+such app) is a 200 with `verified: false` and the error as the reason.
+
+Beside those: `cached` (a fresh attestation, or one inside the cooldown),
+`status` — the full per-signer shape `GET /api/apps/:app_id` serves (verdicts,
+measurements, TCB, errors, all of it) minus the runtime trace, which stays on
+the events endpoint — and `reference_values`, the provenance of the set the
+verdict was reached against.
 
 The endpoint is **public**. What keeps that safe is structural, not caller
 identity:
@@ -252,13 +265,20 @@ identity:
    own fan-out) protects this service, the AS and the nodes. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.
 
-An API key (`Authorization: Bearer`, the same keys [`as-key.sh`](as-key.sh)
-issues) only selects a bigger request quota — anonymous callers are metered per
-IP at 6/min, key holders at 60/min (a KMS node warming its cache after a restart
-may need to verify tens of signers quickly). The key is **not a security
-boundary**: all authorisation lives in the three limits above, a stolen key
-yields nothing but quota, so it may sit in plaintext config and be rotated
-freely.
+An API key (`Authorization: Bearer` or `x-api-key`, the same keys
+[`as-key.sh`](as-key.sh) issues) only selects a bigger request quota — anonymous
+callers are metered per IP at 6/min, key holders at 60/min (a KMS node warming
+its cache after a restart may need to verify tens of signers quickly). The key
+is **not a security boundary**: all authorisation lives in the three limits
+above, a stolen key yields nothing but quota, so it may sit in plaintext config
+and be rotated freely.
+
+On the per-IP metering: the IP is the **last** hop of `X-Forwarded-For` (what a
+standard appending proxy actually saw; everything before it is client-supplied),
+falling back to the socket peer. That is honest behind the deployment's nginx
+front; a caller who can reach the port directly can still write the header, so
+treat the anonymous quota as best-effort — the structural limits above are the
+safety story either way.
 
 ## Verifying tappscan itself
 
