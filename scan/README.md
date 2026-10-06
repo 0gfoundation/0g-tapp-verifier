@@ -309,10 +309,15 @@ request from a cache. Without a nonce the evidence is still genuine, only undate
 in it is attested (`"attested": false`); the facts that matter are also in the
 event log, where they are.
 
-Both are bounded exactly like `POST /api/verify`: only a CURRENT node of the app
-on chain, its teeUrl read via `getNode` (no URL in the request), the same per-IP /
-per-key quota, and the shared concurrency cap. A node that cannot be reached or
-answers with an error is `502`; failing to read the chain is `503`.
+Both are bounded like `POST /api/verify`: only a CURRENT node of the app on chain,
+its teeUrl read via `getNode` (no URL in the request), the same per-IP / per-key
+quota — plus a concurrency cap of their own (half of `--concurrency`), since relay
+calls cannot share results and must not starve `/api/verify`. Node calls time out
+(8s to connect, 30s per call). A node that cannot be reached is `502 node
+unreachable`, one that answers with an error `502 node answered with an error`;
+the detail goes to this service's log only, because a teeUrl is its registrant's
+choice and raw connection errors would let them probe what is reachable from
+here. Failing to read the chain is `503`.
 
 ## Verifying tappscan itself
 

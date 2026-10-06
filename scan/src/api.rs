@@ -98,6 +98,10 @@ pub struct VerifyState {
     /// limit the refresh loop runs under, protecting this service, the AS and
     /// the nodes. Over capacity answers 429 rather than queueing without bound.
     slots: tokio::sync::Semaphore,
+    /// The relay's own, smaller cap. A relay call cannot share results (every one
+    /// carries a fresh nonce), so it must not be able to occupy the slots
+    /// `/api/verify` and the KMS depend on.
+    relay_slots: tokio::sync::Semaphore,
     /// Single-flight per (app_id, signer): concurrent requests for one target
     /// serialise on its lock, and the latecomers find the fresh result inside
     /// the cooldown instead of repeating the work. Entries are only created for
@@ -118,6 +122,7 @@ impl VerifyState {
     pub fn new(concurrency: usize) -> Self {
         Self {
             slots: tokio::sync::Semaphore::new(concurrency),
+            relay_slots: tokio::sync::Semaphore::new((concurrency / 2).max(1)),
             targets: Default::default(),
             quota: Default::default(),
             last_sync: tokio::sync::Mutex::new(0),
@@ -824,8 +829,11 @@ async fn resolve_current_target(
 // relayed answer is never a cached one.
 //
 // Bounded like `/api/verify`: current on-chain nodes only, with the teeUrl read
-// from the chain (no URL in the request, so no SSRF), the per-caller quota, and
-// the shared concurrency cap.
+// from the chain rather than the request, the per-caller quota, and a concurrency
+// cap of its own; node calls time out. The teeUrl is still the registrant's choice
+// and may name an internal address (legitimately: a node in this service's VPC), so
+// a failure is reported only as "unreachable" or "answered with an error" — the raw
+// connection error would let a registrant probe what is reachable from here.
 
 /// The longest challenge GetEvidence accepts.
 const MAX_NONCE_BYTES: usize = 64;
@@ -903,7 +911,7 @@ async fn relay_evidence(
             Ok(t) => t,
             Err(r) => return r,
         };
-    let Ok(_permit) = verify_state.slots.try_acquire() else {
+    let Ok(_permit) = verify_state.relay_slots.try_acquire() else {
         return too_many(5);
     };
     match crate::attest::fetch_evidence_for(&tee_url, &app_id, nonce.clone()).await {
@@ -917,8 +925,19 @@ async fn relay_evidence(
             "relayed_at": now(),
             "evidence": base64::engine::general_purpose::STANDARD.encode(&r.evidence),
         })),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("node at {tee_url}: {e}\n")).into_response(),
+        Err(e) => node_failure(&app_id, &signer, e),
     }
+}
+
+/// What a caller learns about a node call that failed: which of two classes, never the
+/// detail, which goes to this service's log.
+fn node_failure(app_id: &str, signer: &str, e: crate::attest::NodeFailure) -> Response {
+    tracing::warn!("relay {app_id}/{signer}: {e}");
+    let msg = match e {
+        crate::attest::NodeFailure::Unreachable(_) => "node unreachable\n",
+        crate::attest::NodeFailure::Refused(_) => "node answered with an error\n",
+    };
+    (StatusCode::BAD_GATEWAY, msg).into_response()
 }
 
 /// `GET /api/apps/:app_id/nodes/:signer/info` — the node's public configuration,
@@ -936,7 +955,7 @@ async fn relay_info(
             Ok(t) => t,
             Err(r) => return r,
         };
-    let Ok(_permit) = verify_state.slots.try_acquire() else {
+    let Ok(_permit) = verify_state.relay_slots.try_acquire() else {
         return too_many(5);
     };
     match crate::attest::fetch_tapp_info(&tee_url).await {
@@ -958,7 +977,7 @@ async fn relay_info(
                 "relayed_at": now(),
             }))
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("node at {tee_url}: {e}\n")).into_response(),
+        Err(e) => node_failure(&app_id, &signer, e),
     }
 }
 
