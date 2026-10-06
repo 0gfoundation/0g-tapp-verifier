@@ -1,23 +1,27 @@
-//! Read-only HTTP interface over the caches.
+//! HTTP interface over the caches.
 //!
-//! Every response is served from memory. Nothing here fetches evidence or calls
-//! the Attestation Service — that only happens in the background refresh loop, so
-//! no amount of reading can be turned into load on the nodes or the AS.
+//! Every read is served from memory: reads never fetch evidence or call the
+//! Attestation Service, so no amount of reading can be turned into load on the
+//! nodes or the AS. The one exception is `POST /api/verify`, which exists
+//! precisely to do that work on demand — and is therefore bounded three ways
+//! (per-target cooldown with single-flight, chain-registered targets only, a
+//! global concurrency cap) plus per-caller quotas. See [`verify`].
 //!
 //! Every attestation result is reported with the time it was taken. A cached
 //! result describes the node as it was at that moment and nothing more.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,9 +61,88 @@ pub struct Shared {
     pub refs_from: crate::refsource::Provenance,
     /// Unix seconds of the last completed refresh round.
     pub refreshed_at: i64,
+    /// For the on-demand endpoint only: reading teeUrls and syncing the chain.
+    pub scanner: Arc<chain::Scanner>,
+    /// For the on-demand endpoint only: where evidence is evaluated.
+    pub as_endpoint: String,
+    /// The on-demand endpoint's own bounds. An `Arc` so a handler can clone it
+    /// out and wait on its locks without holding this `RwLock` across the wait.
+    pub verify: Arc<VerifyState>,
 }
 
 pub type AppState = Arc<RwLock<Shared>>;
+
+// ─── On-demand verification ──────────────────────────────────────────────────
+
+/// Seconds a fresh result answers repeat requests for the same (app_id, signer).
+/// This is what makes the endpoint safe to expose: a node that just rebooted is
+/// discovered by all five KMS nodes at once, and one attestation must serve all
+/// of them rather than five concurrent quote generations hitting the node.
+const VERIFY_COOLDOWN_SECS: i64 = 60;
+
+/// Per-caller request metering, fixed one-minute windows. The quotas are QoS
+/// tiers, not a security boundary — authorisation comes from the structural
+/// limits (cooldown, chain-registered targets only, the concurrency cap), so a
+/// stolen key yields nothing but a bigger quota.
+const QUOTA_WINDOW_SECS: i64 = 60;
+const ANON_PER_WINDOW: u32 = 6;
+const KEYED_PER_WINDOW: u32 = 60;
+
+/// A forced chain sync (for a target the cached registry does not know yet) runs
+/// at most this often, whoever asks.
+const FORCED_SYNC_MIN_SECS: i64 = 10;
+
+/// Everything that bounds `POST /api/verify`.
+pub struct VerifyState {
+    /// Global cap on targets being attested on demand at once — the same kind of
+    /// limit the refresh loop runs under, protecting this service, the AS and
+    /// the nodes. Over capacity answers 429 rather than queueing without bound.
+    slots: tokio::sync::Semaphore,
+    /// Single-flight per (app_id, signer): concurrent requests for one target
+    /// serialise on its lock, and the latecomers find the fresh result inside
+    /// the cooldown instead of repeating the work. Entries are only created for
+    /// targets the chain knows, so the map is bounded by the registry.
+    targets: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Request counters per caller, pruned as windows expire.
+    quota: tokio::sync::Mutex<HashMap<String, Window>>,
+    /// When a forced chain sync last ran.
+    last_sync: tokio::sync::Mutex<i64>,
+}
+
+struct Window {
+    start: i64,
+    count: u32,
+}
+
+impl VerifyState {
+    pub fn new(concurrency: usize) -> Self {
+        Self {
+            slots: tokio::sync::Semaphore::new(concurrency),
+            targets: Default::default(),
+            quota: Default::default(),
+            last_sync: tokio::sync::Mutex::new(0),
+        }
+    }
+}
+
+/// Count one request against a caller's window. `Err(seconds)` when over quota —
+/// the time until that window ends, for a Retry-After header.
+fn count_request(
+    windows: &mut HashMap<String, Window>,
+    caller: &str,
+    limit: u32,
+    now: i64,
+) -> Result<(), i64> {
+    windows.retain(|_, w| now - w.start < QUOTA_WINDOW_SECS);
+    let w = windows
+        .entry(caller.to_string())
+        .or_insert(Window { start: now, count: 0 });
+    if w.count >= limit {
+        return Err((w.start + QUOTA_WINDOW_SECS - now).max(1));
+    }
+    w.count += 1;
+    Ok(())
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -69,6 +152,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps/:app_id", get(app_detail))
         .route("/api/apps/:app_id/cert", get(app_cert))
         .route("/api/apps/:app_id/events", get(app_events))
+        // The one endpoint that does work instead of reading a cache. Mounted
+        // twice: consumers configure a base URL and POST `{base}/verify`, and a
+        // base of the bare host must work as well as one ending in /api.
+        .route("/api/verify", post(verify))
+        .route("/verify", post(verify))
         // Key management. Minting and revoking require a signature from the
         // registry's admin; listing is metadata only and carries no secret.
         .route("/api/keys", get(list_keys).post(issue_key))
@@ -563,6 +651,271 @@ async fn app_events(
 }
 
 
+#[derive(Deserialize)]
+struct VerifyRequest {
+    app_id: String,
+    signer: String,
+}
+
+/// Attest one node now and return the verdict — for consumers whose decision
+/// cannot wait for the polling loop. A tapp node re-derives its signer on every
+/// restart, so anything gating on "this signer is verified" (the KMS admitting a
+/// freshly rebooted node, for one) would otherwise stall until the next round.
+///
+/// Public by design. What keeps that safe is structural, not caller identity:
+///
+/// 1. a fresh result inside [`VERIFY_COOLDOWN_SECS`] is returned as-is, and
+///    concurrent requests for one target single-flight into one attestation;
+/// 2. the target must be a CURRENT node of the app on chain, and its teeUrl is
+///    read from the chain — a URL in the request would be an SSRF primitive, so
+///    there is none, and unregistered targets are refused before any fetch;
+/// 3. at most [`VerifyState::slots`] attestations run at once; over capacity is
+///    429, not a queue.
+///
+/// The API key (`Authorization: Bearer` or `x-api-key`) only selects a bigger
+/// request quota.
+async fn verify(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyRequest>,
+) -> Response {
+    let signer = req.signer.trim().to_lowercase();
+    if signer.parse::<ethers::types::Address>().is_err() {
+        return (StatusCode::BAD_REQUEST, "signer must be a 0x… address\n").into_response();
+    }
+    let app_id = req.app_id.trim().to_string();
+    if app_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "app_id must not be empty\n").into_response();
+    }
+
+    // Caller class. A presented key that verifies buys the keyed quota; anything
+    // else — no key, bad key — is metered per IP, so this is not a key-testing
+    // oracle: guessing is capped by the anonymous quota itself. The key check is
+    // read-only (no last-used stamp) so the hot path never takes the write lock.
+    let verify_state = state.read().await.verify.clone();
+    let (caller, limit) = match presented_key(&headers) {
+        Some(secret) => match state.read().await.api_keys.check(secret, now()) {
+            Some(id) => (format!("key:{id}"), KEYED_PER_WINDOW),
+            None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
+        },
+        None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
+    };
+    {
+        let mut windows = verify_state.quota.lock().await;
+        if let Err(retry) = count_request(&mut windows, &caller, limit, now()) {
+            return too_many(retry);
+        }
+    }
+
+    // The target must be on chain. The cached registry lags the chain by up to
+    // one sync interval, and "this signer just changed" is exactly when this
+    // endpoint gets called — so an unknown target forces one sync (rate-limited
+    // globally) before it is refused.
+    let mut latest_block = current_target_block(&state, &app_id, &signer).await;
+    if latest_block.is_none() {
+        let due = {
+            let mut last = verify_state.last_sync.lock().await;
+            let n = now();
+            (n - *last >= FORCED_SYNC_MIN_SECS).then(|| *last = n).is_some()
+        };
+        if due {
+            let scanner = state.read().await.scanner.clone();
+            match scanner.sync().await {
+                Ok((registry, added)) => {
+                    if added > 0 {
+                        tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
+                    }
+                    // Never roll the shared view back behind a concurrent sync.
+                    let mut s = state.write().await;
+                    if registry.scanned_to >= s.registry.scanned_to {
+                        s.registry = registry;
+                    }
+                }
+                Err(e) => tracing::warn!("forced chain sync failed: {e}"),
+            }
+            latest_block = current_target_block(&state, &app_id, &signer).await;
+        }
+    }
+    let Some(latest_block) = latest_block else {
+        return (
+            StatusCode::NOT_FOUND,
+            "not a current node of this app on chain\n",
+        )
+            .into_response();
+    };
+
+    // Single-flight: whoever holds the target's lock does the work; the others
+    // wait here and then hit the cooldown check below.
+    let flight = {
+        let mut targets = verify_state.targets.lock().await;
+        targets
+            .entry(format!("{app_id}|{signer}"))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _flight = flight.lock().await;
+
+    {
+        let s = state.read().await;
+        if let Some(entry) = s.store.get(&app_id, &signer) {
+            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS {
+                return verdict_response(&s, entry, true);
+            }
+        }
+    }
+
+    let Ok(_permit) = verify_state.slots.try_acquire() else {
+        return too_many(5);
+    };
+
+    let (scanner, as_endpoint, ref_sets) = {
+        let s = state.read().await;
+        (s.scanner.clone(), s.as_endpoint.clone(), s.ref_sets.clone())
+    };
+    let entry =
+        crate::attest_one(&scanner, &app_id, &signer, latest_block, &as_endpoint, &ref_sets).await;
+
+    // Into the shared store, so the page and the summaries serve it too. Not
+    // saved to disk here: the refresh loop persists on its own schedule, and a
+    // lost on-demand result is regenerated by the next request.
+    let mut s = state.write().await;
+    s.store.put(entry.clone());
+    let s = s.downgrade();
+    verdict_response(&s, &entry, false)
+}
+
+/// `Some(latest registry block for the app)` when the signer is one of the app's
+/// CURRENT nodes in the cached registry, `None` otherwise. Current is the bar:
+/// a removed or replaced signer has no claim on anything, however recently.
+async fn current_target_block(state: &AppState, app_id: &str, signer: &str) -> Option<u64> {
+    let s = state.read().await;
+    let t = s.registry.timeline(app_id);
+    t.current_signers()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(signer))
+        .then(|| t.latest_block())
+}
+
+/// The API key a request presents: `Authorization: Bearer …` or `x-api-key` —
+/// the KMS sends the latter, tooling tends to send the former.
+fn presented_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// The anonymous caller identity: the LAST hop of X-Forwarded-For when a proxy
+/// put one there, the socket peer otherwise. Last, not first: the standard
+/// appending proxy (`$proxy_add_x_forwarded_for`) puts the address it actually
+/// saw at the end, while everything before it is client-supplied — metering the
+/// first hop would let each spoofed value mint its own quota. A caller reaching
+/// this port directly can still write the header; see the README for what the
+/// quota does and does not promise.
+fn anon_caller(headers: &HeaderMap, peer: SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next_back())
+        .map(|ip| format!("ip:{}", ip.trim()))
+        .unwrap_or_else(|| format!("ip:{}", peer.ip()))
+}
+
+fn too_many(retry_after: i64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
+        "over quota or capacity — try again later\n",
+    )
+        .into_response()
+}
+
+/// One node's verdict, without the trace: the events run to thousands of entries
+/// and megabytes, and an admission decision needs none of them — they stay on
+/// the events endpoint.
+fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool) -> Response {
+    let (code, mut body) = verdict_parts(entry, &s.ref_sets, cached);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("reference_values".into(), json!(s.refs_from));
+    }
+    (code, Json(body)).into_response()
+}
+
+/// The wire contract, as a pure function so it has tests. Top-level `verified` +
+/// `reason` are what an admission gate consumes (0g-kms reads exactly these);
+/// `status` is the full per-signer shape `/api/apps/:app_id` serves, minus the
+/// trace, for consumers that want the evidence behind the bool.
+///
+/// `verified` means all of: evidence obtained and quote verified, the quote
+/// attests the registered signer, the runtime event log replays, and the boot
+/// chain matches a published reference set. That last one is deliberate — the
+/// bar is "runs what was declared", and an image nobody published values for
+/// was not declared.
+///
+/// A failure on OUR side (`verifier_fault`: chain RPC down, AS hiccup) is 503,
+/// never a 200 verdict: such a result says nothing about the node, and a gate
+/// reading 200+false as a definite negative would blame the node for this
+/// service's outage. A node-fault failure (unreachable, no such app) IS a
+/// statement about the node: 200, `verified: false`, the error as the reason.
+fn verdict_parts(
+    entry: &status::Entry,
+    sets: &[crate::refvalues::RefSet],
+    cached: bool,
+) -> (StatusCode, serde_json::Value) {
+    let mut status = refreshed_verdict(entry, sets);
+    if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
+        a.remove("events");
+    }
+    let (verified, reason) = match &entry.attested {
+        None => (
+            false,
+            entry
+                .error
+                .clone()
+                .unwrap_or_else(|| "attestation failed".into()),
+        ),
+        Some(a) if !a.signer_ok(&entry.signer) => (
+            false,
+            format!(
+                "the quote attests {}, not the registered signer",
+                a.attested_signer.as_deref().unwrap_or("nothing")
+            ),
+        ),
+        Some(a) if !a.runtime_replay_ok => (
+            false,
+            "the runtime event log does not replay against the signed RTMRs".into(),
+        ),
+        Some(a) => match a.identify(sets).0 {
+            Some(_) => (true, String::new()),
+            None => (
+                false,
+                "the boot chain matches no published reference set".into(),
+            ),
+        },
+    };
+    let code = if entry.error.is_some() && entry.verifier_fault {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        json!({
+            "app_id": entry.app_id,
+            "signer": entry.signer,
+            "cached": cached,
+            "verified": verified,
+            "reason": reason,
+            "status": status,
+            "now": now(),
+        }),
+    )
+}
+
 // ─── API keys ────────────────────────────────────────────────────────────────
 
 fn random_hex(bytes: usize) -> String {
@@ -881,5 +1234,152 @@ mod tests {
     #[test]
     fn a_node_that_never_attested_counts_nothing() {
         assert_eq!(trace_counts(None, "mine"), (0, 0));
+    }
+
+    // ─── /api/verify quotas ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_quota_refuses_the_request_after_the_limit_with_a_sane_retry() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).is_ok());
+        }
+        let retry = count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1030).unwrap_err();
+        // The window opened at 1000, so it ends at 1060 — 30s from now.
+        assert_eq!(retry, 30);
+        // Retry-After must never be zero or negative, even at the window's edge.
+        let retry = count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1059).unwrap_err();
+        assert!(retry >= 1);
+    }
+
+    #[test]
+    fn a_new_window_starts_clean() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).unwrap();
+        }
+        assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000 + QUOTA_WINDOW_SECS).is_ok());
+        // …and the expired windows were pruned rather than accumulating forever.
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn callers_are_metered_apart() {
+        let mut w = HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).unwrap();
+        }
+        assert!(count_request(&mut w, "ip:1.2.3.4", ANON_PER_WINDOW, 1000).is_err());
+        // A different IP, and a key holder, are unaffected.
+        assert!(count_request(&mut w, "ip:5.6.7.8", ANON_PER_WINDOW, 1000).is_ok());
+        assert!(count_request(&mut w, "key:kabc", KEYED_PER_WINDOW, 1000).is_ok());
+    }
+
+    // ─── /api/verify wire contract ───────────────────────────────────────────
+    //
+    // The consumer (0g-kms's admission gate) reads exactly: HTTP status, then
+    // top-level `verified` and `reason`. These tests pin that shape — each side
+    // testing only against its own mock is how the seam breaks.
+
+    use crate::refvalues::{RefSet, ANY_BSA};
+
+    fn matching_set() -> Vec<RefSet> {
+        vec![RefSet {
+            label: "gcp/uki/v0.8.0/prod.json".into(),
+            values: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+        }]
+    }
+
+    fn good_entry() -> status::Entry {
+        status::Entry {
+            app_id: "mine".into(),
+            signer: "0xaaa".into(),
+            tee_url: "https://node:50052".into(),
+            checked_at: 1000,
+            app_latest_block: 1,
+            error: None,
+            verifier_fault: false,
+            attested: Some(status::Attested {
+                tcb_status: "UpToDate".into(),
+                advisories: vec![],
+                attested_signer: Some("0xAAA".into()),
+                tls_public_key: None,
+                boot_format: "uki".into(),
+                measured: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+                runtime_replay_ok: true,
+                event_count: 3,
+                events: vec![
+                    ev("claim_config", None),
+                    ev("start_app", Some("mine")),
+                    ev("get_app_secret_key", Some("mine")),
+                ],
+                note: String::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_good_node_is_verified_with_an_empty_reason_and_no_trace() {
+        let (code, body) = verdict_parts(&good_entry(), &matching_set(), false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(true));
+        assert_eq!(body["reason"], json!(""));
+        assert_eq!(body["cached"], json!(false));
+        // The megabytes stay on the events endpoint.
+        assert!(body["status"]["attested"].get("events").is_none());
+        // …but the evidence behind the bool is served.
+        assert_eq!(body["status"]["attested"]["signer_ok"], json!(true));
+        assert_eq!(
+            body["status"]["attested"]["image"],
+            json!("gcp/uki/v0.8.0/prod.json")
+        );
+    }
+
+    #[test]
+    fn each_failed_check_reads_as_a_definite_negative_with_its_reason() {
+        // Signer mismatch: the registered identity is not the one in the quote.
+        let mut e = good_entry();
+        e.attested.as_mut().unwrap().attested_signer = Some("0xbbb".into());
+        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert!(body["reason"].as_str().unwrap().contains("0xbbb"));
+
+        // Unknown image: runs something nobody published values for.
+        let (code, body) = verdict_parts(&good_entry(), &[], false);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert!(body["reason"].as_str().unwrap().contains("reference set"));
+
+        // Replay mismatch.
+        let mut e = good_entry();
+        e.attested.as_mut().unwrap().runtime_replay_ok = false;
+        let (_, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(body["verified"], json!(false));
+    }
+
+    #[test]
+    fn a_node_fault_is_a_200_negative_but_our_fault_is_a_503() {
+        // The node's failure is a statement about the node.
+        let e = status::Entry::failed(
+            "mine", "0xaaa", "https://node:50052", 1, 1000,
+            "connection refused".into(), false,
+        );
+        let (code, body) = verdict_parts(&e, &matching_set(), true);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["verified"], json!(false));
+        assert_eq!(body["reason"], json!("connection refused"));
+        assert_eq!(body["cached"], json!(true));
+
+        // Our failure says nothing about the node and must not read as a
+        // verdict: the consumer's 5xx path serves stale positives instead of
+        // caching a negative.
+        let e = status::Entry::failed(
+            "mine", "0xaaa", "", 1, 1000,
+            "cannot read teeUrl from chain: RPC down".into(), true,
+        );
+        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["verified"], json!(false));
     }
 }

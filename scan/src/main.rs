@@ -457,6 +457,12 @@ async fn main() -> Result<()> {
                 ref_sets: std::sync::Arc::new(tracker.sets().to_vec()),
                 refs_from: tracker.provenance().clone(),
                 refreshed_at: unix_now(),
+                scanner: scanner.clone(),
+                as_endpoint: opts.as_endpoint.clone(),
+                // The same knob as the refresh loop's fan-out but a SEPARATE
+                // pool — a background round at full tilt cannot starve the
+                // admission path this endpoint exists for.
+                verify: std::sync::Arc::new(api::VerifyState::new(opts.concurrency.max(1))),
             }));
 
             // The refresh loop is the ONLY thing that touches nodes or the AS;
@@ -493,7 +499,10 @@ async fn main() -> Result<()> {
                                 tracing::warn!("could not save status cache: {e}");
                             }
                             let mut s = shared.write().await;
-                            s.store = store;
+                            // Newer-wins, not assignment: an on-demand verification
+                            // may have landed a fresher result while this round ran
+                            // on its clone, and the round must not roll it back.
+                            s.store.absorb(store);
                             s.refreshed_at = unix_now();
                             tracing::info!("{done} node(s) attested");
                         } else {
@@ -546,7 +555,14 @@ async fn main() -> Result<()> {
                                 if added > 0 {
                                     tracing::info!("{added} new chain event(s)");
                                 }
-                                shared.write().await.registry = r;
+                                // Same discipline as the store: never roll the
+                                // view back. A forced sync from the on-demand
+                                // endpoint may have advanced it while this round
+                                // was reading logs.
+                                let mut s = shared.write().await;
+                                if r.scanned_to >= s.registry.scanned_to {
+                                    s.registry = r;
+                                }
                             }
                             Err(e) => tracing::warn!("chain sync failed: {e}"),
                         }
@@ -556,7 +572,14 @@ async fn main() -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("serving on http://{bind}");
-            axum::serve(listener, api::router(shared)).await?;
+            // With the peer address, so the on-demand endpoint can meter callers
+            // that present no API key.
+            axum::serve(
+                listener,
+                api::router(shared)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await?;
             refresher.abort();
         }
     }
@@ -686,62 +709,16 @@ async fn run_jobs(
         let as_endpoint = opts.as_endpoint.clone();
         tasks.spawn(async move {
             let _permit = limit.acquire().await;
-            let now = unix_now();
             tracing::info!("{}/{}: attesting ({})", job.app_id, job.signer, job.reason);
-
-            let tee_url = match scanner.node_tee_url(&job.app_id, &job.signer).await {
-                Ok(u) => u,
-                Err(e) => {
-                    tracing::warn!(
-                        "{}/{}: cannot read teeUrl from chain: {e}",
-                        job.app_id,
-                        job.signer
-                    );
-                    return status::Entry::failed(
-                        &job.app_id,
-                        &job.signer,
-                        "",
-                        job.latest_block,
-                        now,
-                        format!("cannot read teeUrl from chain: {e}"),
-                        true, // reading the chain is our job, not the node's
-                    );
-                }
-            };
-            match attest::check_node(
-                &tee_url,
+            attest_one(
+                &scanner,
                 &job.app_id,
                 &job.signer,
+                job.latest_block,
                 &as_endpoint,
                 &ref_sets,
-                now,
             )
             .await
-            {
-                Ok(s) => status::Entry::from_status(&s, &job.app_id, job.latest_block),
-                Err(e) => {
-                    // Say whose fault it is. An AS that could not finish tells you
-                    // nothing about the node, and reporting it as a node failure
-                    // dresses our own outage up as theirs.
-                    if e.is_verifier() {
-                        tracing::warn!(
-                            "{}/{}: evidence in hand but verification failed on our side: {e}",
-                            job.app_id, job.signer
-                        );
-                    } else {
-                        tracing::warn!("{}/{} at {tee_url}: {e}", job.app_id, job.signer);
-                    }
-                    status::Entry::failed(
-                        &job.app_id,
-                        &job.signer,
-                        &tee_url,
-                        job.latest_block,
-                        now,
-                        e.to_string(),
-                        e.is_verifier(),
-                    )
-                }
-            }
         });
     }
 
@@ -757,6 +734,64 @@ async fn run_jobs(
         }
     }
     done
+}
+
+/// Attest one node end to end: read its teeUrl from the chain, fetch and verify
+/// its evidence, and shape the outcome — success or failure — as the cache entry
+/// everything else reads. Shared by the refresh loop and the on-demand endpoint,
+/// so an on-demand result is exactly what the next round would have produced.
+///
+/// The teeUrl comes from the chain and nowhere else. In particular the on-demand
+/// endpoint never accepts a URL from its caller: whoever is not registered on
+/// chain cannot make this service connect anywhere.
+pub(crate) async fn attest_one(
+    scanner: &chain::Scanner,
+    app_id: &str,
+    signer: &str,
+    latest_block: u64,
+    as_endpoint: &str,
+    ref_sets: &[refvalues::RefSet],
+) -> status::Entry {
+    let now = unix_now();
+    let tee_url = match scanner.node_tee_url(app_id, signer).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("{app_id}/{signer}: cannot read teeUrl from chain: {e}");
+            return status::Entry::failed(
+                app_id,
+                signer,
+                "",
+                latest_block,
+                now,
+                format!("cannot read teeUrl from chain: {e}"),
+                true, // reading the chain is our job, not the node's
+            );
+        }
+    };
+    match attest::check_node(&tee_url, app_id, signer, as_endpoint, ref_sets, now).await {
+        Ok(s) => status::Entry::from_status(&s, app_id, latest_block),
+        Err(e) => {
+            // Say whose fault it is. An AS that could not finish tells you
+            // nothing about the node, and reporting it as a node failure
+            // dresses our own outage up as theirs.
+            if e.is_verifier() {
+                tracing::warn!(
+                    "{app_id}/{signer}: evidence in hand but verification failed on our side: {e}"
+                );
+            } else {
+                tracing::warn!("{app_id}/{signer} at {tee_url}: {e}");
+            }
+            status::Entry::failed(
+                app_id,
+                signer,
+                &tee_url,
+                latest_block,
+                now,
+                e.to_string(),
+                e.is_verifier(),
+            )
+        }
+    }
 }
 
 fn print_entry(

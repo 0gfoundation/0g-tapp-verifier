@@ -324,9 +324,18 @@ impl Store {
     /// The other half of sharing the file: a running instance picks up an operator's
     /// forced re-check on its next round instead of ignoring it for an hour.
     pub fn merge_from_disk(&mut self, path: &Path) -> usize {
-        let disk = Store::load(path);
+        self.absorb(Store::load(path))
+    }
+
+    /// Take every entry of `other` that is newer than the one held here.
+    ///
+    /// This is how a refresh round lands: the loop works on a clone while readers
+    /// stay unblocked, and an on-demand verification may have written a newer
+    /// result into the shared store in the meantime. Assigning the clone back
+    /// would silently discard that result; absorbing keeps whichever is newer.
+    pub fn absorb(&mut self, other: Store) -> usize {
         let mut taken = 0;
-        for (key, entry) in disk.entries {
+        for (key, entry) in other.entries {
             let newer = self
                 .entries
                 .get(&key)
