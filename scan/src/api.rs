@@ -68,6 +68,9 @@ pub struct Shared {
     /// The on-demand endpoint's own bounds. An `Arc` so a handler can clone it
     /// out and wait on its locks without holding this `RwLock` across the wait.
     pub verify: Arc<VerifyState>,
+    /// Whether a match on a dev reference set counts as verified. Dev images can
+    /// carry an SSH key into the TD; mainnet accepts production sets only.
+    pub accept_dev: bool,
 }
 
 pub type AppState = Arc<RwLock<Shared>>;
@@ -102,6 +105,10 @@ pub struct VerifyState {
     /// carries a fresh nonce), so it must not be able to occupy the slots
     /// `/api/verify` and the KMS depend on.
     relay_slots: tokio::sync::Semaphore,
+    /// Relay targets that just failed to answer, until when to answer for them without
+    /// trying: a blackholed teeUrl would otherwise hold a relay slot for the full
+    /// connect timeout on every call, and its timing would tell refused from filtered.
+    unreachable: tokio::sync::Mutex<HashMap<String, i64>>,
     /// Single-flight per (app_id, signer): concurrent requests for one target
     /// serialise on its lock, and the latecomers find the fresh result inside
     /// the cooldown instead of repeating the work. Entries are only created for
@@ -123,6 +130,7 @@ impl VerifyState {
         Self {
             slots: tokio::sync::Semaphore::new(concurrency),
             relay_slots: tokio::sync::Semaphore::new((concurrency / 2).max(1)),
+            unreachable: Default::default(),
             targets: Default::default(),
             quota: Default::default(),
             last_sync: tokio::sync::Mutex::new(0),
@@ -911,6 +919,10 @@ async fn relay_evidence(
             Ok(t) => t,
             Err(r) => return r,
         };
+    let key = format!("{app_id}|{signer}");
+    if let Some(r) = held_unreachable(&verify_state, &key).await {
+        return r;
+    }
     let Ok(_permit) = verify_state.relay_slots.try_acquire() else {
         return too_many(5);
     };
@@ -925,7 +937,32 @@ async fn relay_evidence(
             "relayed_at": now(),
             "evidence": base64::engine::general_purpose::STANDARD.encode(&r.evidence),
         })),
-        Err(e) => node_failure(&app_id, &signer, e),
+        Err(e) => {
+            hold_if_unreachable(&verify_state, &key, &e).await;
+            node_failure(&app_id, &signer, e)
+        }
+    }
+}
+
+/// How long a target that did not answer is answered for without trying again.
+const UNREACHABLE_HOLD_SECS: i64 = 30;
+
+/// `Some(response)` while `key` is held as unreachable.
+async fn held_unreachable(verify_state: &VerifyState, key: &str) -> Option<Response> {
+    let mut held = verify_state.unreachable.lock().await;
+    let now = now();
+    held.retain(|_, until| *until > now);
+    held.contains_key(key)
+        .then(|| (StatusCode::BAD_GATEWAY, "node unreachable\n").into_response())
+}
+
+async fn hold_if_unreachable(verify_state: &VerifyState, key: &str, e: &crate::attest::NodeFailure) {
+    if matches!(e, crate::attest::NodeFailure::Unreachable(_)) {
+        verify_state
+            .unreachable
+            .lock()
+            .await
+            .insert(key.to_string(), now() + UNREACHABLE_HOLD_SECS);
     }
 }
 
@@ -955,6 +992,10 @@ async fn relay_info(
             Ok(t) => t,
             Err(r) => return r,
         };
+    let key = format!("{app_id}|{signer}");
+    if let Some(r) = held_unreachable(&verify_state, &key).await {
+        return r;
+    }
     let Ok(_permit) = verify_state.relay_slots.try_acquire() else {
         return too_many(5);
     };
@@ -977,7 +1018,10 @@ async fn relay_info(
                 "relayed_at": now(),
             }))
         }
-        Err(e) => node_failure(&app_id, &signer, e),
+        Err(e) => {
+            hold_if_unreachable(&verify_state, &key, &e).await;
+            node_failure(&app_id, &signer, e)
+        }
     }
 }
 
@@ -1034,7 +1078,7 @@ fn too_many(retry_after: i64) -> Response {
 /// and megabytes, and an admission decision needs none of them — they stay on
 /// the events endpoint.
 fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool) -> Response {
-    let (code, mut body) = verdict_parts(entry, &s.ref_sets, cached);
+    let (code, mut body) = verdict_parts(entry, &s.ref_sets, cached, s.accept_dev);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("reference_values".into(), json!(s.refs_from));
     }
@@ -1061,6 +1105,7 @@ fn verdict_parts(
     entry: &status::Entry,
     sets: &[crate::refvalues::RefSet],
     cached: bool,
+    accept_dev: bool,
 ) -> (StatusCode, serde_json::Value) {
     let mut status = refreshed_verdict(entry, sets);
     if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
@@ -1085,7 +1130,22 @@ fn verdict_parts(
             false,
             "the runtime event log does not replay against the signed RTMRs".into(),
         ),
+        // What an AS policy used to enforce, and the local verdict must not drop: a
+        // DEBUG TD's memory is open to its host, whatever image it runs.
+        Some(a) if a.td_debug == Some(true) => (
+            false,
+            "the TD runs with DEBUG: its host can read and write its memory".into(),
+        ),
+        Some(a) if a.td_debug.is_none() => (
+            false,
+            "the TD's DEBUG attribute is not known for this result; it needs re-attesting".into(),
+        ),
+        Some(a) if a.tcb_status == "Revoked" => (false, "the platform TCB is revoked".into()),
         Some(a) => match a.identify(sets).0 {
+            Some(label) if !accept_dev && crate::refvalues::is_dev(&label) => (
+                false,
+                "the boot chain matches a dev image, which this network does not accept".into(),
+            ),
             Some(_) => (true, String::new()),
             None => (
                 false,
@@ -1093,6 +1153,21 @@ fn verdict_parts(
             ),
         },
     };
+    // Reported, not failed: clouds roll firmware out behind Intel, so a TCB trailing
+    // the latest is common on healthy nodes. The advisories say what is outstanding.
+    let warnings: Vec<String> = match &entry.attested {
+        Some(a) if a.tcb_status != "UpToDate" && a.tcb_status != "Revoked" => vec![format!(
+            "TCB {} (advisories: {})",
+            a.tcb_status,
+            a.advisories.join(", ")
+        )],
+        _ => vec![],
+    };
+    let image_env = entry
+        .attested
+        .as_ref()
+        .and_then(|a| a.identify(sets).0)
+        .map(|l| if crate::refvalues::is_dev(&l) { "dev" } else { "prod" });
     let code = if entry.error.is_some() && entry.verifier_fault {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -1106,6 +1181,8 @@ fn verdict_parts(
             "cached": cached,
             "verified": verified,
             "reason": reason,
+            "warnings": warnings,
+            "image_env": image_env,
             "status": status,
             "now": now(),
         }),
@@ -1387,6 +1464,7 @@ mod tests {
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
+                td_debug: Some(false),
                 event_count: events.len(),
                 events,
                 note: String::new(),
@@ -1503,6 +1581,7 @@ mod tests {
                 boot_format: "uki".into(),
                 measured: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
                 runtime_replay_ok: true,
+                td_debug: Some(false),
                 event_count: 3,
                 events: vec![
                     ev("claim_config", None),
@@ -1514,9 +1593,53 @@ mod tests {
         }
     }
 
+    fn with_attested(f: impl FnOnce(&mut status::Attested)) -> status::Entry {
+        let mut e = good_entry();
+        f(e.attested.as_mut().unwrap());
+        e
+    }
+
+    #[test]
+    fn a_debug_td_is_never_verified() {
+        let (_, body) = verdict_parts(&with_attested(|a| a.td_debug = Some(true)), &matching_set(), false, true);
+        assert_eq!(body["verified"], json!(false));
+        assert!(body["reason"].as_str().unwrap().contains("DEBUG"));
+        // A result stored before the attribute was recorded is unknown, not "off".
+        let (_, body) = verdict_parts(&with_attested(|a| a.td_debug = None), &matching_set(), false, true);
+        assert_eq!(body["verified"], json!(false));
+    }
+
+    #[test]
+    fn a_trailing_tcb_warns_and_a_revoked_one_fails() {
+        let e = with_attested(|a| {
+            a.tcb_status = "OutOfDate".into();
+            a.advisories = vec!["INTEL-SA-00837".into()];
+        });
+        let (_, body) = verdict_parts(&e, &matching_set(), false, true);
+        assert_eq!(body["verified"], json!(true));
+        assert_eq!(body["warnings"][0], json!("TCB OutOfDate (advisories: INTEL-SA-00837)"));
+        let (_, body) = verdict_parts(&with_attested(|a| a.tcb_status = "Revoked".into()), &matching_set(), false, true);
+        assert_eq!(body["verified"], json!(false));
+    }
+
+    #[test]
+    fn a_dev_image_is_verified_only_where_dev_is_accepted() {
+        let dev = vec![RefSet {
+            label: "gcp/uki/v0.8.0-r3/dev.json".into(),
+            values: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
+        }];
+        let (_, body) = verdict_parts(&good_entry(), &dev, false, false);
+        assert_eq!(body["verified"], json!(false));
+        assert_eq!(body["image_env"], json!("dev"));
+        let (_, body) = verdict_parts(&good_entry(), &dev, false, true);
+        assert_eq!(body["verified"], json!(true));
+        let (_, body) = verdict_parts(&good_entry(), &matching_set(), false, false);
+        assert_eq!((body["verified"].clone(), body["image_env"].clone()), (json!(true), json!("prod")));
+    }
+
     #[test]
     fn a_good_node_is_verified_with_an_empty_reason_and_no_trace() {
-        let (code, body) = verdict_parts(&good_entry(), &matching_set(), false);
+        let (code, body) = verdict_parts(&good_entry(), &matching_set(), false, true);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["verified"], json!(true));
         assert_eq!(body["reason"], json!(""));
@@ -1536,13 +1659,13 @@ mod tests {
         // Signer mismatch: the registered identity is not the one in the quote.
         let mut e = good_entry();
         e.attested.as_mut().unwrap().attested_signer = Some("0xbbb".into());
-        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        let (code, body) = verdict_parts(&e, &matching_set(), false, true);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["verified"], json!(false));
         assert!(body["reason"].as_str().unwrap().contains("0xbbb"));
 
         // Unknown image: runs something nobody published values for.
-        let (code, body) = verdict_parts(&good_entry(), &[], false);
+        let (code, body) = verdict_parts(&good_entry(), &[], false, true);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["verified"], json!(false));
         assert!(body["reason"].as_str().unwrap().contains("reference set"));
@@ -1550,7 +1673,7 @@ mod tests {
         // Replay mismatch.
         let mut e = good_entry();
         e.attested.as_mut().unwrap().runtime_replay_ok = false;
-        let (_, body) = verdict_parts(&e, &matching_set(), false);
+        let (_, body) = verdict_parts(&e, &matching_set(), false, true);
         assert_eq!(body["verified"], json!(false));
     }
 
@@ -1561,7 +1684,7 @@ mod tests {
             "mine", "0xaaa", "https://node:50052", 1, 1000,
             "connection refused".into(), false,
         );
-        let (code, body) = verdict_parts(&e, &matching_set(), true);
+        let (code, body) = verdict_parts(&e, &matching_set(), true, true);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["verified"], json!(false));
         assert_eq!(body["reason"], json!("connection refused"));
@@ -1574,7 +1697,7 @@ mod tests {
             "mine", "0xaaa", "", 1, 1000,
             "cannot read teeUrl from chain: RPC down".into(), true,
         );
-        let (code, body) = verdict_parts(&e, &matching_set(), false);
+        let (code, body) = verdict_parts(&e, &matching_set(), false, true);
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["verified"], json!(false));
     }

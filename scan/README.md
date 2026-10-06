@@ -237,10 +237,19 @@ the **HTTP status** (200 = a verdict about the node; **503** = *this service*
 could not establish anything — chain RPC or AS trouble — which a consumer must
 treat as "verifier unavailable", never as a negative), **`verified`**, and
 **`reason`** (empty when verified). `verified` means all of: quote verified and
-the registered signer attested, runtime event log replays, and the boot chain
-matches a **published reference set** — running an image nobody published values
-for was not declared, so it does not pass. A node-side failure (unreachable, no
-such app) is a 200 with `verified: false` and the error as the reason.
+the registered signer attested, runtime event log replays, the TD runs **without
+DEBUG** (a DEBUG TD's memory is open to its host — on bare metal the operator
+launches it), the platform TCB is **not revoked**, and the boot chain matches a
+**published reference set** — running an image nobody published values for was not
+declared, so it does not pass. On **mainnet** a dev set does not count (dev images
+can carry an SSH key into the TD); `--accept-dev` / `TAPPSCAN_ACCEPT_DEV` overrides,
+and testnet accepts them by default. A node-side failure (unreachable, no such app)
+is a 200 with `verified: false` and the error as the reason.
+
+`warnings` lists what passed with a caveat — a TCB trailing Intel's latest
+(`OutOfDate`, `SWHardeningNeeded`, …) and its advisories, common on clouds that roll
+firmware out behind Intel. `image_env` says whether the matched set is `dev` or
+`prod`.
 
 Beside those: `cached` (a fresh attestation, or one inside the cooldown),
 `status` — the full per-signer shape `GET /api/apps/:app_id` serves (verdicts,
@@ -313,7 +322,8 @@ Both are bounded like `POST /api/verify`: only a CURRENT node of the app on chai
 its teeUrl read via `getNode` (no URL in the request), the same per-IP / per-key
 quota — plus a concurrency cap of their own (half of `--concurrency`), since relay
 calls cannot share results and must not starve `/api/verify`. Node calls time out
-(8s to connect, 30s per call). A node that cannot be reached is `502 node
+(8s to connect, 30s per call), and a target that did not answer is answered for
+without trying for the next 30s. A node that cannot be reached is `502 node
 unreachable`, one that answers with an error `502 node answered with an error`;
 the detail goes to this service's log only, because a teeUrl is its registrant's
 choice and raw connection errors would let them probe what is reachable from

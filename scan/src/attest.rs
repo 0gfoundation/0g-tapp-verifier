@@ -104,6 +104,18 @@ fn sha384_of(event: &Value) -> Option<&str> {
 
 // ─── Boot chain ──────────────────────────────────────────────────────────────
 
+/// The DEBUG bit, parsed by the AS or read from the raw TDATTRIBUTES (bit 0 of the
+/// first, little-endian byte) when only that is present. DEBUG lets the host read and
+/// write the TD's memory — whoever launches the TD, the operator on bare metal.
+pub(crate) fn td_debug_of(tdx: &Value) -> Option<bool> {
+    if let Some(d) = tdx.pointer("/td_attributes/debug").and_then(Value::as_bool) {
+        return Some(d);
+    }
+    let raw = tdx.pointer("/quote/body/td_attributes").and_then(Value::as_str)?;
+    let first = u8::from_str_radix(raw.get(0..2)?, 16).ok()?;
+    Some(first & 1 == 1)
+}
+
 /// Pull the boot-chain digests out of the parsed event log.
 ///
 /// Selection rules mirror `../tdx-boot-chain/policy.rego`:
@@ -256,6 +268,8 @@ fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
 pub struct NodeStatus {
     /// On-chain node signer (the hardware identity being checked).
     pub signer: String,
+    /// The TD's DEBUG attribute from the token; `None` when it does not carry it.
+    pub td_debug: Option<bool>,
     pub tee_url: String,
     /// Unix seconds when this check ran. A cached status is only ever "as of"
     /// this moment — attestation is a snapshot, not a standing property.
@@ -521,6 +535,7 @@ pub async fn check_node(
         signer: signer.to_lowercase(),
         tee_url: tee_url.to_string(),
         checked_at: now,
+        td_debug: td_debug_of(tdx),
         tcb_status: tdx
             .get("tcb_status")
             .and_then(Value::as_str)
