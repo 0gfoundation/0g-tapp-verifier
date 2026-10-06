@@ -181,9 +181,9 @@ window. Each signature is therefore good for exactly one key.
 
 ## HTTP interface
 
-All reads are served from memory; no read can trigger evidence fetching. The one
-endpoint that does work on demand is `POST /api/verify`, bounded as described in
-its own section below.
+All reads are served from memory; no read can trigger evidence fetching. The
+endpoints that do work on demand are `POST /api/verify` and the two relay
+endpoints, bounded as described in their own sections below.
 
 | Endpoint | |
 |---|---|
@@ -194,6 +194,8 @@ its own section below.
 | `GET /api/apps/:app_id/cert` | the app's attested TLS key as `sha256//<base64>`, text/plain |
 | `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
 | `POST /api/verify` | attest one `{app_id, signer}` now and return the verdict |
+| `GET /api/apps/:app_id/nodes/:signer/evidence` | the node's evidence, fetched now · `nonce` (hex, ≤ 64 bytes) |
+| `GET /api/apps/:app_id/nodes/:signer/info` | the node's `GetTappInfo`, fetched now; not attested |
 
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
@@ -279,6 +281,38 @@ falling back to the socket peer. That is honest behind the deployment's nginx
 front; a caller who can reach the port directly can still write the header, so
 treat the anonymous quota as best-effort — the structural limits above are the
 safety story either way.
+
+## Relay: evidence for callers who cannot reach the node
+
+A node's tapp port (`:50052`) is meant to be open only to this service and the
+node's operators (0g-tapp#141). Everyone else gets the node's evidence through
+here, and verifies it themselves:
+
+```bash
+NONCE=0x$(openssl rand -hex 32)
+curl -s "https://scan/api/apps/$APP/nodes/$SIGNER/evidence?nonce=$NONCE"
+```
+
+The answer carries `evidence` (base64 of the bytes the node sent, untouched),
+`tee_type`, the node's `timestamp`, the `nonce` it was fetched with, the
+`tee_url` from the chain, and `relayed_at`. Responses are `no-store`.
+
+**Relaying costs no trust; the nonce is what makes that true.** Evidence verifies
+itself — the quote is Intel-signed and its `report_data` is `sha512` of the
+`runtime_data` beside it, which names the signer. What a relay could still do is
+hand back an *old* quote as a new one. With a nonce, the node writes it into
+`runtime_data`, so a quote that does not echo yours was not produced for your
+request. This service forwards the nonce as given and never answers a relay
+request from a cache. Without a nonce the evidence is still genuine, only undated.
+
+`/info` relays `GetTappInfo` — version, owner, KMS cluster, trust anchors. Nothing
+in it is attested (`"attested": false`); the facts that matter are also in the
+event log, where they are.
+
+Both are bounded exactly like `POST /api/verify`: only a CURRENT node of the app
+on chain, its teeUrl read via `getNode` (no URL in the request), the same per-IP /
+per-key quota, and the shared concurrency cap. A node that cannot be reached or
+answers with an error is `502`; failing to read the chain is `503`.
 
 ## Verifying tappscan itself
 

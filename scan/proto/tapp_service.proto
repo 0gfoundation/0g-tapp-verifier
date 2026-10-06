@@ -1,10 +1,11 @@
 syntax = "proto3";
 
 // Wire-compatible SUBSET of 0g-tapp's proto/tapp_service.proto, carrying only
-// the one method tappscan calls. Package, service, method and field numbers
-// match upstream, so this speaks to a real tapp-server unchanged; the rest of
-// the (large) service is omitted deliberately — vendoring only what is used
-// keeps the drift surface to a single stable RPC.
+// the methods tappscan calls, and of their messages only the fields it reads.
+// Package, service, method and field numbers match upstream, so this speaks to a
+// real tapp-server unchanged (fields left out are skipped on decode); the rest of
+// the (large) service is omitted deliberately — vendoring only what is used keeps
+// the drift surface small.
 //
 // Upstream: https://github.com/0gfoundation/0g-tapp/blob/main/proto/tapp_service.proto
 
@@ -15,10 +16,17 @@ service TappService {
   // address of the app is used as report_data, which is what binds the quote to
   // the on-chain node signer.
   rpc GetEvidence(GetEvidenceRequest) returns (GetEvidenceResponse);
+
+  // Public node configuration. Relayed on request; never part of a verdict, since
+  // nothing in it is attested (what matters is also in the event log).
+  rpc GetTappInfo(GetTappInfoRequest) returns (GetTappInfoResponse);
 }
 
 message GetEvidenceRequest {
   string app_id = 1;
+  // Optional challenge, at most 64 bytes, echoed into the quote's report_data
+  // (tapp-server >= 0.4.0). Sent only on behalf of a caller who supplied one.
+  bytes nonce = 2;
 }
 
 message GetEvidenceResponse {
@@ -27,4 +35,30 @@ message GetEvidenceResponse {
   bytes evidence = 3;
   string tee_type = 4;
   int64 timestamp = 5;
+}
+
+message GetTappInfoRequest {}
+
+message ServerConfigInfo {
+  bool permission_enabled = 6;
+  string owner_address = 7;
+}
+
+message KbsConfigInfo {
+  repeated string node_urls = 1;
+}
+
+message TappConfigInfo {
+  ServerConfigInfo server = 2;
+  KbsConfigInfo kbs = 4;
+  bool kbs_enabled = 5;
+  string scan_url = 7;
+  string scan_public_key = 8;
+}
+
+message GetTappInfoResponse {
+  bool success = 1;
+  string message = 2;
+  TappConfigInfo config = 3;
+  string version = 4;
 }

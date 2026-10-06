@@ -28,7 +28,7 @@ pub mod as_proto {
 
 use as_proto::attestation_service_client::AttestationServiceClient;
 use as_proto::{AttestationRequest, IndividualAttestationRequest};
-use tapp::{tapp_service_client::TappServiceClient, GetEvidenceRequest};
+use tapp::{tapp_service_client::TappServiceClient, GetEvidenceRequest, GetTappInfoRequest};
 
 const B64URL: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -323,12 +323,13 @@ impl CheckError {
     }
 }
 
-/// Fetch `app_id`'s evidence from a node.
-async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
+async fn node_client(
+    tee_url: &str,
+) -> Result<TappServiceClient<tonic::transport::Channel>> {
     // An https teeUrl (nodes ≥0g-tapp#110 register their baked :50052 front) is
     // encryption without authentication — the certificate is self-signed and
     // accepted unseen, which is sound here because evidence authenticates itself
-    // (Intel-signed) and this fetch sends no secret. See tls.rs.
+    // (Intel-signed) and these calls send no secret. See tls.rs.
     let channel = if tee_url.starts_with("https://") {
         crate::tls::grpc_channel_any(tee_url).await?
     } else {
@@ -338,16 +339,33 @@ async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
             .await
             .with_context(|| format!("connect {tee_url}"))?
     };
-    let mut client = TappServiceClient::new(channel).max_decoding_message_size(MAX_MSG_BYTES);
+    Ok(TappServiceClient::new(channel).max_decoding_message_size(MAX_MSG_BYTES))
+}
+
+/// Fetch `app_id`'s evidence from a node for this service's own verdicts.
+async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
     // GetEvidence (≥0.4.0) accepts a challenge that the node echoes into
     // runtime_data — that is how a caller tells a fresh quote from a replayed
     // one. NONE IS SENT HERE ON PURPOSE, not as an oversight: this service
     // fetches once and serves the result to many readers, and its whole
     // contract is "as of checked_at". A nonce would prove freshness only to
     // this service while making the answer un-cacheable for everyone else.
-    let resp = client
+    // A caller who wants freshness for itself sends its own through the relay.
+    Ok(fetch_evidence_for(tee_url, app_id, Vec::new()).await?.evidence)
+}
+
+/// Fetch evidence with a caller's challenge, for the relay. The response is
+/// returned whole: the caller verifies it, not this service.
+pub(crate) async fn fetch_evidence_for(
+    tee_url: &str,
+    app_id: &str,
+    nonce: Vec<u8>,
+) -> Result<tapp::GetEvidenceResponse> {
+    let resp = node_client(tee_url)
+        .await?
         .get_evidence(tonic::Request::new(GetEvidenceRequest {
             app_id: app_id.to_string(),
+            nonce,
         }))
         .await
         .map_err(|e| anyhow!("GetEvidence: {}", e.message()))?
@@ -355,7 +373,17 @@ async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
     if resp.evidence.is_empty() {
         return Err(anyhow!("node returned empty evidence: {}", resp.message));
     }
-    Ok(resp.evidence)
+    Ok(resp)
+}
+
+/// A node's public configuration, for the relay.
+pub(crate) async fn fetch_tapp_info(tee_url: &str) -> Result<tapp::GetTappInfoResponse> {
+    node_client(tee_url)
+        .await?
+        .get_tapp_info(tonic::Request::new(GetTappInfoRequest {}))
+        .await
+        .map_err(|e| anyhow!("GetTappInfo: {}", e.message()))
+        .map(|r| r.into_inner())
 }
 
 /// Submit evidence to the AS with no policy selected and return the token claims.

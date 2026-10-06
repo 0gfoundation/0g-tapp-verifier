@@ -128,6 +128,7 @@ mod tests {
         let r = c
             .get_evidence(tonic::Request::new(crate::attest::tapp::GetEvidenceRequest {
                 app_id: "0g-attestor-dev".into(),
+                nonce: Vec::new(),
             }))
             .await
             .expect("rpc");

@@ -152,6 +152,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/apps/:app_id", get(app_detail))
         .route("/api/apps/:app_id/cert", get(app_cert))
         .route("/api/apps/:app_id/events", get(app_events))
+        // Relay to a node for callers who cannot reach it (its port is open only
+        // to this service and its operators). Does work, so bounded like verify.
+        .route("/api/apps/:app_id/nodes/:signer/evidence", get(relay_evidence))
+        .route("/api/apps/:app_id/nodes/:signer/info", get(relay_info))
         // The one endpoint that does work instead of reading a cache. Mounted
         // twice: consumers configure a base URL and POST `{base}/verify`, and a
         // base of the bare host must work as well as one ending in /api.
@@ -680,69 +684,17 @@ async fn verify(
     headers: HeaderMap,
     Json(req): Json<VerifyRequest>,
 ) -> Response {
-    let signer = req.signer.trim().to_lowercase();
-    if signer.parse::<ethers::types::Address>().is_err() {
-        return (StatusCode::BAD_REQUEST, "signer must be a 0x… address\n").into_response();
-    }
-    let app_id = req.app_id.trim().to_string();
-    if app_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "app_id must not be empty\n").into_response();
-    }
-
-    // Caller class. A presented key that verifies buys the keyed quota; anything
-    // else — no key, bad key — is metered per IP, so this is not a key-testing
-    // oracle: guessing is capped by the anonymous quota itself. The key check is
-    // read-only (no last-used stamp) so the hot path never takes the write lock.
-    let verify_state = state.read().await.verify.clone();
-    let (caller, limit) = match presented_key(&headers) {
-        Some(secret) => match state.read().await.api_keys.check(secret, now()) {
-            Some(id) => (format!("key:{id}"), KEYED_PER_WINDOW),
-            None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
-        },
-        None => (anon_caller(&headers, peer), ANON_PER_WINDOW),
+    let (app_id, signer) = match parse_target(&req.app_id, &req.signer) {
+        Ok(t) => t,
+        Err(r) => return r,
     };
-    {
-        let mut windows = verify_state.quota.lock().await;
-        if let Err(retry) = count_request(&mut windows, &caller, limit, now()) {
-            return too_many(retry);
-        }
+    let verify_state = state.read().await.verify.clone();
+    if let Err(r) = charge_caller(&state, &verify_state, &headers, peer).await {
+        return r;
     }
-
-    // The target must be on chain. The cached registry lags the chain by up to
-    // one sync interval, and "this signer just changed" is exactly when this
-    // endpoint gets called — so an unknown target forces one sync (rate-limited
-    // globally) before it is refused.
-    let mut latest_block = current_target_block(&state, &app_id, &signer).await;
-    if latest_block.is_none() {
-        let due = {
-            let mut last = verify_state.last_sync.lock().await;
-            let n = now();
-            (n - *last >= FORCED_SYNC_MIN_SECS).then(|| *last = n).is_some()
-        };
-        if due {
-            let scanner = state.read().await.scanner.clone();
-            match scanner.sync().await {
-                Ok((registry, added)) => {
-                    if added > 0 {
-                        tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
-                    }
-                    // Never roll the shared view back behind a concurrent sync.
-                    let mut s = state.write().await;
-                    if registry.scanned_to >= s.registry.scanned_to {
-                        s.registry = registry;
-                    }
-                }
-                Err(e) => tracing::warn!("forced chain sync failed: {e}"),
-            }
-            latest_block = current_target_block(&state, &app_id, &signer).await;
-        }
-    }
-    let Some(latest_block) = latest_block else {
-        return (
-            StatusCode::NOT_FOUND,
-            "not a current node of this app on chain\n",
-        )
-            .into_response();
+    let latest_block = match resolve_current_target(&state, &verify_state, &app_id, &signer).await {
+        Ok(b) => b,
+        Err(r) => return r,
     };
 
     // Single-flight: whoever holds the target's lock does the work; the others
@@ -783,6 +735,231 @@ async fn verify(
     s.store.put(entry.clone());
     let s = s.downgrade();
     verdict_response(&s, &entry, false)
+}
+
+fn parse_target(app_id: &str, signer: &str) -> Result<(String, String), Response> {
+    let signer = signer.trim().to_lowercase();
+    if signer.parse::<ethers::types::Address>().is_err() {
+        return Err((StatusCode::BAD_REQUEST, "signer must be a 0x… address\n").into_response());
+    }
+    let app_id = app_id.trim().to_string();
+    if app_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "app_id must not be empty\n").into_response());
+    }
+    Ok((app_id, signer))
+}
+
+/// Count the request against its caller's quota.
+///
+/// Caller class: a presented key that verifies buys the keyed quota; anything
+/// else — no key, bad key — is metered per IP, so this is not a key-testing
+/// oracle: guessing is capped by the anonymous quota itself. The key check is
+/// read-only (no last-used stamp) so the hot path never takes the write lock.
+async fn charge_caller(
+    state: &AppState,
+    verify_state: &VerifyState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(), Response> {
+    let (caller, limit) = match presented_key(headers) {
+        Some(secret) => match state.read().await.api_keys.check(secret, now()) {
+            Some(id) => (format!("key:{id}"), KEYED_PER_WINDOW),
+            None => (anon_caller(headers, peer), ANON_PER_WINDOW),
+        },
+        None => (anon_caller(headers, peer), ANON_PER_WINDOW),
+    };
+    let mut windows = verify_state.quota.lock().await;
+    count_request(&mut windows, &caller, limit, now()).map_err(too_many)
+}
+
+/// The latest registry block for the app, when `signer` is one of its CURRENT
+/// nodes; 404 otherwise. The cached registry lags the chain by up to one sync
+/// interval, and "this signer just changed" is exactly when these endpoints get
+/// called — so an unknown target forces one sync (rate-limited globally) before
+/// it is refused.
+async fn resolve_current_target(
+    state: &AppState,
+    verify_state: &VerifyState,
+    app_id: &str,
+    signer: &str,
+) -> Result<u64, Response> {
+    let mut latest_block = current_target_block(state, app_id, signer).await;
+    if latest_block.is_none() {
+        let due = {
+            let mut last = verify_state.last_sync.lock().await;
+            let n = now();
+            (n - *last >= FORCED_SYNC_MIN_SECS).then(|| *last = n).is_some()
+        };
+        if due {
+            let scanner = state.read().await.scanner.clone();
+            match scanner.sync().await {
+                Ok((registry, added)) => {
+                    if added > 0 {
+                        tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
+                    }
+                    // Never roll the shared view back behind a concurrent sync.
+                    let mut s = state.write().await;
+                    if registry.scanned_to >= s.registry.scanned_to {
+                        s.registry = registry;
+                    }
+                }
+                Err(e) => tracing::warn!("forced chain sync failed: {e}"),
+            }
+            latest_block = current_target_block(state, app_id, signer).await;
+        }
+    }
+    latest_block.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "not a current node of this app on chain\n").into_response()
+    })
+}
+
+// ─── Relay ───────────────────────────────────────────────────────────────────
+//
+// Nodes keep their management port closed to everyone but this service and their
+// operators. Anyone else reaches a node's evidence through here. That costs no
+// trust: evidence verifies itself (the quote is Intel-signed and commits to the
+// signer and the event log), and the one thing a relay could still do — hand back
+// an old quote as a new one — is what the caller's nonce rules out, because the
+// node writes it into report_data. So the nonce goes to the node untouched and a
+// relayed answer is never a cached one.
+//
+// Bounded like `/api/verify`: current on-chain nodes only, with the teeUrl read
+// from the chain (no URL in the request, so no SSRF), the per-caller quota, and
+// the shared concurrency cap.
+
+/// The longest challenge GetEvidence accepts.
+const MAX_NONCE_BYTES: usize = 64;
+
+#[derive(Deserialize)]
+struct EvidenceQuery {
+    nonce: Option<String>,
+}
+
+/// A caller's challenge: hex, `0x` optional, at most [`MAX_NONCE_BYTES`].
+fn parse_nonce(raw: Option<&str>) -> Result<Vec<u8>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw))
+        .map_err(|_| "nonce must be hex".to_string())?;
+    if bytes.len() > MAX_NONCE_BYTES {
+        return Err(format!(
+            "nonce is {} bytes; at most {MAX_NONCE_BYTES}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Everything before a node is contacted on a caller's behalf: a well-formed,
+/// current target, the caller's quota, and its teeUrl from the chain.
+async fn relay_target(
+    state: &AppState,
+    verify_state: &VerifyState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    app_id: &str,
+    signer: &str,
+) -> Result<(String, String, String), Response> {
+    let (app_id, signer) = parse_target(app_id, signer)?;
+    charge_caller(state, verify_state, headers, peer).await?;
+    resolve_current_target(state, verify_state, &app_id, &signer).await?;
+    let scanner = state.read().await.scanner.clone();
+    let tee_url = scanner.node_tee_url(&app_id, &signer).await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("cannot read teeUrl from chain: {e}\n"),
+        )
+            .into_response()
+    })?;
+    Ok((app_id, signer, tee_url))
+}
+
+fn no_store(body: serde_json::Value) -> Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// `GET /api/apps/:app_id/nodes/:signer/evidence?nonce=0x…` — the node's evidence,
+/// fetched now with the caller's nonce, returned as the node sent it. Verify it
+/// yourself (e.g. `tapp-cli verify-app`); this endpoint vouches for nothing.
+async fn relay_evidence(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((app_id, signer)): Path<(String, String)>,
+    Query(q): Query<EvidenceQuery>,
+) -> Response {
+    let nonce = match parse_nonce(q.nonce.as_deref()) {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    };
+    let verify_state = state.read().await.verify.clone();
+    let (app_id, signer, tee_url) =
+        match relay_target(&state, &verify_state, &headers, peer, &app_id, &signer).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+    let Ok(_permit) = verify_state.slots.try_acquire() else {
+        return too_many(5);
+    };
+    match crate::attest::fetch_evidence_for(&tee_url, &app_id, nonce.clone()).await {
+        Ok(r) => no_store(json!({
+            "app_id": app_id,
+            "signer": signer,
+            "tee_url": tee_url,
+            "nonce": (!nonce.is_empty()).then(|| format!("0x{}", hex::encode(&nonce))),
+            "tee_type": r.tee_type,
+            "timestamp": r.timestamp,
+            "relayed_at": now(),
+            "evidence": base64::engine::general_purpose::STANDARD.encode(&r.evidence),
+        })),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("node at {tee_url}: {e}\n")).into_response(),
+    }
+}
+
+/// `GET /api/apps/:app_id/nodes/:signer/info` — the node's public configuration,
+/// fetched now. Not attested: informational, and what matters in it (owner, KMS
+/// cluster, trust anchors) is in the event log, where it is.
+async fn relay_info(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((app_id, signer)): Path<(String, String)>,
+) -> Response {
+    let verify_state = state.read().await.verify.clone();
+    let (app_id, signer, tee_url) =
+        match relay_target(&state, &verify_state, &headers, peer, &app_id, &signer).await {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+    let Ok(_permit) = verify_state.slots.try_acquire() else {
+        return too_many(5);
+    };
+    match crate::attest::fetch_tapp_info(&tee_url).await {
+        Ok(r) => {
+            let c = r.config.unwrap_or_default();
+            let server = c.server.unwrap_or_default();
+            no_store(json!({
+                "app_id": app_id,
+                "signer": signer,
+                "tee_url": tee_url,
+                "attested": false,
+                "version": r.version,
+                "owner": server.owner_address,
+                "permission_enabled": server.permission_enabled,
+                "kbs_enabled": c.kbs_enabled,
+                "kbs_node_urls": c.kbs.map(|k| k.node_urls).unwrap_or_default(),
+                "scan_url": c.scan_url,
+                "scan_public_key": c.scan_public_key,
+                "relayed_at": now(),
+            }))
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("node at {tee_url}: {e}\n")).into_response(),
+    }
 }
 
 /// `Some(latest registry block for the app)` when the signer is one of the app's
@@ -1381,5 +1558,40 @@ mod tests {
         let (code, body) = verdict_parts(&e, &matching_set(), false);
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["verified"], json!(false));
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn no_nonce_is_an_empty_challenge() {
+        assert_eq!(parse_nonce(None), Ok(Vec::new()));
+        assert_eq!(parse_nonce(Some("")), Ok(Vec::new()));
+        assert_eq!(parse_nonce(Some("  ")), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_nonce_reaches_the_node_as_the_bytes_the_caller_chose() {
+        assert_eq!(parse_nonce(Some("0x00ff10")), Ok(vec![0x00, 0xff, 0x10]));
+        assert_eq!(parse_nonce(Some("00FF10")), Ok(vec![0x00, 0xff, 0x10]));
+    }
+
+    #[test]
+    fn a_nonce_the_node_would_refuse_is_refused_here() {
+        assert!(parse_nonce(Some(&"ab".repeat(MAX_NONCE_BYTES))).is_ok());
+        assert!(parse_nonce(Some(&"ab".repeat(MAX_NONCE_BYTES + 1))).is_err());
+        assert!(parse_nonce(Some("0xzz")).is_err());
+        assert!(parse_nonce(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn a_target_is_a_named_app_and_an_address() {
+        assert!(parse_target("app", "0x0000000000000000000000000000000000000001").is_ok());
+        assert!(parse_target(" ", "0x0000000000000000000000000000000000000001").is_err());
+        assert!(parse_target("app", "http://169.254.169.254/").is_err());
+        let (a, s) = parse_target(" app ", "0xABCDEF0000000000000000000000000000000001").unwrap();
+        assert_eq!((a.as_str(), s.as_str()), ("app", "0xabcdef0000000000000000000000000000000001"));
     }
 }
