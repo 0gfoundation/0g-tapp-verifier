@@ -103,6 +103,18 @@ pub enum Event {
     InvalidatorRevoked {
         invalidator: String,
     },
+    /// Registry ≥0.2.0, step one of a two-step hand-over: the owner nominated
+    /// `pending_owner`. Nothing has changed hands yet.
+    AppOwnershipTransferStarted {
+        owner: String,
+        pending_owner: String,
+    },
+    /// Step two: the nominee accepted and is now the app's owner — the one who
+    /// registers and replaces its nodes from here on, and gets its stake.
+    AppOwnershipTransferred {
+        previous_owner: String,
+        new_owner: String,
+    },
 }
 
 impl Event {
@@ -121,6 +133,8 @@ impl Event {
             Event::AcksInvalidated { .. } => "AcksInvalidated",
             Event::InvalidatorAuthorized { .. } => "InvalidatorAuthorized",
             Event::InvalidatorRevoked { .. } => "InvalidatorRevoked",
+            Event::AppOwnershipTransferStarted { .. } => "AppOwnershipTransferStarted",
+            Event::AppOwnershipTransferred { .. } => "AppOwnershipTransferred",
         }
     }
 }
@@ -152,6 +166,8 @@ const METHOD_SIGS: &[&str] = &[
     "authorizeInvalidator(string,address)",
     "revokeInvalidator(string,address)",
     "invalidateAcks(string)",
+    "transferAppOwnership(string,address)",
+    "acceptAppOwnership(string)",
 ];
 
 /// Batch methods taking `string[] appIds`. Their logs are indistinguishable from
@@ -308,6 +324,16 @@ fn decode_log(log: &Log) -> Option<AppEvent> {
     } else if t0 == topic0("InvalidatorRevoked(string,address)") {
         Event::InvalidatorRevoked {
             invalidator: addr_from_topic(log.topics.get(2)?),
+        }
+    } else if t0 == topic0("AppOwnershipTransferStarted(string,address,address)") {
+        Event::AppOwnershipTransferStarted {
+            owner: addr_from_topic(log.topics.get(2)?),
+            pending_owner: addr_from_topic(log.topics.get(3)?),
+        }
+    } else if t0 == topic0("AppOwnershipTransferred(string,address,address)") {
+        Event::AppOwnershipTransferred {
+            previous_owner: addr_from_topic(log.topics.get(2)?),
+            new_owner: addr_from_topic(log.topics.get(3)?),
         }
     } else {
         return None;
@@ -982,6 +1008,37 @@ mod tests {
         // Printable ASCII prefix followed by raw digest bytes (volumesHash shape).
         assert_eq!(bytes_display(b"kms.toml:\x60\x9c\n"), "6b6d732e746f6d6c3a609c0a");
         assert_eq!(bytes_display(b""), "");
+    }
+
+    /// The two hand-over events of registry 0.2.0: everything is in topics, so a
+    /// wrong signature string or topic order would silently swap the parties.
+    #[test]
+    fn ownership_events_name_both_parties_in_order() {
+        let addr = |b: u8| H256::from_low_u64_be(b as u64);
+        let log = |sig: &str| Log {
+            topics: vec![topic0(sig), H256::from(keccak256(b"app")), addr(0xa1), addr(0xb2)],
+            block_number: Some(10u64.into()),
+            log_index: Some(0u64.into()),
+            transaction_hash: Some(H256::zero()),
+            ..Default::default()
+        };
+        let started = decode_log(&log("AppOwnershipTransferStarted(string,address,address)")).unwrap();
+        assert_eq!(
+            started.event,
+            Event::AppOwnershipTransferStarted {
+                owner: format!("0x{:040x}", 0xa1),
+                pending_owner: format!("0x{:040x}", 0xb2),
+            }
+        );
+        let done = decode_log(&log("AppOwnershipTransferred(string,address,address)")).unwrap();
+        assert_eq!(
+            done.event,
+            Event::AppOwnershipTransferred {
+                previous_owner: format!("0x{:040x}", 0xa1),
+                new_owner: format!("0x{:040x}", 0xb2),
+            }
+        );
+        assert_eq!(done.app_hash, format!("0x{}", hex::encode(keccak256(b"app"))));
     }
 
     #[test]

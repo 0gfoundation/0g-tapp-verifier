@@ -309,6 +309,8 @@ async fn main() -> Result<()> {
                             | chain::Event::AppRegistered { .. }
                             | chain::Event::AppUnregistered { .. }
                             | chain::Event::NodeCode { .. }
+                            | chain::Event::AppOwnershipTransferStarted { .. }
+                            | chain::Event::AppOwnershipTransferred { .. }
                     );
                 if !all && !interesting {
                     continue;
@@ -341,6 +343,12 @@ async fn main() -> Result<()> {
                     chain::Event::AcksInvalidated { invalidator, .. }
                     | chain::Event::InvalidatorAuthorized { invalidator }
                     | chain::Event::InvalidatorRevoked { invalidator } => print!(" {invalidator}"),
+                    chain::Event::AppOwnershipTransferStarted { owner, pending_owner } => {
+                        print!(" {owner} → {pending_owner} (nominated, not yet accepted)")
+                    }
+                    chain::Event::AppOwnershipTransferred { previous_owner, new_owner } => {
+                        print!(" {previous_owner} → {new_owner}")
+                    }
                 }
                 println!();
             }
