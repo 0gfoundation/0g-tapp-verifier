@@ -91,10 +91,6 @@ const QUOTA_WINDOW_SECS: i64 = 60;
 const ANON_PER_WINDOW: u32 = 6;
 const KEYED_PER_WINDOW: u32 = 60;
 
-/// A forced chain sync (for a target the cached registry does not know yet) runs
-/// at most this often, whoever asks.
-const FORCED_SYNC_MIN_SECS: i64 = 10;
-
 /// Everything that bounds `POST /api/verify`.
 pub struct VerifyState {
     /// Global cap on targets being attested on demand at once — the same kind of
@@ -116,8 +112,6 @@ pub struct VerifyState {
     targets: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Request counters per caller, pruned as windows expire.
     quota: tokio::sync::Mutex<HashMap<String, Window>>,
-    /// When a forced chain sync last ran.
-    last_sync: tokio::sync::Mutex<i64>,
 }
 
 struct Window {
@@ -133,7 +127,6 @@ impl VerifyState {
             unreachable: Default::default(),
             targets: Default::default(),
             quota: Default::default(),
-            last_sync: tokio::sync::Mutex::new(0),
         }
     }
 }
@@ -705,7 +698,7 @@ async fn verify(
     if let Err(r) = charge_caller(&state, &verify_state, &headers, peer).await {
         return r;
     }
-    let latest_block = match resolve_current_target(&state, &verify_state, &app_id, &signer).await {
+    let latest_block = match resolve_current_target(&state, &app_id, &signer).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -724,7 +717,10 @@ async fn verify(
     {
         let s = state.read().await;
         if let Some(entry) = s.store.get(&app_id, &signer) {
-            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS {
+            // A result stored before the TD's DEBUG attribute was recorded cannot be
+            // judged, so it is attested again now rather than answered "not verified"
+            // until the cooldown runs out — which a gate would take as a refusal.
+            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS && !debug_unknown(entry) {
                 return verdict_response(&s, entry, true);
             }
         }
@@ -748,6 +744,11 @@ async fn verify(
     s.store.put(entry.clone());
     let s = s.downgrade();
     verdict_response(&s, &entry, false)
+}
+
+/// An attested result from before the TD's DEBUG attribute was stored.
+fn debug_unknown(entry: &status::Entry) -> bool {
+    entry.attested.as_ref().is_some_and(|a| a.td_debug.is_none())
 }
 
 fn parse_target(app_id: &str, signer: &str) -> Result<(String, String), Response> {
@@ -785,45 +786,39 @@ async fn charge_caller(
     count_request(&mut windows, &caller, limit, now()).map_err(too_many)
 }
 
-/// The latest registry block for the app, when `signer` is one of its CURRENT
-/// nodes; 404 otherwise. The cached registry lags the chain by up to one sync
-/// interval, and "this signer just changed" is exactly when these endpoints get
-/// called — so an unknown target forces one sync (rate-limited globally) before
-/// it is refused.
+/// The block at which `signer` is known to be one of the app's CURRENT nodes; 404
+/// when it is not one.
+///
+/// The cached registry lags the chain by up to one sync interval, and "this signer
+/// just changed" is exactly when these endpoints get called: a node re-registers its
+/// new signer on restart and asks the KMS for its key, and every KMS node asks here at
+/// once. So a target the registry does not know is looked up in the contract directly
+/// (`getNodeList` at the chain head), which has no global rate limit for concurrent
+/// requests to lose a race against. The registry catches up on its own schedule.
 async fn resolve_current_target(
     state: &AppState,
-    verify_state: &VerifyState,
     app_id: &str,
     signer: &str,
 ) -> Result<u64, Response> {
-    let mut latest_block = current_target_block(state, app_id, signer).await;
-    if latest_block.is_none() {
-        let due = {
-            let mut last = verify_state.last_sync.lock().await;
-            let n = now();
-            (n - *last >= FORCED_SYNC_MIN_SECS).then(|| *last = n).is_some()
-        };
-        if due {
-            let scanner = state.read().await.scanner.clone();
-            match scanner.sync().await {
-                Ok((registry, added)) => {
-                    if added > 0 {
-                        tracing::info!("forced sync for {app_id}/{signer}: {added} new event(s)");
-                    }
-                    // Never roll the shared view back behind a concurrent sync.
-                    let mut s = state.write().await;
-                    if registry.scanned_to >= s.registry.scanned_to {
-                        s.registry = registry;
-                    }
-                }
-                Err(e) => tracing::warn!("forced chain sync failed: {e}"),
-            }
-            latest_block = current_target_block(state, app_id, signer).await;
+    if let Some(block) = current_target_block(state, app_id, signer).await {
+        return Ok(block);
+    }
+    let scanner = state.read().await.scanner.clone();
+    match scanner.current_node_at_head(app_id, signer).await {
+        Ok(Some(head)) => {
+            tracing::info!("{app_id}/{signer}: current on chain at block {head}, ahead of the registry");
+            Ok(head)
+        }
+        Ok(None) => Err(
+            (StatusCode::NOT_FOUND, "not a current node of this app on chain\n").into_response(),
+        ),
+        // Our outage, not a statement about the target: a gate must not read it as one.
+        Err(e) => {
+            tracing::warn!("{app_id}/{signer}: getNodeList failed: {e}");
+            Err((StatusCode::SERVICE_UNAVAILABLE, "cannot read the registry right now\n")
+                .into_response())
         }
     }
-    latest_block.ok_or_else(|| {
-        (StatusCode::NOT_FOUND, "not a current node of this app on chain\n").into_response()
-    })
 }
 
 // ─── Relay ───────────────────────────────────────────────────────────────────
@@ -879,7 +874,7 @@ async fn relay_target(
 ) -> Result<(String, String, String), Response> {
     let (app_id, signer) = parse_target(app_id, signer)?;
     charge_caller(state, verify_state, headers, peer).await?;
-    resolve_current_target(state, verify_state, &app_id, &signer).await?;
+    resolve_current_target(state, &app_id, &signer).await?;
     let scanner = state.read().await.scanner.clone();
     let tee_url = scanner.node_tee_url(&app_id, &signer).await.map_err(|e| {
         (
@@ -1597,6 +1592,13 @@ mod tests {
         let mut e = good_entry();
         f(e.attested.as_mut().unwrap());
         e
+    }
+
+    #[test]
+    fn a_result_without_the_debug_attribute_is_attested_again() {
+        assert!(debug_unknown(&with_attested(|a| a.td_debug = None)));
+        assert!(!debug_unknown(&with_attested(|a| a.td_debug = Some(false))));
+        assert!(!debug_unknown(&with_attested(|a| a.td_debug = Some(true))));
     }
 
     #[test]

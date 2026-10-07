@@ -264,14 +264,18 @@ identity:
    repeats as-is, and concurrent requests for one target collapse into one
    attestation. The forcing scenario: a node reboots with a new signer, all five
    KMS nodes notice at once — one quote generation must serve all five, not five
-   concurrent ones hitting a node that just came up.
+   concurrent ones hitting a node that just came up. The one exception is a result
+   stored before the TD's DEBUG attribute was recorded: it cannot be judged, so it
+   is attested again at once rather than answered `verified: false`.
 2. **Targets come from the chain, never from the request.** The signer must be a
    CURRENT node of the app on chain, and its teeUrl is read via `getNode` — a
    URL parameter would be an SSRF primitive, so there is none, and unregistered
    targets are refused before any fetch (which also keeps stored negatives
-   bounded). A target the cached registry does not know yet forces one chain
-   sync (globally rate-limited) before it is refused, because "this signer just
-   changed" is exactly when this endpoint gets called.
+   bounded). A target the cached registry does not know yet is looked up in the
+   contract directly (`getNodeList` at the chain head) before it is refused,
+   because "this signer just changed" is exactly when this endpoint gets called;
+   the registry catches up on its own schedule. If that read fails, the answer is
+   503, not 404.
 3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
    own fan-out) protects this service, the AS and the nodes. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.

@@ -706,6 +706,39 @@ impl Scanner {
         out
     }
 
+    /// The chain head, if `signer` is one of `app_id`'s current nodes there, read with
+    /// `getNodeList` directly rather than from the event registry: for a target the
+    /// registry has not caught up with yet, such as a node that re-registered its new
+    /// signer seconds ago.
+    pub async fn current_node_at_head(&self, app_id: &str, signer: &str) -> Result<Option<u64>> {
+        use ethers::abi::{encode, Token};
+        use ethers::types::{BlockId, Bytes, TransactionRequest};
+
+        let addr: Address = signer
+            .parse()
+            .with_context(|| format!("invalid signer address: {signer}"))?;
+        let head = self.provider.get_block_number().await?;
+        let mut data = selector("getNodeList(string)").to_vec();
+        data.extend_from_slice(&encode(&[Token::String(app_id.to_string())]));
+        let tx = TransactionRequest::new()
+            .to(self.contract)
+            .data(Bytes::from(data));
+        let out = self
+            .provider
+            .call(&tx.into(), Some(BlockId::Number(head.into())))
+            .await?;
+        let listed = decode(&[ParamType::Array(Box::new(ParamType::Address))], &out)
+            .map_err(|e| anyhow!("could not decode getNodeList for {app_id}: {e}"))?
+            .into_iter()
+            .next()
+            .and_then(|t| t.into_array())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| t.into_address())
+            .any(|a| a == addr);
+        Ok(listed.then_some(head.as_u64()))
+    }
+
     /// The `teeUrl` a node was registered with, via `getNode`. This is an
     /// owner-supplied string, NOT an attested fact — it says where to ask for
     /// evidence, and nothing more.
@@ -905,6 +938,26 @@ impl Scanner {
 
 #[cfg(test)]
 mod tests {
+
+    /// Against the live testnet registry: a current node is found at the head, a random
+    /// address is not. `cargo test -- --ignored current_node_at_head`.
+    #[tokio::test]
+    #[ignore]
+    async fn current_node_at_head_reads_the_contract() {
+        let dir = std::env::temp_dir().join("scan-head-test");
+        let s = Scanner::new(
+            "https://evmrpc-testnet.0g.ai",
+            "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9",
+            0,
+            dir.join("registry.json"),
+        )
+        .unwrap();
+        let node = "0x2da59224845da5c33e114d2d428c9dc68c4ee0e3"; // tapp-kmssync-test
+        assert!(s.current_node_at_head("tapp-kmssync-test", node).await.unwrap().is_some());
+        let stranger = "0x00000000000000000000000000000000000000aa";
+        assert!(s.current_node_at_head("tapp-kmssync-test", stranger).await.unwrap().is_none());
+    }
+
     use super::*;
 
     #[test]
