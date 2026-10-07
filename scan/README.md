@@ -181,9 +181,9 @@ window. Each signature is therefore good for exactly one key.
 
 ## HTTP interface
 
-All reads are served from memory; no read can trigger evidence fetching. The one
-endpoint that does work on demand is `POST /api/verify`, bounded as described in
-its own section below.
+All reads are served from memory; no read can trigger evidence fetching. The
+endpoints that do work on demand are `POST /api/verify` and the two relay
+endpoints, bounded as described in their own sections below.
 
 | Endpoint | |
 |---|---|
@@ -194,6 +194,8 @@ its own section below.
 | `GET /api/apps/:app_id/cert` | the app's attested TLS key as `sha256//<base64>`, text/plain |
 | `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
 | `POST /api/verify` | attest one `{app_id, signer}` now and return the verdict |
+| `GET /api/apps/:app_id/nodes/:signer/evidence` | the node's evidence, fetched now · `nonce` (hex, ≤ 64 bytes) |
+| `GET /api/apps/:app_id/nodes/:signer/info` | the node's `GetTappInfo`, fetched now; not attested |
 
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
@@ -235,10 +237,19 @@ the **HTTP status** (200 = a verdict about the node; **503** = *this service*
 could not establish anything — chain RPC or AS trouble — which a consumer must
 treat as "verifier unavailable", never as a negative), **`verified`**, and
 **`reason`** (empty when verified). `verified` means all of: quote verified and
-the registered signer attested, runtime event log replays, and the boot chain
-matches a **published reference set** — running an image nobody published values
-for was not declared, so it does not pass. A node-side failure (unreachable, no
-such app) is a 200 with `verified: false` and the error as the reason.
+the registered signer attested, runtime event log replays, the TD runs **without
+DEBUG** (a DEBUG TD's memory is open to its host — on bare metal the operator
+launches it), the platform TCB is **not revoked**, and the boot chain matches a
+**published reference set** — running an image nobody published values for was not
+declared, so it does not pass. On **mainnet** a dev set does not count (dev images
+can carry an SSH key into the TD); `--accept-dev` / `TAPPSCAN_ACCEPT_DEV` overrides,
+and testnet accepts them by default. A node-side failure (unreachable, no such app)
+is a 200 with `verified: false` and the error as the reason.
+
+`warnings` lists what passed with a caveat — a TCB trailing Intel's latest
+(`OutOfDate`, `SWHardeningNeeded`, …) and its advisories, common on clouds that roll
+firmware out behind Intel. `image_env` says whether the matched set is `dev` or
+`prod`.
 
 Beside those: `cached` (a fresh attestation, or one inside the cooldown),
 `status` — the full per-signer shape `GET /api/apps/:app_id` serves (verdicts,
@@ -253,14 +264,20 @@ identity:
    repeats as-is, and concurrent requests for one target collapse into one
    attestation. The forcing scenario: a node reboots with a new signer, all five
    KMS nodes notice at once — one quote generation must serve all five, not five
-   concurrent ones hitting a node that just came up.
+   concurrent ones hitting a node that just came up. The one exception is a result
+   stored by an earlier version, before the TD's DEBUG attribute was recorded: it
+   cannot be judged, so it is attested again at once rather than answered
+   `verified: false`.
 2. **Targets come from the chain, never from the request.** The signer must be a
    CURRENT node of the app on chain, and its teeUrl is read via `getNode` — a
    URL parameter would be an SSRF primitive, so there is none, and unregistered
    targets are refused before any fetch (which also keeps stored negatives
-   bounded). A target the cached registry does not know yet forces one chain
-   sync (globally rate-limited) before it is refused, because "this signer just
-   changed" is exactly when this endpoint gets called.
+   bounded). A target the cached registry does not know yet is looked up in the
+   contract directly (`getNodeList` at the chain head) before it is refused,
+   because "this signer just changed" is exactly when this endpoint gets called;
+   the registry catches up on its own schedule. The call runs at `latest` (a
+   load-balanced RPC may not serve a just-read block number yet) and a failure is
+   retried once; if it still fails, the answer is 503, not 404.
 3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
    own fan-out) protects this service, the AS and the nodes. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.
@@ -279,6 +296,44 @@ falling back to the socket peer. That is honest behind the deployment's nginx
 front; a caller who can reach the port directly can still write the header, so
 treat the anonymous quota as best-effort — the structural limits above are the
 safety story either way.
+
+## Relay: evidence for callers who cannot reach the node
+
+A node's tapp port (`:50052`) is meant to be open only to this service and the
+node's operators (0g-tapp#141). Everyone else gets the node's evidence through
+here, and verifies it themselves:
+
+```bash
+NONCE=0x$(openssl rand -hex 32)
+curl -s "https://scan/api/apps/$APP/nodes/$SIGNER/evidence?nonce=$NONCE"
+```
+
+The answer carries `evidence` (base64 of the bytes the node sent, untouched),
+`tee_type`, the node's `timestamp`, the `nonce` it was fetched with, the
+`tee_url` from the chain, and `relayed_at`. Responses are `no-store`.
+
+**Relaying costs no trust; the nonce is what makes that true.** Evidence verifies
+itself — the quote is Intel-signed and its `report_data` is `sha512` of the
+`runtime_data` beside it, which names the signer. What a relay could still do is
+hand back an *old* quote as a new one. With a nonce, the node writes it into
+`runtime_data`, so a quote that does not echo yours was not produced for your
+request. This service forwards the nonce as given and never answers a relay
+request from a cache. Without a nonce the evidence is still genuine, only undated.
+
+`/info` relays `GetTappInfo` — version, owner, KMS cluster, trust anchors. Nothing
+in it is attested (`"attested": false`); the facts that matter are also in the
+event log, where they are.
+
+Both are bounded like `POST /api/verify`: only a CURRENT node of the app on chain,
+its teeUrl read via `getNode` (no URL in the request), the same per-IP / per-key
+quota — plus a concurrency cap of their own (half of `--concurrency`), since relay
+calls cannot share results and must not starve `/api/verify`. Node calls time out
+(8s to connect, 30s per call), and a target that did not answer is answered for
+without trying for the next 30s. A node that cannot be reached is `502 node
+unreachable`, one that answers with an error `502 node answered with an error`;
+the detail goes to this service's log only, because a teeUrl is its registrant's
+choice and raw connection errors would let them probe what is reachable from
+here. Failing to read the chain is `503`.
 
 ## Verifying tappscan itself
 

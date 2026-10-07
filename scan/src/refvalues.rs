@@ -63,6 +63,17 @@ pub struct RefSet {
     pub values: BTreeMap<Component, Vec<String>>,
 }
 
+/// A development image: a set labelled `…/dev.json` or under a `dev/` directory — the
+/// builds that can carry a baked-in SSH key (`DEV_SSH_PUBKEY`), a shell inside the TD.
+pub fn is_dev(label: &str) -> bool {
+    let p = Path::new(label);
+    p.file_stem().and_then(|s| s.to_str()) == Some("dev")
+        || p.parent()
+            .into_iter()
+            .flat_map(|d| d.components())
+            .any(|c| c.as_os_str() == "dev")
+}
+
 /// Map a reference-value JSON key to the component it constrains.
 fn key_to_component(key: &str) -> Option<Component> {
     let rest = key.strip_prefix("measurement.")?.strip_suffix(".SHA-384")?;

@@ -100,6 +100,10 @@ pub struct Attested {
     /// whose only component is a pseudo-component — store nothing at all.
     pub measured: BTreeMap<String, Vec<String>>,
     pub runtime_replay_ok: bool,
+    /// The TD's DEBUG attribute. Absent in results stored before it was recorded, which
+    /// counts as unknown — not as off.
+    #[serde(default)]
+    pub td_debug: Option<bool>,
 
     pub event_count: usize,
     /// The signer's complete trace, oldest first.
@@ -219,6 +223,7 @@ impl Entry {
                 })
                 .collect(),
             runtime_replay_ok: status.runtime_replay_ok(),
+            td_debug: status.td_debug,
             event_count: status.runtime_events.len(),
             events: status.runtime_events.clone(),
             note: status.note.clone(),
@@ -416,6 +421,7 @@ mod tests {
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
+                td_debug: Some(false),
                 event_count: 0,
                 events: vec![],
                 note: String::new(),
@@ -488,6 +494,7 @@ mod tests {
         measured.add(ANY_BSA, "u-digest");
         let status = crate::attest::NodeStatus {
             signer: "0xaaa".into(),
+            td_debug: Some(false),
             tee_url: "http://node:50051".into(),
             checked_at: 1000,
             tcb_status: "OutOfDate".into(),

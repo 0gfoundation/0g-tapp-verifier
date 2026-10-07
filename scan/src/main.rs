@@ -25,6 +25,9 @@ const DEFAULT_RPC: &str = "https://evmrpc-testnet.0g.ai";
 const DEFAULT_CONTRACT: &str = "0x2Ce80374318B1d7Fb3345724457a182E0ad165c9";
 const DEFAULT_AS: &str = "47.237.201.184:50004";
 
+/// 0G mainnet, where only production reference sets are accepted by default.
+const MAINNET_CHAIN_ID: u64 = 16661;
+
 #[derive(Parser)]
 #[command(name = "tappscan", version, about = "TappRegistry explorer")]
 struct Cli {
@@ -97,6 +100,12 @@ struct AttestOpts {
     /// out), so this trades round-trip latency against bandwidth and AS load.
     #[arg(long, env = "TAPPSCAN_CONCURRENCY", default_value_t = 4)]
     concurrency: usize,
+
+    /// Whether a boot chain matching a dev reference set counts as verified. Dev
+    /// images can carry an SSH key into the TD. Default: not on mainnet (chain
+    /// 16661), yes elsewhere.
+    #[arg(long, env = "TAPPSCAN_ACCEPT_DEV")]
+    accept_dev: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -444,6 +453,8 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            let accept_dev = opts.accept_dev.unwrap_or(registry.chain_id != MAINNET_CHAIN_ID);
+            tracing::info!("dev reference sets {} verification", if accept_dev { "count toward" } else { "do NOT count toward" });
             let shared: api::AppState = std::sync::Arc::new(tokio::sync::RwLock::new(api::Shared {
                 registry,
                 store: status::Store::load(&cli.status),
@@ -463,6 +474,7 @@ async fn main() -> Result<()> {
                 // pool — a background round at full tilt cannot starve the
                 // admission path this endpoint exists for.
                 verify: std::sync::Arc::new(api::VerifyState::new(opts.concurrency.max(1))),
+                accept_dev,
             }));
 
             // The refresh loop is the ONLY thing that touches nodes or the AS;

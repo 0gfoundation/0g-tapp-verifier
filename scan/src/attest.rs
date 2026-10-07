@@ -28,7 +28,7 @@ pub mod as_proto {
 
 use as_proto::attestation_service_client::AttestationServiceClient;
 use as_proto::{AttestationRequest, IndividualAttestationRequest};
-use tapp::{tapp_service_client::TappServiceClient, GetEvidenceRequest};
+use tapp::{tapp_service_client::TappServiceClient, GetEvidenceRequest, GetTappInfoRequest};
 
 const B64URL: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -103,6 +103,18 @@ fn sha384_of(event: &Value) -> Option<&str> {
 }
 
 // ─── Boot chain ──────────────────────────────────────────────────────────────
+
+/// The DEBUG bit, parsed by the AS or read from the raw TDATTRIBUTES (bit 0 of the
+/// first, little-endian byte) when only that is present. DEBUG lets the host read and
+/// write the TD's memory — whoever launches the TD, the operator on bare metal.
+pub(crate) fn td_debug_of(tdx: &Value) -> Option<bool> {
+    if let Some(d) = tdx.pointer("/td_attributes/debug").and_then(Value::as_bool) {
+        return Some(d);
+    }
+    let raw = tdx.pointer("/quote/body/td_attributes").and_then(Value::as_str)?;
+    let first = u8::from_str_radix(raw.get(0..2)?, 16).ok()?;
+    Some(first & 1 == 1)
+}
 
 /// Pull the boot-chain digests out of the parsed event log.
 ///
@@ -256,6 +268,8 @@ fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
 pub struct NodeStatus {
     /// On-chain node signer (the hardware identity being checked).
     pub signer: String,
+    /// The TD's DEBUG attribute from the token; `None` when it does not carry it.
+    pub td_debug: Option<bool>,
     pub tee_url: String,
     /// Unix seconds when this check ran. A cached status is only ever "as of"
     /// this moment — attestation is a snapshot, not a standing property.
@@ -323,39 +337,122 @@ impl CheckError {
     }
 }
 
-/// Fetch `app_id`'s evidence from a node.
-async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
+/// How long a node gets to accept a connection. A teeUrl is whatever its registrant
+/// wrote, and a blackholed address otherwise holds the connect for the OS timeout —
+/// minutes — while it holds a concurrency slot.
+const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long a call may take once connected: a quote plus a few MB of event log.
+const NODE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a node call failed, in the two classes a caller is told about. The detail is
+/// for this service's log only: echoing raw connection errors for an address the
+/// registrant chose would let them probe what is reachable from here.
+#[derive(Debug)]
+pub(crate) enum NodeFailure {
+    /// No answer: refused, timed out, TLS failed.
+    Unreachable(anyhow::Error),
+    /// The node answered, with an error.
+    Refused(anyhow::Error),
+}
+
+impl std::fmt::Display for NodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeFailure::Unreachable(e) | NodeFailure::Refused(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for NodeFailure {}
+
+async fn node_client(
+    tee_url: &str,
+) -> Result<TappServiceClient<tonic::transport::Channel>, NodeFailure> {
     // An https teeUrl (nodes ≥0g-tapp#110 register their baked :50052 front) is
     // encryption without authentication — the certificate is self-signed and
     // accepted unseen, which is sound here because evidence authenticates itself
-    // (Intel-signed) and this fetch sends no secret. See tls.rs.
-    let channel = if tee_url.starts_with("https://") {
-        crate::tls::grpc_channel_any(tee_url).await?
-    } else {
-        tonic::transport::Endpoint::from_shared(tee_url.to_string())
-            .with_context(|| format!("endpoint {tee_url}"))?
-            .connect()
-            .await
-            .with_context(|| format!("connect {tee_url}"))?
+    // (Intel-signed) and these calls send no secret. See tls.rs.
+    let connect = async {
+        if tee_url.starts_with("https://") {
+            crate::tls::grpc_channel_any(tee_url).await
+        } else {
+            tonic::transport::Endpoint::from_shared(tee_url.to_string())
+                .with_context(|| format!("endpoint {tee_url}"))?
+                .timeout(NODE_CALL_TIMEOUT)
+                .connect()
+                .await
+                .with_context(|| format!("connect {tee_url}"))
+        }
     };
-    let mut client = TappServiceClient::new(channel).max_decoding_message_size(MAX_MSG_BYTES);
+    let channel = tokio::time::timeout(NODE_CONNECT_TIMEOUT, connect)
+        .await
+        .map_err(|_| NodeFailure::Unreachable(anyhow!("connect {tee_url}: no answer in time")))?
+        .map_err(NodeFailure::Unreachable)?;
+    Ok(TappServiceClient::new(channel).max_decoding_message_size(MAX_MSG_BYTES))
+}
+
+/// One call to a node, bounded once connected too.
+async fn bounded<T>(
+    call: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    what: &str,
+) -> Result<T, NodeFailure> {
+    match tokio::time::timeout(NODE_CALL_TIMEOUT, call).await {
+        Err(_) => Err(NodeFailure::Unreachable(anyhow!("{what}: no answer in time"))),
+        Ok(Err(s)) => Err(NodeFailure::Refused(anyhow!("{what}: {}", s.message()))),
+        Ok(Ok(r)) => Ok(r.into_inner()),
+    }
+}
+
+/// Fetch `app_id`'s evidence from a node for this service's own verdicts.
+async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
     // GetEvidence (≥0.4.0) accepts a challenge that the node echoes into
     // runtime_data — that is how a caller tells a fresh quote from a replayed
     // one. NONE IS SENT HERE ON PURPOSE, not as an oversight: this service
     // fetches once and serves the result to many readers, and its whole
     // contract is "as of checked_at". A nonce would prove freshness only to
     // this service while making the answer un-cacheable for everyone else.
-    let resp = client
-        .get_evidence(tonic::Request::new(GetEvidenceRequest {
-            app_id: app_id.to_string(),
-        }))
+    // A caller who wants freshness for itself sends its own through the relay.
+    Ok(fetch_evidence_for(tee_url, app_id, Vec::new())
         .await
-        .map_err(|e| anyhow!("GetEvidence: {}", e.message()))?
-        .into_inner();
+        .map_err(anyhow::Error::new)?
+        .evidence)
+}
+
+/// Fetch evidence with a caller's challenge, for the relay. The response is
+/// returned whole: the caller verifies it, not this service.
+pub(crate) async fn fetch_evidence_for(
+    tee_url: &str,
+    app_id: &str,
+    nonce: Vec<u8>,
+) -> Result<tapp::GetEvidenceResponse, NodeFailure> {
+    let mut client = node_client(tee_url).await?;
+    let resp = bounded(
+        client.get_evidence(tonic::Request::new(GetEvidenceRequest {
+            app_id: app_id.to_string(),
+            nonce,
+        })),
+        "GetEvidence",
+    )
+    .await?;
     if resp.evidence.is_empty() {
-        return Err(anyhow!("node returned empty evidence: {}", resp.message));
+        return Err(NodeFailure::Refused(anyhow!(
+            "node returned empty evidence: {}",
+            resp.message
+        )));
     }
-    Ok(resp.evidence)
+    Ok(resp)
+}
+
+/// A node's public configuration, for the relay.
+pub(crate) async fn fetch_tapp_info(
+    tee_url: &str,
+) -> Result<tapp::GetTappInfoResponse, NodeFailure> {
+    let mut client = node_client(tee_url).await?;
+    bounded(
+        client.get_tapp_info(tonic::Request::new(GetTappInfoRequest {})),
+        "GetTappInfo",
+    )
+    .await
 }
 
 /// Submit evidence to the AS with no policy selected and return the token claims.
@@ -438,6 +535,7 @@ pub async fn check_node(
         signer: signer.to_lowercase(),
         tee_url: tee_url.to_string(),
         checked_at: now,
+        td_debug: td_debug_of(tdx),
         tcb_status: tdx
             .get("tcb_status")
             .and_then(Value::as_str)
