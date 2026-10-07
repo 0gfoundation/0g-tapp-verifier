@@ -112,6 +112,12 @@ pub struct VerifyState {
     targets: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Request counters per caller, pruned as windows expire.
     quota: tokio::sync::Mutex<HashMap<String, Window>>,
+    /// When this process started. A stored result without the TD's DEBUG attribute is
+    /// attested again inside the cooldown only if it is older than this: such a result
+    /// comes from a version that did not record the attribute. One this process made
+    /// lacks it only if the AS left it out, and re-attesting that on every call would
+    /// turn the cooldown off.
+    started_at: i64,
 }
 
 struct Window {
@@ -127,6 +133,7 @@ impl VerifyState {
             unreachable: Default::default(),
             targets: Default::default(),
             quota: Default::default(),
+            started_at: now(),
         }
     }
 }
@@ -720,7 +727,9 @@ async fn verify(
             // A result stored before the TD's DEBUG attribute was recorded cannot be
             // judged, so it is attested again now rather than answered "not verified"
             // until the cooldown runs out — which a gate would take as a refusal.
-            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS && !debug_unknown(entry) {
+            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS
+                && !predates_debug_attribute(entry, verify_state.started_at)
+            {
                 return verdict_response(&s, entry, true);
             }
         }
@@ -746,9 +755,10 @@ async fn verify(
     verdict_response(&s, &entry, false)
 }
 
-/// An attested result from before the TD's DEBUG attribute was stored.
-fn debug_unknown(entry: &status::Entry) -> bool {
-    entry.attested.as_ref().is_some_and(|a| a.td_debug.is_none())
+/// An attested result without the TD's DEBUG attribute, made before this process started:
+/// by a version that did not record it.
+fn predates_debug_attribute(entry: &status::Entry, started_at: i64) -> bool {
+    entry.attested.as_ref().is_some_and(|a| a.td_debug.is_none()) && entry.checked_at < started_at
 }
 
 fn parse_target(app_id: &str, signer: &str) -> Result<(String, String), Response> {
@@ -1595,10 +1605,17 @@ mod tests {
     }
 
     #[test]
-    fn a_result_without_the_debug_attribute_is_attested_again() {
-        assert!(debug_unknown(&with_attested(|a| a.td_debug = None)));
-        assert!(!debug_unknown(&with_attested(|a| a.td_debug = Some(false))));
-        assert!(!debug_unknown(&with_attested(|a| a.td_debug = Some(true))));
+    fn only_a_result_from_an_earlier_version_is_attested_again() {
+        let mut old = with_attested(|a| a.td_debug = None);
+        old.checked_at = 100;
+        assert!(predates_debug_attribute(&old, 200));
+        // Made by this process: the AS left the attribute out, and the cooldown holds.
+        assert!(!predates_debug_attribute(&old, 50));
+        for known in [Some(false), Some(true)] {
+            let mut e = with_attested(|a| a.td_debug = known);
+            e.checked_at = 100;
+            assert!(!predates_debug_attribute(&e, 200));
+        }
     }
 
     #[test]

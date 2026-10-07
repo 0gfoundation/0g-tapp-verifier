@@ -710,9 +710,26 @@ impl Scanner {
     /// `getNodeList` directly rather than from the event registry: for a target the
     /// registry has not caught up with yet, such as a node that re-registered its new
     /// signer seconds ago.
+    ///
+    /// The block returned is read before the call, so it is a lower bound on the state the
+    /// call saw. The call itself runs at `latest` rather than at that number: behind a
+    /// load-balanced RPC, the backend serving it may not have a just-read block yet
+    /// ("header not found"). One failed attempt is retried before the caller gets an
+    /// error, which it reports as this service's outage.
     pub async fn current_node_at_head(&self, app_id: &str, signer: &str) -> Result<Option<u64>> {
+        match self.current_node_once(app_id, signer).await {
+            Err(e) => {
+                tracing::debug!("{app_id}/{signer}: getNodeList failed ({e}), retrying once");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                self.current_node_once(app_id, signer).await
+            }
+            ok => ok,
+        }
+    }
+
+    async fn current_node_once(&self, app_id: &str, signer: &str) -> Result<Option<u64>> {
         use ethers::abi::{encode, Token};
-        use ethers::types::{BlockId, Bytes, TransactionRequest};
+        use ethers::types::{Bytes, TransactionRequest};
 
         let addr: Address = signer
             .parse()
@@ -723,10 +740,7 @@ impl Scanner {
         let tx = TransactionRequest::new()
             .to(self.contract)
             .data(Bytes::from(data));
-        let out = self
-            .provider
-            .call(&tx.into(), Some(BlockId::Number(head.into())))
-            .await?;
+        let out = self.provider.call(&tx.into(), None).await?;
         let listed = decode(&[ParamType::Array(Box::new(ParamType::Address))], &out)
             .map_err(|e| anyhow!("could not decode getNodeList for {app_id}: {e}"))?
             .into_iter()
