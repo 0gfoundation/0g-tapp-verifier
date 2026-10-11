@@ -116,20 +116,17 @@ can reach it can overwrite any policy id, and an EAR token records only which
 policy id was used — never a hash of it — so a client cannot detect a swap.
 
 One tappscan process watches one chain (`TAPPSCAN_RPC` / `TAPPSCAN_CONTRACT` /
-`TAPPSCAN_FROM_BLOCK`, with their own cache files). The UI's testnet/mainnet
-switch expects a second instance for the other network proxied under `/mainnet`
-on the same host; the choice travels in `?net=mainnet` so links stay shareable.
-The proxy must STRIP the prefix (the server's routes are `/` and `/api/*`) —
-nginx does that with a trailing slash on `proxy_pass`:
+`TAPPSCAN_FROM_BLOCK`, with their own cache files), and its page shows that chain
+only: deploy one instance per network, each on its own host. The network label
+follows `/api/health`'s `chain_id`, not the URL.
+
+The page calls its API relative to its own URL, so an instance also works behind
+a reverse proxy under a prefix, provided the proxy STRIPS it (the server's routes
+are `/` and `/api/*`) — nginx does that with a trailing slash on `proxy_pass`:
 
 ```nginx
 location /mainnet/ { proxy_pass http://tappscan-mainnet:9090/; }
 ```
-
-Two misconfigurations to avoid: a proxy that does not strip (everything under
-`/mainnet` 404s), and publishing the second instance's own port directly — the
-page still works there (the network pill follows `/api/health`'s `chain_id`,
-not the URL), but prefer one front so links mean one thing.
 
 Point `TAPPSCAN_REFVALUES_HOST` at a checkout of
 [`0g-tapp`](https://github.com/0gfoundation/0g-tapp)'s `verifier/reference-values`,
