@@ -90,6 +90,32 @@ const VERIFY_COOLDOWN_SECS: i64 = 60;
 const QUOTA_WINDOW_SECS: i64 = 60;
 const ANON_PER_WINDOW: u32 = 6;
 const KEYED_PER_WINDOW: u32 = 60;
+const ANON_READS_PER_WINDOW: u32 = 600;
+const KEYED_READS_PER_WINDOW: u32 = 6000;
+
+#[derive(Clone, Copy)]
+enum QuotaLane {
+    /// Cheap cache reads and the live chain checks which authenticate their scope.
+    Read,
+    /// A cold attestation or an evidence/info relay to the remote node.
+    Cold,
+}
+
+fn count_in_lane(
+    windows: &mut HashMap<String, Window>,
+    caller: &str,
+    keyed: bool,
+    lane: QuotaLane,
+    now: i64,
+) -> Result<(), i64> {
+    let (namespace, limit) = match (lane, keyed) {
+        (QuotaLane::Read, false) => ("read", ANON_READS_PER_WINDOW),
+        (QuotaLane::Read, true) => ("read", KEYED_READS_PER_WINDOW),
+        (QuotaLane::Cold, false) => ("cold", ANON_PER_WINDOW),
+        (QuotaLane::Cold, true) => ("cold", KEYED_PER_WINDOW),
+    };
+    count_request(windows, &format!("{namespace}:{caller}"), limit, now)
+}
 
 /// Everything that bounds `POST /api/verify`.
 pub struct VerifyState {
@@ -702,13 +728,14 @@ async fn verify(
         Err(r) => return r,
     };
     let verify_state = state.read().await.verify.clone();
-    if let Err(r) = charge_caller(&state, &verify_state, &headers, peer).await {
+    if let Err(r) = charge_caller_for(&state, &verify_state, &headers, peer, QuotaLane::Read).await {
         return r;
     }
     let latest_block = match resolve_current_target(&state, &app_id, &signer).await {
         Ok(b) => b,
         Err(r) => return r,
     };
+    let scanner = state.read().await.scanner.clone();
 
     // Single-flight: whoever holds the target's lock does the work; the others
     // wait here and then hit the cooldown check below.
@@ -720,6 +747,16 @@ async fn verify(
             .clone()
     };
     let _flight = flight.lock().await;
+    // Read scope after waiting for the target lock, so a concurrent verifier
+    // cannot leave this request using membership read before a long wait.
+    let (registered_at, scope_block) = match scanner.identity_scope_at_head(&app_id, &signer).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return (StatusCode::NOT_FOUND, "not a current node of this app on chain\n").into_response(),
+        Err(e) => {
+            tracing::warn!("{app_id}: cannot read app registration: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "cannot read app registration right now\n").into_response();
+        }
+    };
 
     {
         let s = state.read().await;
@@ -728,13 +765,20 @@ async fn verify(
             // judged, so it is attested again now rather than answered "not verified"
             // until the cooldown runs out — which a gate would take as a refusal.
             if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS
+                && entry.app_latest_block >= latest_block
+                && entry.registered_at == Some(registered_at)
                 && !predates_debug_attribute(entry, verify_state.started_at)
             {
-                return verdict_response(&s, entry, true);
+                return verdict_response(&s, entry, true, registered_at, scope_block);
             }
         }
     }
 
+    // Only the single-flight leader that actually needs a new attestation
+    // spends the cold budget. Cached replies and waiters share its result.
+    if let Err(r) = charge_caller(&state, &verify_state, &headers, peer).await {
+        return r;
+    }
     let Ok(_permit) = verify_state.slots.try_acquire() else {
         return too_many(5);
     };
@@ -743,8 +787,19 @@ async fn verify(
         let s = state.read().await;
         (s.scanner.clone(), s.as_endpoint.clone(), s.ref_sets.clone())
     };
-    let entry =
+    let mut entry =
         crate::attest_one(&scanner, &app_id, &signer, latest_block, &as_endpoint, &ref_sets).await;
+    // The quote was fetched after the first scope read. Re-read current
+    // membership and epoch before attaching it to that registration instance.
+    let scope_block = match scanner.identity_scope_at_head(&app_id, &signer).await {
+        Ok(Some((epoch, block))) if epoch == registered_at => block,
+        Ok(_) => return (StatusCode::CONFLICT, "app registration or node membership changed during verification\n").into_response(),
+        Err(e) => {
+            tracing::warn!("{app_id}: cannot confirm app registration: {e}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "cannot confirm app registration right now\n").into_response();
+        }
+    };
+    entry.registered_at = Some(registered_at);
 
     // Into the shared store, so the page and the summaries serve it too. Not
     // saved to disk here: the refresh loop persists on its own schedule, and a
@@ -752,7 +807,7 @@ async fn verify(
     let mut s = state.write().await;
     s.store.put(entry.clone());
     let s = s.downgrade();
-    verdict_response(&s, &entry, false)
+    verdict_response(&s, &entry, false, registered_at, scope_block)
 }
 
 /// An attested result without the TD's DEBUG attribute, made before this process started:
@@ -785,15 +840,25 @@ async fn charge_caller(
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> Result<(), Response> {
-    let (caller, limit) = match presented_key(headers) {
+    charge_caller_for(state, verify_state, headers, peer, QuotaLane::Cold).await
+}
+
+async fn charge_caller_for(
+    state: &AppState,
+    verify_state: &VerifyState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    lane: QuotaLane,
+) -> Result<(), Response> {
+    let (caller, keyed) = match presented_key(headers) {
         Some(secret) => match state.read().await.api_keys.check(secret, now()) {
-            Some(id) => (format!("key:{id}"), KEYED_PER_WINDOW),
-            None => (anon_caller(headers, peer), ANON_PER_WINDOW),
+            Some(id) => (format!("key:{id}"), true),
+            None => (anon_caller(headers, peer), false),
         },
-        None => (anon_caller(headers, peer), ANON_PER_WINDOW),
+        None => (anon_caller(headers, peer), false),
     };
     let mut windows = verify_state.quota.lock().await;
-    count_request(&mut windows, &caller, limit, now()).map_err(too_many)
+    count_in_lane(&mut windows, &caller, keyed, lane, now()).map_err(too_many)
 }
 
 /// The block at which `signer` is known to be one of the app's CURRENT nodes; 404
@@ -1082,10 +1147,17 @@ fn too_many(retry_after: i64) -> Response {
 /// One node's verdict, without the trace: the events run to thousands of entries
 /// and megabytes, and an admission decision needs none of them — they stay on
 /// the events endpoint.
-fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool) -> Response {
+fn verdict_response(s: &Shared, entry: &status::Entry, cached: bool, registered_at: u64, scope_block: u64) -> Response {
     let (code, mut body) = verdict_parts(entry, &s.ref_sets, cached, s.accept_dev);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("reference_values".into(), json!(s.refs_from));
+        obj.insert("scope".into(), json!({
+            "chain_id": s.registry.chain_id,
+            "registry_address": s.registry.contract,
+            "app_id": entry.app_id,
+            "registered_at": registered_at,
+        }));
+        obj.insert("scope_block".into(), json!(scope_block));
     }
     (code, Json(body)).into_response()
 }
@@ -1135,6 +1207,10 @@ fn verdict_parts(
             false,
             "the runtime event log does not replay against the signed RTMRs".into(),
         ),
+        Some(a) if a.fresh == Some(false) => (
+            false,
+            "the quote does not echo this verifier's challenge".into(),
+        ),
         // What an AS policy used to enforce, and the local verdict must not drop: a
         // DEBUG TD's memory is open to its host, whatever image it runs.
         Some(a) if a.td_debug == Some(true) => (
@@ -1160,7 +1236,7 @@ fn verdict_parts(
     };
     // Reported, not failed: clouds roll firmware out behind Intel, so a TCB trailing
     // the latest is common on healthy nodes. The advisories say what is outstanding.
-    let warnings: Vec<String> = match &entry.attested {
+    let mut warnings: Vec<String> = match &entry.attested {
         Some(a) if a.tcb_status != "UpToDate" && a.tcb_status != "Revoked" => vec![format!(
             "TCB {} (advisories: {})",
             a.tcb_status,
@@ -1168,11 +1244,32 @@ fn verdict_parts(
         )],
         _ => vec![],
     };
+    if let Some(a) = &entry.attested {
+        if a.identity.identities_unchecked > 0 {
+            warnings.push(format!("{} KMS commitments lack an attested upstream acquisition", a.identity.identities_unchecked));
+        }
+    }
     let image_env = entry
         .attested
         .as_ref()
         .and_then(|a| a.identify(sets).0)
         .map(|l| if crate::refvalues::is_dev(&l) { "dev" } else { "prod" });
+    let current_time = now();
+    let identities_verified = verified && entry.checked_at > 0
+        && entry.checked_at <= current_time
+        && current_time < entry.checked_at.saturating_add(VERIFY_COOLDOWN_SECS)
+        && entry.attested.as_ref().is_some_and(|a| {
+            a.fresh == Some(true) && a.identity.identities_error.is_none()
+                && !a.identity.identities.is_empty()
+        });
+    if !identities_verified {
+        if let Some(a) = status.get_mut("attested").and_then(|v| v.as_object_mut()) {
+            a.insert("identities".into(), json!([]));
+            a.insert("key_commitments".into(), json!([]));
+            a.insert("app_signer".into(), json!(null));
+            a.insert("identities_unchecked".into(), json!(0));
+        }
+    }
     let code = if entry.error.is_some() && entry.verifier_fault {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -1185,6 +1282,9 @@ fn verdict_parts(
             "signer": entry.signer,
             "cached": cached,
             "verified": verified,
+            "identities_verified": identities_verified,
+            "checked_at": entry.checked_at,
+            "expires_at": entry.checked_at.saturating_add(VERIFY_COOLDOWN_SECS),
             "reason": reason,
             "warnings": warnings,
             "image_env": image_env,
@@ -1459,6 +1559,7 @@ mod tests {
             tee_url: "http://node:50051".into(),
             checked_at: 1,
             app_latest_block: 1,
+            registered_at: None,
             error: None,
             verifier_fault: false,
             attested: Some(status::Attested {
@@ -1466,6 +1567,8 @@ mod tests {
                 advisories: vec![],
                 attested_signer: Some("0xaaa".into()),
                 tls_public_key: None,
+                fresh: None,
+                identity: Default::default(),
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
@@ -1516,6 +1619,106 @@ mod tests {
     }
 
     // ─── /api/verify quotas ──────────────────────────────────────────────────
+
+    #[test]
+    fn shared_cached_reads_do_not_spend_the_cold_attestation_budget() {
+        let mut windows=HashMap::new();
+        for _ in 0..ANON_READS_PER_WINDOW {
+            assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Read,1000).is_ok());
+        }
+        for _ in 0..ANON_PER_WINDOW {
+            assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1000).is_ok());
+        }
+        assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1000).is_err());
+        assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Read,1000).is_err());
+        // The read cap protects live chain lookups as well as in-memory replies.
+        assert_eq!(windows["read:ip:1.2.3.4"].count,600);
+        assert_eq!(windows["cold:ip:1.2.3.4"].count,6);
+    }
+
+    #[test]
+    fn exhausting_cold_work_still_allows_bounded_cached_reads_and_separate_keyed_tiers() {
+        let mut windows=HashMap::new();
+        for _ in 0..ANON_PER_WINDOW {
+            count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1000).unwrap();
+        }
+        assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1000).is_err());
+        assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Read,1000).is_ok());
+        for _ in 0..KEYED_PER_WINDOW {
+            count_in_lane(&mut windows,"key:valid",true,QuotaLane::Cold,1000).unwrap();
+        }
+        assert!(count_in_lane(&mut windows,"key:valid",true,QuotaLane::Cold,1000).is_err());
+        assert!(count_in_lane(&mut windows,"key:valid",true,QuotaLane::Read,1000).is_ok());
+        assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1060).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cached_verify_handler_does_not_charge_the_exhausted_cold_lane() {
+        use ethers::abi::{encode, Token};
+        use ethers::types::Address;
+        use serde_json::Value;
+        let signer=format!("{:#x}",Address::from_low_u64_be(1));
+        let contract=format!("{:#x}",Address::from_low_u64_be(8));
+        let app_selector=format!("0x{}",hex::encode(&ethers::utils::keccak256("getAppInfo(string)")[..4]));
+        let scope_reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_reads=scope_reads.clone();
+        let handler=move |Json(request):Json<Value>| {
+            let app_selector=app_selector.clone();
+            let scope_reads=handler_reads.clone();
+            async move {
+                if request["method"]=="eth_call" { scope_reads.fetch_add(1,std::sync::atomic::Ordering::Relaxed); }
+                let result=if request["method"]=="eth_blockNumber" { "0x2a".to_owned() }
+                else if request["params"][0]["data"].as_str().unwrap().starts_with(&app_selector) {
+                    format!("0x{}",hex::encode(encode(&[Token::Tuple(vec![
+                        Token::Bytes(vec![]),Token::Bytes(vec![]),Token::Array(vec![]),
+                        Token::Address(Address::from_low_u64_be(9)),Token::Uint(1234.into())
+                    ])])))
+                } else { format!("0x{}",hex::encode(encode(&[Token::Array(vec![Token::Address(Address::from_low_u64_be(1))])])))};
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+            }
+        };
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move { axum::serve(listener,Router::new().route("/",post(handler))).await.unwrap() });
+        let mut registry=chain::Registry {
+            chain_id:16602,contract:contract.clone(),scanned_to:42,app_ids:BTreeMap::new(),events:vec![],
+        };
+        registry.events.push(chain::AppEvent {
+            block:1,log_index:0,tx:String::new(),app_hash:format!("0x{}",hex::encode(ethers::utils::keccak256("mine"))),
+            event:chain::Event::NodeAdded{signer:signer.clone(),ack_version:1},
+        });
+        let mut entry=good_entry(); entry.signer=signer.clone(); entry.checked_at=now(); entry.registered_at=Some(1234);
+        entry.attested.as_mut().unwrap().attested_signer=Some(signer.clone());
+        let mut store=status::Store::default(); store.put(entry);
+        let verify_state=Arc::new(VerifyState::new(1));
+        let peer:SocketAddr="10.1.1.1:1234".parse().unwrap();
+        {
+            let mut windows=verify_state.quota.lock().await;
+            for _ in 0..ANON_PER_WINDOW { count_in_lane(&mut windows,"ip:10.1.1.1",false,QuotaLane::Cold,now()).unwrap(); }
+        }
+        let state=Arc::new(RwLock::new(Shared {
+            registry,store,balances:BTreeMap::new(),rpc_url:rpc.clone(),api_keys:Default::default(),keys_path:Default::default(),
+            admin:None,spent:BTreeMap::new(),authz_secret:None,ref_sets:Arc::new(matching_set()),
+            refs_from:crate::refsource::Provenance{source:"test".into(),tree:None,fetched_at:Some(now()),sets:BTreeMap::new(),error:None},
+            refreshed_at:now(),scanner:Arc::new(chain::Scanner::new(&rpc,&contract,0,Default::default()).unwrap()),
+            as_endpoint:"127.0.0.1:1".into(),verify:verify_state.clone(),accept_dev:false,
+        }));
+        for _ in 0..12 {
+            let response=verify(State(state.clone()),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer:signer.clone()})).await;
+            assert_eq!(response.status(),StatusCode::OK);
+        }
+        assert_eq!(scope_reads.load(std::sync::atomic::Ordering::Relaxed),24);
+        {
+            let windows=verify_state.quota.lock().await;
+            assert_eq!(windows["read:ip:10.1.1.1"].count,12);
+            assert_eq!(windows["cold:ip:10.1.1.1"].count,ANON_PER_WINDOW);
+        }
+        let mut expired=good_entry(); expired.signer=signer.clone(); expired.checked_at=now()-VERIFY_COOLDOWN_SECS; expired.registered_at=Some(1234);
+        state.write().await.store.put(expired);
+        let response=verify(State(state),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer})).await;
+        assert_eq!(response.status(),StatusCode::TOO_MANY_REQUESTS);
+        server.abort();
+    }
 
     #[test]
     fn the_quota_refuses_the_request_after_the_limit_with_a_sane_retry() {
@@ -1576,6 +1779,7 @@ mod tests {
             tee_url: "https://node:50052".into(),
             checked_at: 1000,
             app_latest_block: 1,
+            registered_at: None,
             error: None,
             verifier_fault: false,
             attested: Some(status::Attested {
@@ -1583,6 +1787,8 @@ mod tests {
                 advisories: vec![],
                 attested_signer: Some("0xAAA".into()),
                 tls_public_key: None,
+                fresh: None,
+                identity: Default::default(),
                 boot_format: "uki".into(),
                 measured: [(ANY_BSA.to_string(), vec!["u-digest".to_string()])].into(),
                 runtime_replay_ok: true,
@@ -1671,6 +1877,48 @@ mod tests {
             body["status"]["attested"]["image"],
             json!("gcp/uki/v0.8.0/prod.json")
         );
+    }
+
+    #[test]
+    fn typed_metadata_is_not_an_affirmative_identity_on_legacy_or_failed_nodes() {
+        let mut e = good_entry();
+        e.checked_at = now();
+        let a = e.attested.as_mut().unwrap();
+        a.fresh = Some(true);
+        a.identity.identities = vec![crate::identity::Identity {
+            role: "node_signer".into(), algorithm: "ecdsa-secp256k1".into(),
+            public_key: "0x0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+            public_key_encoding: "sec1-compressed".into(), key_source: "local".into(),
+            derivation: "tapp-app-signer-v1".into(), key_ref: None,
+        }];
+        let (_, body) = verdict_parts(&e, &matching_set(), false, true);
+        assert_eq!(body["identities_verified"], true);
+        assert_eq!(body["checked_at"], e.checked_at);
+        assert_eq!(body["expires_at"], e.checked_at + VERIFY_COOLDOWN_SECS);
+        assert_eq!(body["status"]["attested"]["identities"].as_array().unwrap().len(), 1);
+        // Existing node admission and typed-identity admission are separate.
+        e.attested.as_mut().unwrap().identity.identities_error = Some("bad commitment".into());
+        let (_, body) = verdict_parts(&e, &matching_set(), true, true);
+        assert_eq!(body["verified"], true);
+        assert_eq!(body["identities_verified"], false);
+        assert_eq!(body["status"]["attested"]["identities"], json!([]));
+        e.attested.as_mut().unwrap().identity.identities_error = None;
+        e.attested.as_mut().unwrap().fresh = None;
+        let (_, body) = verdict_parts(&e, &matching_set(), false, true);
+        assert_eq!(body["verified"], true);
+        assert_eq!(body["identities_verified"], false);
+        e.attested.as_mut().unwrap().fresh = Some(false);
+        let (_, body) = verdict_parts(&e, &matching_set(), false, true);
+        assert_eq!(body["verified"], false);
+        assert_eq!(body["identities_verified"], false);
+        e.attested.as_mut().unwrap().fresh = Some(true);
+        let (_, body) = verdict_parts(&e, &[], false, true);
+        assert_eq!(body["verified"], false);
+        assert_eq!(body["status"]["attested"]["identities"], json!([]));
+        e.checked_at = now() - VERIFY_COOLDOWN_SECS;
+        let (_, body) = verdict_parts(&e, &matching_set(), true, true);
+        assert_eq!(body["identities_verified"], false);
+        assert_eq!(body["status"]["attested"]["identities"], json!([]));
     }
 
     #[test]

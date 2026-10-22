@@ -48,6 +48,10 @@ pub struct Entry {
     /// Latest registry event block for this app at check time. A newer event than
     /// this means the cached result may no longer describe the app.
     pub app_latest_block: u64,
+    /// Registration epoch read on chain with current node membership. Absent
+    /// in older caches and background results until refreshed on demand.
+    #[serde(default)]
+    pub registered_at: Option<u64>,
     /// `None` when the attempt succeeded; the reason it failed otherwise.
     pub error: Option<String>,
     /// True when the failure was OURS, not the node's: evidence arrived and the
@@ -93,6 +97,10 @@ pub struct Attested {
     /// is an anomaly to show, not to average away.
     #[serde(default)]
     pub tls_public_key: Option<String>,
+    #[serde(default)]
+    pub fresh: Option<bool>,
+    #[serde(default, flatten)]
+    pub identity: crate::identity::Identities,
     /// grub or uki, decided structurally from `measured` alone.
     pub boot_format: String,
     /// Boot-chain digests this node measured, component → digests. The whole map,
@@ -190,6 +198,7 @@ impl Entry {
             tee_url: tee_url.to_string(),
             checked_at,
             app_latest_block,
+            registered_at: None,
             error: Some(error),
             verifier_fault,
             attested: None,
@@ -203,6 +212,7 @@ impl Entry {
             tee_url: status.tee_url.clone(),
             checked_at: status.checked_at,
             app_latest_block,
+            registered_at: None,
             error: None,
             verifier_fault: false,
             attested: Some(Attested {
@@ -210,6 +220,8 @@ impl Entry {
             advisories: status.advisories.clone(),
             attested_signer: status.attested_signer.clone(),
             tls_public_key: status.tls_public_key.clone(),
+            fresh: status.fresh,
+            identity: status.identity.clone(),
             boot_format: status.boot_format.to_string(),
             // Every component, the ANY_BSA pseudo-component included: it is what a
             // UKI reference value matches against, so dropping it would make a
@@ -411,6 +423,7 @@ mod tests {
             tee_url: "http://node:50051".into(),
             checked_at,
             app_latest_block: block,
+            registered_at: None,
             error: None,
             verifier_fault: false,
             attested: Some(Attested {
@@ -418,6 +431,8 @@ mod tests {
                 advisories: vec![],
                 attested_signer: Some(signer.to_lowercase()),
                 tls_public_key: None,
+                fresh: None,
+                identity: Default::default(),
                 boot_format: "uki".into(),
                 measured: BTreeMap::new(),
                 runtime_replay_ok: true,
@@ -438,6 +453,22 @@ mod tests {
         );
         s.put(entry("app", "0xaaa", 1000, 100));
         assert_eq!(s.freshness("app", "0xaaa", 100, 300, 1000), Freshness::Fresh);
+    }
+
+    #[test]
+    fn an_old_cache_has_no_synthesized_typed_identity_or_epoch() {
+        let mut old = serde_json::to_value(entry("app", "0xaaa", 1000, 100)).unwrap();
+        old.as_object_mut().unwrap().remove("registered_at");
+        let attested = old["attested"].as_object_mut().unwrap();
+        for field in ["fresh", "identities", "key_commitments", "app_signer", "identities_error"] {
+            attested.remove(field);
+        }
+        let read: Entry = serde_json::from_value(old).unwrap();
+        assert!(read.registered_at.is_none());
+        let a = read.attested.unwrap();
+        assert!(a.fresh.is_none() && a.identity.identities.is_empty());
+        assert!(a.identity.key_commitments.is_empty() && a.identity.app_signer.is_none());
+        assert_eq!(a.attested_signer.as_deref(), Some("0xaaa"));
     }
 
     #[test]
@@ -501,6 +532,8 @@ mod tests {
             advisories: vec![],
             attested_signer: Some("0xaaa".into()),
             tls_public_key: None,
+                fresh: None,
+                identity: Default::default(),
             boot_format: "uki",
             measured,
             matches: vec![],

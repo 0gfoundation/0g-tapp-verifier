@@ -182,6 +182,8 @@ struct ReportData {
     signer: Option<String>,
     /// sha256 of the app's TLS public key (hex), when the node attested one.
     tls_public_key: Option<String>,
+    /// Retained only after hashing the transmitted bytes against report_data.
+    runtime: Option<Value>,
     note: String,
 }
 
@@ -207,6 +209,7 @@ fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
     let mut out = ReportData {
         signer: None,
         tls_public_key: None,
+        runtime: None,
         note: String::new(),
     };
     let Some(rd) = tdx
@@ -220,11 +223,13 @@ fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
         return out;
     };
 
-    let runtime_data_b64 = serde_json::from_slice::<Value>(evidence)
-        .ok()
-        .and_then(|e| e.get("runtime_data").and_then(Value::as_str).map(String::from));
-    let Some(runtime_data_b64) = runtime_data_b64 else {
+    let evidence_json = serde_json::from_slice::<Value>(evidence).ok();
+    let Some(runtime_data) = evidence_json.as_ref().and_then(|e| e.get("runtime_data")) else {
         out.signer = Some(format!("0x{}", hex::encode(&rd[..20])));
+        return out;
+    };
+    let Some(runtime_data_b64) = runtime_data.as_str() else {
+        out.note = "runtime_data is present but not a base64 string; ".into();
         return out;
     };
 
@@ -255,6 +260,7 @@ fn read_report_data(tdx: &Value, evidence: &[u8]) -> ReportData {
             if out.signer.is_none() {
                 out.note = "runtime_data verified but names no signer; ".into();
             }
+            out.runtime = Some(v);
         }
         Err(e) => out.note = format!("runtime_data parse: {e}; "),
     }
@@ -283,6 +289,9 @@ pub struct NodeStatus {
     /// sha256 of the app's TLS public key (hex), when the node attested one
     /// (tapp-server ≥0.4.0 with a TLS certificate issued).
     pub tls_public_key: Option<String>,
+    pub fresh: Option<bool>,
+    #[serde(flatten)]
+    pub identity: crate::identity::Identities,
 
     pub boot_format: &'static str,
     pub measured: Measured,
@@ -404,15 +413,10 @@ async fn bounded<T>(
 }
 
 /// Fetch `app_id`'s evidence from a node for this service's own verdicts.
-async fn fetch_evidence(tee_url: &str, app_id: &str) -> Result<Vec<u8>> {
-    // GetEvidence (≥0.4.0) accepts a challenge that the node echoes into
-    // runtime_data — that is how a caller tells a fresh quote from a replayed
-    // one. NONE IS SENT HERE ON PURPOSE, not as an oversight: this service
-    // fetches once and serves the result to many readers, and its whole
-    // contract is "as of checked_at". A nonce would prove freshness only to
-    // this service while making the answer un-cacheable for everyone else.
-    // A caller who wants freshness for itself sends its own through the relay.
-    Ok(fetch_evidence_for(tee_url, app_id, Vec::new())
+async fn fetch_evidence(tee_url: &str, app_id: &str, nonce: &[u8]) -> Result<Vec<u8>> {
+    // Prove freshness to this verifier before caching a result. Readers trust
+    // the verifier's checked_at; independent verifiers can still use the relay.
+    Ok(fetch_evidence_for(tee_url, app_id, nonce.to_vec())
         .await
         .map_err(anyhow::Error::new)?
         .evidence)
@@ -468,8 +472,7 @@ async fn evaluate(as_endpoint: &str, evidence: &[u8]) -> Result<Value> {
             verification_requests: vec![IndividualAttestationRequest {
                 tee: "tdx".to_string(),
                 evidence: B64URL.encode(evidence),
-                // No nonce binding: the evidence is pre-generated and bound to
-                // the node's signer via report_data, not to a challenge.
+                // The challenge is checked against quote-bound runtime_data below.
                 runtime_data: None,
                 init_data: None,
                 runtime_data_hash_algorithm: String::new(),
@@ -505,7 +508,10 @@ pub async fn check_node(
     ref_sets: &[RefSet],
     now: i64,
 ) -> Result<NodeStatus, CheckError> {
-    let evidence = fetch_evidence(tee_url, app_id)
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let evidence = fetch_evidence(tee_url, app_id, &nonce)
         .await
         .map_err(CheckError::Node)?;
     tracing::debug!("{tee_url}: {} bytes of evidence", evidence.len());
@@ -529,6 +535,17 @@ pub async fn check_node(
     let measured = boot_digests(&logs);
     let matches = refvalues::match_sets(&measured, ref_sets);
     let rd = read_report_data(tdx, &evidence);
+    let fresh = quote_freshness(rd.runtime.as_ref(), &nonce);
+    let runtime_events = runtime_events(&logs);
+    let identity = match &rd.runtime {
+        Some(v) if rd.signer.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(signer)) =>
+            crate::identity::authenticate(v, app_id, rd.signer.as_deref(), rd.tls_public_key.as_deref(), &runtime_events, fresh),
+        Some(v) if v.get("identities").is_some() => crate::identity::Identities {
+            identities_error: Some("quote signer does not match the registered node".into()),
+            ..Default::default()
+        },
+        _ => Default::default(),
+    };
     let note = rd.note;
 
     Ok(NodeStatus {
@@ -553,6 +570,8 @@ pub async fn check_node(
             .unwrap_or_default(),
         attested_signer: rd.signer,
         tls_public_key: rd.tls_public_key,
+        fresh,
+        identity,
         boot_format: measured.boot_format(),
         matches,
         measured,
@@ -560,9 +579,16 @@ pub async fn check_node(
             .iter()
             .filter(|e| e.get("digest_matches_event").and_then(Value::as_bool) == Some(false))
             .count(),
-        runtime_events: runtime_events(&logs),
+        runtime_events,
         note,
     })
+}
+
+fn quote_freshness(runtime: Option<&Value>, expected_nonce: &[u8]) -> Option<bool> {
+    let runtime = runtime?;
+    let nonce = runtime.get("nonce")?;
+    Some(nonce.as_str().and_then(|v| v.strip_prefix("0x"))
+        .and_then(|v| hex::decode(v).ok()).as_deref() == Some(expected_nonce))
 }
 
 #[cfg(test)]
@@ -624,6 +650,34 @@ mod tests {
         assert!(out.signer.is_none());
         assert!(out.tls_public_key.is_none());
         assert!(out.note.contains("does not hash"));
+    }
+
+    #[test]
+    fn only_a_quote_bound_matching_challenge_is_fresh() {
+        let nonce = [5u8; 32];
+        let runtime = json!({"nonce": format!("0x{}", hex::encode(nonce))});
+        assert_eq!(quote_freshness(Some(&runtime), &nonce), Some(true));
+        assert_eq!(quote_freshness(Some(&runtime), &[6; 32]), Some(false));
+        assert_eq!(quote_freshness(Some(&json!({"nonce":42})), &nonce), Some(false));
+        assert_eq!(quote_freshness(Some(&json!({})), &nonce), None);
+        assert_eq!(quote_freshness(None, &nonce), None);
+    }
+
+    #[test]
+    fn altered_typed_metadata_is_not_read_before_report_data_matches() {
+        let raw = br#"{"signer":"0x1111111111111111111111111111111111111111","app_id":"app","identities":[{"role":"app_signer"}]}"#;
+        let evidence = serde_json::to_vec(&json!({"runtime_data":base64::engine::general_purpose::STANDARD.encode(raw)})).unwrap();
+        let out = read_report_data(&token(&hex::encode(sha2::Sha512::digest(b"other"))), &evidence);
+        assert!(out.runtime.is_none() && out.signer.is_none());
+    }
+
+    #[test]
+    fn malformed_runtime_data_cannot_downgrade_to_bare_address() {
+        for runtime in [json!(null), json!({"signer":"0x1234"}), json!(42)] {
+            let evidence = serde_json::to_vec(&json!({"runtime_data":runtime})).unwrap();
+            let out = read_report_data(&token(&"11".repeat(64)), &evidence);
+            assert!(out.signer.is_none() && out.runtime.is_none());
+        }
     }
 
     fn bsa(digest: &str, path: &str) -> Value {
