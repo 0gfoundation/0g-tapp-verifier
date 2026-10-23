@@ -83,6 +83,11 @@ pub type AppState = Arc<RwLock<Shared>>;
 /// of them rather than five concurrent quote generations hitting the node.
 const VERIFY_COOLDOWN_SECS: i64 = 60;
 
+/// Maximum age of an authenticated identity, measured from the observation's
+/// start. This is separate from the cache cooldown: fetching and verifying a
+/// quote can itself take longer than the cooldown without extending its lease.
+const IDENTITY_ACCEPTANCE_SECS: i64 = 300;
+
 /// Per-caller request metering, fixed one-minute windows. The quotas are QoS
 /// tiers, not a security boundary — authorisation comes from the structural
 /// limits (cooldown, chain-registered targets only, the concurrency cap), so a
@@ -751,6 +756,8 @@ async fn verify(
 
     // A refresh queues for an observation started after this snapshot. Requests
     // sharing the snapshot share that next round, including its negative result.
+    // Ordinary callers also remember what was already published: a slow round
+    // completing while they queue can be shared beyond the cache cooldown.
     let flight = {
         let mut targets = verify_state.targets.lock().await;
         targets
@@ -759,6 +766,7 @@ async fn verify(
             .clone()
     };
     let observed_generation = flight.started_generation.load(Ordering::Acquire);
+    let observed_published = flight.published_generation.load(Ordering::Acquire);
     let _flight = flight.gate.lock().await;
     // Read scope after waiting for the target lock, so a concurrent verifier
     // cannot leave this request using membership read before a long wait.
@@ -777,9 +785,8 @@ async fn verify(
             // A result stored before the TD's DEBUG attribute was recorded cannot be
             // judged, so it is attested again now rather than answered "not verified"
             // until the cooldown runs out — which a gate would take as a refusal.
-            let refreshed = flight.published_generation.load(Ordering::Acquire) > observed_generation;
-            if (!req.refresh || refreshed)
-                && entry.age_secs(now()) < VERIFY_COOLDOWN_SECS
+            let published = flight.published_generation.load(Ordering::Acquire);
+            if cached_observation_usable(req.refresh, entry.age_secs(now()), observed_generation, observed_published, published)
                 && entry.app_latest_block >= latest_block
                 && entry.registered_at == Some(registered_at)
                 && !predates_debug_attribute(entry, verify_state.started_at)
@@ -825,6 +832,21 @@ async fn verify(
     flight.published_generation.store(generation, Ordering::Release);
     let s = s.downgrade();
     verdict_response(&s, &entry, false, registered_at, scope_block)
+}
+
+/// A newly published round may outlast the ordinary cache cooldown while its
+/// identity lease remains valid. Only callers queued before its publication may
+/// share it at that age; later ordinary callers still trigger a new observation.
+fn cached_observation_usable(
+    refresh: bool,
+    age_secs: i64,
+    observed_started: u64,
+    observed_published: u64,
+    published: u64,
+) -> bool {
+    (!refresh || published > observed_started)
+        && (age_secs < VERIFY_COOLDOWN_SECS
+            || (published > observed_published && age_secs < IDENTITY_ACCEPTANCE_SECS))
 }
 
 /// An attested result without the TD's DEBUG attribute, made before this process started:
@@ -1201,6 +1223,16 @@ fn verdict_parts(
     cached: bool,
     accept_dev: bool,
 ) -> (StatusCode, serde_json::Value) {
+    verdict_parts_at(entry, sets, cached, accept_dev, now())
+}
+
+fn verdict_parts_at(
+    entry: &status::Entry,
+    sets: &[crate::refvalues::RefSet],
+    cached: bool,
+    accept_dev: bool,
+    current_time: i64,
+) -> (StatusCode, serde_json::Value) {
     let mut status = refreshed_verdict(entry, sets);
     if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
         a.remove("events");
@@ -1271,10 +1303,9 @@ fn verdict_parts(
         .as_ref()
         .and_then(|a| a.identify(sets).0)
         .map(|l| if crate::refvalues::is_dev(&l) { "dev" } else { "prod" });
-    let current_time = now();
     let identities_verified = verified && entry.checked_at > 0
         && entry.checked_at <= current_time
-        && current_time < entry.checked_at.saturating_add(VERIFY_COOLDOWN_SECS)
+        && current_time < entry.checked_at.saturating_add(IDENTITY_ACCEPTANCE_SECS)
         && entry.attested.as_ref().is_some_and(|a| {
             a.fresh == Some(true) && a.identity.identities_error.is_none()
                 && !a.identity.identities.is_empty()
@@ -1301,12 +1332,12 @@ fn verdict_parts(
             "verified": verified,
             "identities_verified": identities_verified,
             "checked_at": entry.checked_at,
-            "expires_at": entry.checked_at.saturating_add(VERIFY_COOLDOWN_SECS),
+            "expires_at": entry.checked_at.saturating_add(IDENTITY_ACCEPTANCE_SECS),
             "reason": reason,
             "warnings": warnings,
             "image_env": image_env,
             "status": status,
-            "now": now(),
+            "now": current_time,
         }),
     )
 }
@@ -1678,6 +1709,29 @@ mod tests {
         assert!(serde_json::from_value::<VerifyRequest>(refresh.clone()).unwrap().refresh);
         refresh["refresh"] = json!("true");
         assert!(serde_json::from_value::<VerifyRequest>(refresh).is_err());
+    }
+
+    #[test]
+    fn slow_published_rounds_serve_waiters_without_extending_the_cache_cooldown() {
+        for age in [0, VERIFY_COOLDOWN_SECS - 1, VERIFY_COOLDOWN_SECS, 90, IDENTITY_ACCEPTANCE_SECS - 1, IDENTITY_ACCEPTANCE_SECS] {
+            // This round was already published before a new ordinary caller
+            // arrived. Its larger identity lease must not extend cache reuse.
+            assert_eq!(cached_observation_usable(false, age, 2, 2, 2),
+                age < VERIFY_COOLDOWN_SECS, "new ordinary caller, age {age}");
+            // An ordinary caller queued during this round, so it can share the
+            // newly published result even after a 90-second quote/AS operation.
+            assert_eq!(cached_observation_usable(false, age, 2, 1, 2),
+                age < IDENTITY_ACCEPTANCE_SECS, "ordinary waiter, age {age}");
+            // Refreshes queued before the new round started share it, too.
+            assert_eq!(cached_observation_usable(true, age, 1, 1, 2),
+                age < IDENTITY_ACCEPTANCE_SECS, "refresh waiter, age {age}");
+            // A refresh queued after quote acquisition cannot share that older
+            // round just because its AS call completed after the request.
+            assert!(!cached_observation_usable(true, age, 2, 1, 2),
+                "refresh during an older round, age {age}");
+            assert!(!cached_observation_usable(true, age, 2, 2, 2),
+                "refresh after publication, age {age}");
+        }
     }
 
     // Exercise the real HTTP/RPC/nonce/AS path. Only the chain, node and AS are
@@ -2201,10 +2255,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_metadata_is_not_an_affirmative_identity_on_legacy_or_failed_nodes() {
+    fn good_identity_entry() -> status::Entry {
         let mut e = good_entry();
-        e.checked_at = now();
         let a = e.attested.as_mut().unwrap();
         a.fresh = Some(true);
         a.identity.identities = vec![crate::identity::Identity {
@@ -2213,10 +2265,17 @@ mod tests {
             public_key_encoding: "sec1-compressed".into(), key_source: "local".into(),
             derivation: "tapp-app-signer-v1".into(), key_ref: None,
         }];
+        e
+    }
+
+    #[test]
+    fn typed_metadata_is_not_an_affirmative_identity_on_legacy_or_failed_nodes() {
+        let mut e = good_identity_entry();
+        e.checked_at = now();
         let (_, body) = verdict_parts(&e, &matching_set(), false, true);
         assert_eq!(body["identities_verified"], true);
         assert_eq!(body["checked_at"], e.checked_at);
-        assert_eq!(body["expires_at"], e.checked_at + VERIFY_COOLDOWN_SECS);
+        assert_eq!(body["expires_at"], e.checked_at + IDENTITY_ACCEPTANCE_SECS);
         assert_eq!(body["status"]["attested"]["identities"].as_array().unwrap().len(), 1);
         // Existing node admission and typed-identity admission are separate.
         e.attested.as_mut().unwrap().identity.identities_error = Some("bad commitment".into());
@@ -2237,10 +2296,34 @@ mod tests {
         let (_, body) = verdict_parts(&e, &[], false, true);
         assert_eq!(body["verified"], false);
         assert_eq!(body["status"]["attested"]["identities"], json!([]));
-        e.checked_at = now() - VERIFY_COOLDOWN_SECS;
+        e.checked_at = now() - IDENTITY_ACCEPTANCE_SECS;
         let (_, body) = verdict_parts(&e, &matching_set(), true, true);
         assert_eq!(body["identities_verified"], false);
         assert_eq!(body["status"]["attested"]["identities"], json!([]));
+    }
+
+    #[test]
+    fn identity_acceptance_includes_verification_time_without_renewing_the_observation() {
+        let e = good_identity_entry();
+        // In particular, a 90-second quote/AS round must not return an already
+        // expired identity merely because it outlasted the 60-second cooldown.
+        for age in [0, VERIFY_COOLDOWN_SECS - 1, VERIFY_COOLDOWN_SECS, 90, IDENTITY_ACCEPTANCE_SECS - 1] {
+            let (_, body) = verdict_parts_at(&e, &matching_set(), false, true, e.checked_at + age);
+            assert_eq!(body["identities_verified"], true, "age {age}");
+            assert_eq!(body["checked_at"], e.checked_at);
+            assert_eq!(body["expires_at"], e.checked_at + IDENTITY_ACCEPTANCE_SECS);
+            assert_eq!(body["now"], e.checked_at + age);
+            assert_eq!(body["status"]["attested"]["identities"].as_array().unwrap().len(), 1);
+        }
+        for age in [IDENTITY_ACCEPTANCE_SECS, IDENTITY_ACCEPTANCE_SECS + 1] {
+            let (_, body) = verdict_parts_at(&e, &matching_set(), true, true, e.checked_at + age);
+            assert_eq!(body["verified"], true); // Legacy node admission is unchanged.
+            assert_eq!(body["identities_verified"], false, "age {age}");
+            assert_eq!(body["expires_at"], e.checked_at + IDENTITY_ACCEPTANCE_SECS);
+            assert_eq!(body["status"]["attested"]["identities"], json!([]));
+        }
+        let (_, body) = verdict_parts_at(&e, &matching_set(), false, true, e.checked_at - 1);
+        assert_eq!(body["identities_verified"], false);
     }
 
     #[test]

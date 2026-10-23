@@ -206,10 +206,15 @@ Available from tappscan 0.5.0.
 quote; a registration change returns 409, and a chain-read failure returns 503.
 An old cached result is never attached to a newly registered app instance.
 
-`checked_at` is the scan verification time. `expires_at` is `checked_at + 60`
-seconds, the on-demand endpoint's cache window, not a promise that the remote
-process cannot change during that time. A consumer must validate the scope and
-expiry, then require both `verified` and `identities_verified`. The existing
+`checked_at` is the start of Scan's observation, before fetching the quote and
+evaluating it with the AS. `expires_at` is `checked_at + 300` seconds: the identity
+acceptance window includes that work and is never extended when verification
+finishes. The separate 60-second cache cooldown controls when an ordinary request
+must obtain a new observation; it is not the identity lease. Thus a verification
+that takes 90 seconds can still return an accepted identity, while a result aged
+300 seconds cannot. Neither window promises that the remote process cannot
+change during that time. A consumer must validate the scope and expiry, then
+require both `verified` and `identities_verified`. The existing
 `verified` node verdict keeps its earlier meaning; a legacy node may pass that
 verdict while supplying no authenticated app signer.
 
@@ -350,8 +355,12 @@ identity:
 1. **Per-target cooldown + single-flight.** A result younger than 60s answers
    ordinary requests as-is. Concurrent refreshes queued against the same old
    observation share one new round; each waiter still checks the live epoch and
-   membership, and the shared result must satisfy the normal TTL and scope
-   checks. A refresh arriving after an older round has already started waits for
+   membership, and the shared result must satisfy the 300-second identity
+   acceptance window and scope checks. A round published while ordinary callers
+   wait may also serve those callers within that window, even if verification
+   took longer than 60 seconds. Ordinary requests arriving after publication
+   still use the 60-second cooldown and obtain a new observation once it has
+   elapsed. A refresh arriving after an older round has already started waits for
    a subsequent round: that older quote may predate the new metadata even if its
    AS evaluation finishes later. Only a result published after the final scope
    check can satisfy the waiting refreshes. The forcing scenario: a node reboots with a new signer, all five
