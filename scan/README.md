@@ -379,6 +379,9 @@ identity:
    the registry catches up on its own schedule. The call runs at `latest` (a
    load-balanced RPC may not serve a just-read block number yet) and a failure is
    retried once; if it still fails, the answer is 503, not 404.
+   Cache invalidation tracks the app's cached event cursor, so unrelated new
+   blocks do not force repeated attestations while the registry catches up.
+   Every reply still checks the live registration epoch and node membership.
 3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
    own fan-out) protects this service, the AS and the nodes. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.

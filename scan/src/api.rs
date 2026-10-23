@@ -900,8 +900,8 @@ async fn charge_caller_for(
     count_in_lane(&mut windows, &caller, keyed, lane, now()).map_err(too_many)
 }
 
-/// The block at which `signer` is known to be one of the app's CURRENT nodes; 404
-/// when it is not one.
+/// The latest cached app-event block when `signer` is a current node; 404 when
+/// neither the cached registry nor the live membership lookup knows the target.
 ///
 /// The cached registry lags the chain by up to one sync interval, and "this signer
 /// just changed" is exactly when these endpoints get called: a node re-registers its
@@ -921,7 +921,13 @@ async fn resolve_current_target(
     match scanner.current_node_at_head(app_id, signer).await {
         Ok(Some(head)) => {
             tracing::info!("{app_id}/{signer}: current on chain at block {head}, ahead of the registry");
-            Ok(head)
+            // The live head proves membership, not that this app changed at that
+            // block. Treating every new block as an app event would invalidate a
+            // just-published result until the registry caught up, defeating
+            // single-flight for the KMS nodes admitting a new signer. Use the
+            // same cached event cursor as the ordinary path; verify separately
+            // checks live membership and registration epoch after its gate.
+            Ok(state.read().await.registry.timeline(app_id).latest_block())
         }
         Ok(None) => Err(
             (StatusCode::NOT_FOUND, "not a current node of this app on chain\n").into_response(),
@@ -1823,6 +1829,7 @@ mod tests {
         signer: String,
         peer: SocketAddr,
         epoch: Arc<AtomicU64>,
+        head: Arc<AtomicU64>,
         scope_reads: Arc<std::sync::atomic::AtomicUsize>,
         evidence: RefreshEvidence,
         attestation: RefreshAs,
@@ -1863,16 +1870,18 @@ mod tests {
                 axum::serve(listener,router).await.unwrap();
             });
             let epoch = Arc::new(AtomicU64::new(1234));
+            let head = Arc::new(AtomicU64::new(42));
+            let rpc_head = head.clone();
             let scope_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let rpc_epoch = epoch.clone();
             let rpc_reads = scope_reads.clone();
             let app_selector = format!("0x{}",hex::encode(&ethers::utils::keccak256("getAppInfo(string)")[..4]));
             let node_selector = format!("0x{}",hex::encode(&ethers::utils::keccak256("getNode(string,address)")[..4]));
             let handler = move |Json(request):Json<serde_json::Value>| {
-                let (epoch, reads, tee_url, app_selector, node_selector) =
-                    (rpc_epoch.clone(),rpc_reads.clone(),tee_url.clone(),app_selector.clone(),node_selector.clone());
+                let (epoch, head, reads, tee_url, app_selector, node_selector) =
+                    (rpc_epoch.clone(),rpc_head.clone(),rpc_reads.clone(),tee_url.clone(),app_selector.clone(),node_selector.clone());
                 async move {
-                    let result = if request["method"] == "eth_blockNumber" { "0x2a".into() }
+                    let result = if request["method"] == "eth_blockNumber" { format!("0x{:x}",head.load(Ordering::SeqCst)) }
                     else {
                         let data = request["params"][0]["data"].as_str().unwrap();
                         let tokens = if data.starts_with(&app_selector) {
@@ -1908,7 +1917,7 @@ mod tests {
                 refreshed_at:now(),scanner:Arc::new(chain::Scanner::new(&rpc,&contract,0,Default::default()).unwrap()),
                 as_endpoint,verify:Arc::new(VerifyState::new(1)),accept_dev:false,
             }));
-            Self { state,signer,peer:"10.1.1.1:1234".parse().unwrap(),epoch,scope_reads,evidence,attestation,
+            Self { state,signer,peer:"10.1.1.1:1234".parse().unwrap(),epoch,head,scope_reads,evidence,attestation,
                 servers:vec![node,as_server,rpc_server] }
         }
 
@@ -1935,6 +1944,34 @@ mod tests {
     async fn response_json(response: Response) -> serde_json::Value {
         assert_eq!(response.status(),StatusCode::OK);
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsynced_target_reuses_its_fresh_observation_when_unrelated_blocks_advance() {
+        let fixture = RefreshFixture::new(false).await;
+        {
+            let mut state = fixture.state.write().await;
+            state.registry.events.clear();
+            state.store = status::Store::default();
+        }
+        let first = response_json(fixture.call(false).await.unwrap()).await;
+        assert_eq!(first["cached"], false);
+        // More than the anonymous cold quota, but all the blocks are unrelated:
+        // membership and registration stay unchanged while the registry lags.
+        for head in 43..55 {
+            fixture.head.store(head, Ordering::SeqCst);
+            let body = response_json(fixture.call(false).await.unwrap()).await;
+            assert_eq!(body["cached"], true, "head {head}");
+            assert_eq!(body["verified"], true);
+            assert_eq!(body["scope_block"], head);
+        }
+        assert_eq!(fixture.evidence.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.scope_reads.load(Ordering::SeqCst), 14); // 13 pre + leader post
+        let state = fixture.state.read().await;
+        let quota = state.verify.quota.lock().await;
+        assert_eq!(quota["read:ip:10.1.1.1"].count, 13);
+        assert_eq!(quota["cold:ip:10.1.1.1"].count, 1);
     }
 
     #[tokio::test]
