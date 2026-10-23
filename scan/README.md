@@ -209,9 +209,11 @@ An old cached result is never attached to a newly registered app instance.
 `checked_at` is the start of Scan's observation, before fetching the quote and
 evaluating it with the AS. `expires_at` is `checked_at + 300` seconds: the identity
 acceptance window includes that work and is never extended when verification
-finishes. The separate 60-second cache cooldown controls when an ordinary request
-must obtain a new observation; it is not the identity lease. Thus a verification
-that takes 90 seconds can still return an accepted identity, while a result aged
+finishes. The separate 60-second cache cooldown starts at `status.completed_at`,
+when Scan finishes verification (including its final scope check). It controls
+when an ordinary request must obtain a new observation; it is not the identity
+lease. Older caches without a completion time fall back to `checked_at`. Thus a
+verification that takes 90 seconds can still return an accepted identity, while a result aged
 300 seconds cannot. Neither window promises that the remote process cannot
 change during that time. A consumer must validate the scope and expiry, then
 require both `verified` and `identities_verified`. The existing
@@ -352,16 +354,17 @@ verdict was reached against.
 The endpoint is **public**. What keeps that safe is structural, not caller
 identity:
 
-1. **Per-target cooldown + single-flight.** A result younger than 60s answers
-   ordinary requests as-is. Concurrent refreshes queued against the same old
-   observation share one new round; each waiter still checks the live epoch and
+1. **Per-target cooldown + single-flight.** For 60 seconds after completing
+   verification, a result answers ordinary requests as-is, while its original
+   300-second identity lease remains valid. Concurrent refreshes queued against
+   the same old observation share one new round; each waiter still checks the live epoch and
    membership, and the shared result must satisfy the 300-second identity
    acceptance window and scope checks. A round published while ordinary callers
    wait may also serve those callers within that window, even if verification
    took longer than 60 seconds. Ordinary requests arriving after publication
-   still use the 60-second cooldown and obtain a new observation once it has
-   elapsed. A refresh arriving after an older round has already started waits for
-   a subsequent round: that older quote may predate the new metadata even if its
+   still use the 60-second completion cooldown and obtain a new observation once
+   it has elapsed; completion never extends the identity lease. A refresh arriving
+   after an older round has already started waits for a subsequent round: that older quote may predate the new metadata even if its
    AS evaluation finishes later. Only a result published after the final scope
    check can satisfy the waiting refreshes. The forcing scenario: a node reboots with a new signer, all five
    KMS nodes notice at once — one quote generation must serve all five, not five

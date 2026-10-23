@@ -45,6 +45,10 @@ pub struct Entry {
     pub tee_url: String,
     /// When this attempt ran (unix seconds).
     pub checked_at: i64,
+    /// When verification completed. Only the cache cooldown uses this clock;
+    /// the identity lease always starts at checked_at. Zero is an older cache.
+    #[serde(default)]
+    pub completed_at: i64,
     /// Latest registry event block for this app at check time. A newer event than
     /// this means the cached result may no longer describe the app.
     pub app_latest_block: u64,
@@ -197,6 +201,7 @@ impl Entry {
             signer: signer.to_lowercase(),
             tee_url: tee_url.to_string(),
             checked_at,
+            completed_at: completion_time(),
             app_latest_block,
             registered_at: None,
             error: Some(error),
@@ -211,6 +216,7 @@ impl Entry {
             signer: status.signer.clone(),
             tee_url: status.tee_url.clone(),
             checked_at: status.checked_at,
+            completed_at: completion_time(),
             app_latest_block,
             registered_at: None,
             error: None,
@@ -247,11 +253,25 @@ impl Entry {
         (now - self.checked_at).max(0)
     }
 
+    pub fn cache_age_secs(&self, now: i64) -> i64 {
+        let completed_at = if self.completed_at >= self.checked_at && self.completed_at <= now {
+            self.completed_at
+        } else {
+            self.checked_at
+        };
+        (now - completed_at).max(0)
+    }
+
     /// The image this node is identified as against the reference values given.
     /// Derived on every call — see [`Attested`] for why it is not stored.
     pub fn image(&self, sets: &[crate::refvalues::RefSet]) -> Option<String> {
         self.attested.as_ref()?.identify(sets).0
     }
+}
+
+fn completion_time() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 /// Why a node needs re-attesting (or does not).
@@ -422,6 +442,7 @@ mod tests {
             signer: signer.to_lowercase(),
             tee_url: "http://node:50051".into(),
             checked_at,
+            completed_at: checked_at,
             app_latest_block: block,
             registered_at: None,
             error: None,
@@ -459,16 +480,35 @@ mod tests {
     fn an_old_cache_has_no_synthesized_typed_identity_or_epoch() {
         let mut old = serde_json::to_value(entry("app", "0xaaa", 1000, 100)).unwrap();
         old.as_object_mut().unwrap().remove("registered_at");
+        old.as_object_mut().unwrap().remove("completed_at");
         let attested = old["attested"].as_object_mut().unwrap();
         for field in ["fresh", "identities", "key_commitments", "app_signer", "identities_error"] {
             attested.remove(field);
         }
         let read: Entry = serde_json::from_value(old).unwrap();
         assert!(read.registered_at.is_none());
+        assert_eq!(read.completed_at, 0);
+        assert_eq!(read.cache_age_secs(1090), 90);
         let a = read.attested.unwrap();
         assert!(a.fresh.is_none() && a.identity.identities.is_empty());
         assert!(a.identity.key_commitments.is_empty() && a.identity.app_signer.is_none());
         assert_eq!(a.attested_signer.as_deref(), Some("0xaaa"));
+    }
+
+    #[test]
+    fn completion_cools_the_cache_without_changing_the_observation_age() {
+        let mut e = entry("app", "0xaaa", 1000, 100);
+        e.completed_at = 1090;
+        assert_eq!(e.age_secs(1100), 100);
+        assert_eq!(e.cache_age_secs(1100), 10);
+        let restored: Entry = serde_json::from_slice(&serde_json::to_vec(&e).unwrap()).unwrap();
+        assert_eq!(restored.completed_at, 1090);
+        assert_eq!(restored.cache_age_secs(1100), 10);
+        for invalid in [0, 999, 1200] {
+            e.completed_at = invalid;
+            assert_eq!(e.cache_age_secs(1100), 100, "completion {invalid}");
+            assert_eq!(e.age_secs(1100), 100);
+        }
     }
 
     #[test]
