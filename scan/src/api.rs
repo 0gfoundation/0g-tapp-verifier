@@ -748,10 +748,9 @@ async fn verify(
     if let Err(r) = charge_caller_for(&state, &verify_state, &headers, peer, QuotaLane::Read).await {
         return r;
     }
-    let latest_block = match resolve_current_target(&state, &app_id, &signer).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
+    if let Err(r) = resolve_current_target(&state, &app_id, &signer).await {
+        return r;
+    }
     let scanner = state.read().await.scanner.clone();
 
     // A refresh queues for an observation started after this snapshot. Requests
@@ -779,8 +778,12 @@ async fn verify(
         }
     };
 
-    {
+    let latest_block = {
         let s = state.read().await;
+        // A registry sync can learn a real app event while this caller waits
+        // for the gate. Read its cursor with the store entry, after waiting, so
+        // an older observation cannot satisfy that newly known app state.
+        let latest_block = s.registry.timeline(&app_id).latest_block();
         if let Some(entry) = s.store.get(&app_id, &signer) {
             // A result stored before the TD's DEBUG attribute was recorded cannot be
             // judged, so it is attested again now rather than answered "not verified"
@@ -794,7 +797,8 @@ async fn verify(
                 return verdict_response(&s, entry, true, registered_at, scope_block);
             }
         }
-    }
+        latest_block
+    };
 
     // Only the single-flight leader that actually needs a new attestation
     // spends the cold budget. Cached replies and waiters share its result.
@@ -1944,6 +1948,40 @@ mod tests {
     async fn response_json(response: Response) -> serde_json::Value {
         assert_eq!(response.status(),StatusCode::OK);
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn queued_requests_share_a_new_observation_after_the_app_event_cursor_advances() {
+        let fixture = RefreshFixture::new(false).await;
+        let flight = fixture.flight().await;
+        let guard = flight.gate.lock().await;
+        let requests: Vec<_> = (0..12).map(|_| fixture.call(false)).collect();
+        RefreshFixture::wait_for_queued(&flight, 12).await;
+        // Background sync learns a real app update while these requests wait.
+        // The signer remains a live member of the same registration instance.
+        fixture.state.write().await.registry.events.push(chain::AppEvent {
+            block: 2, log_index: 0, tx: String::new(),
+            app_hash: format!("0x{}", hex::encode(ethers::utils::keccak256("mine"))),
+            event: chain::Event::AppUpdated { ack_version: 2, compose: "new-compose".into(),
+                volumes: String::new(), images: vec![] },
+        });
+        drop(guard);
+        let mut new_results = 0;
+        for request in requests {
+            let body = response_json(request.await.unwrap()).await;
+            assert_eq!(body["verified"], true);
+            assert_eq!(body["status"]["app_latest_block"], 2);
+            if body["cached"] == false { new_results += 1; }
+        }
+        assert_eq!(new_results, 1);
+        assert_eq!(fixture.evidence.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.scope_reads.load(Ordering::SeqCst), 13); // 12 pre + leader post
+        assert_eq!(flight.published_generation.load(Ordering::Acquire), 1);
+        let state = fixture.state.read().await;
+        let quota = state.verify.quota.lock().await;
+        assert_eq!(quota["read:ip:10.1.1.1"].count, 12);
+        assert_eq!(quota["cold:ip:10.1.1.1"].count, 1);
     }
 
     #[tokio::test]
