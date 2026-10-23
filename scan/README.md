@@ -382,8 +382,9 @@ identity:
    Cache invalidation tracks the app's cached event cursor, so unrelated new
    blocks do not force repeated attestations while the registry catches up.
    Every reply still checks the live registration epoch and node membership.
-3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
-   own fan-out) protects this service, the AS and the nodes. Over capacity is
+3. **An on-demand concurrency cap** (sized by `--concurrency`, separately from
+   the background refresh pool) protects this service, the AS and the nodes.
+   Background work cannot consume the on-demand pool. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.
 
 An API key (`Authorization: Bearer` or `x-api-key`, the same keys
