@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use tokio::sync::RwLock;
 
 use crate::{chain, keys, status};
@@ -101,6 +101,15 @@ enum QuotaLane {
     Cold,
 }
 
+/// A refresh must observe a round which STARTED after it queued, not merely one
+/// which finished later: an older in-flight quote may predate the new metadata.
+#[derive(Default)]
+struct TargetFlight {
+    gate: tokio::sync::Mutex<()>,
+    started_generation: AtomicU64,
+    published_generation: AtomicU64,
+}
+
 fn count_in_lane(
     windows: &mut HashMap<String, Window>,
     caller: &str,
@@ -132,10 +141,10 @@ pub struct VerifyState {
     /// connect timeout on every call, and its timing would tell refused from filtered.
     unreachable: tokio::sync::Mutex<HashMap<String, i64>>,
     /// Single-flight per (app_id, signer): concurrent requests for one target
-    /// serialise on its lock, and the latecomers find the fresh result inside
-    /// the cooldown instead of repeating the work. Entries are only created for
+    /// serialise on its lock, and the latecomers share the new observation even
+    /// when asking for a refresh. Entries are only created for
     /// targets the chain knows, so the map is bounded by the registry.
-    targets: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    targets: tokio::sync::Mutex<HashMap<String, Arc<TargetFlight>>>,
     /// Request counters per caller, pruned as windows expire.
     quota: tokio::sync::Mutex<HashMap<String, Window>>,
     /// When this process started. A stored result without the TD's DEBUG attribute is
@@ -698,6 +707,9 @@ async fn app_events(
 struct VerifyRequest {
     app_id: String,
     signer: String,
+    /// Fetch a new observation after local identity metadata has been published.
+    #[serde(default)]
+    refresh: bool,
 }
 
 /// Attest one node now and return the verdict — for consumers whose decision
@@ -707,8 +719,8 @@ struct VerifyRequest {
 ///
 /// Public by design. What keeps that safe is structural, not caller identity:
 ///
-/// 1. a fresh result inside [`VERIFY_COOLDOWN_SECS`] is returned as-is, and
-///    concurrent requests for one target single-flight into one attestation;
+/// 1. a fresh result inside [`VERIFY_COOLDOWN_SECS`] is normally returned as-is;
+///    explicit refreshes and cache misses single-flight into new attestations;
 /// 2. the target must be a CURRENT node of the app on chain, and its teeUrl is
 ///    read from the chain — a URL in the request would be an SSRF primitive, so
 ///    there is none, and unregistered targets are refused before any fetch;
@@ -737,16 +749,17 @@ async fn verify(
     };
     let scanner = state.read().await.scanner.clone();
 
-    // Single-flight: whoever holds the target's lock does the work; the others
-    // wait here and then hit the cooldown check below.
+    // A refresh queues for an observation started after this snapshot. Requests
+    // sharing the snapshot share that next round, including its negative result.
     let flight = {
         let mut targets = verify_state.targets.lock().await;
         targets
             .entry(format!("{app_id}|{signer}"))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| Arc::new(TargetFlight::default()))
             .clone()
     };
-    let _flight = flight.lock().await;
+    let observed_generation = flight.started_generation.load(Ordering::Acquire);
+    let _flight = flight.gate.lock().await;
     // Read scope after waiting for the target lock, so a concurrent verifier
     // cannot leave this request using membership read before a long wait.
     let (registered_at, scope_block) = match scanner.identity_scope_at_head(&app_id, &signer).await {
@@ -764,7 +777,9 @@ async fn verify(
             // A result stored before the TD's DEBUG attribute was recorded cannot be
             // judged, so it is attested again now rather than answered "not verified"
             // until the cooldown runs out — which a gate would take as a refusal.
-            if entry.age_secs(now()) < VERIFY_COOLDOWN_SECS
+            let refreshed = flight.published_generation.load(Ordering::Acquire) > observed_generation;
+            if (!req.refresh || refreshed)
+                && entry.age_secs(now()) < VERIFY_COOLDOWN_SECS
                 && entry.app_latest_block >= latest_block
                 && entry.registered_at == Some(registered_at)
                 && !predates_debug_attribute(entry, verify_state.started_at)
@@ -787,6 +802,7 @@ async fn verify(
         let s = state.read().await;
         (s.scanner.clone(), s.as_endpoint.clone(), s.ref_sets.clone())
     };
+    let generation = flight.started_generation.fetch_add(1, Ordering::AcqRel) + 1;
     let mut entry =
         crate::attest_one(&scanner, &app_id, &signer, latest_block, &as_endpoint, &ref_sets).await;
     // The quote was fetched after the first scope read. Re-read current
@@ -806,6 +822,7 @@ async fn verify(
     // lost on-demand result is regenerated by the next request.
     let mut s = state.write().await;
     s.store.put(entry.clone());
+    flight.published_generation.store(generation, Ordering::Release);
     let s = s.downgrade();
     verdict_response(&s, &entry, false, registered_at, scope_block)
 }
@@ -1652,6 +1669,311 @@ mod tests {
         assert!(count_in_lane(&mut windows,"ip:1.2.3.4",false,QuotaLane::Cold,1060).is_ok());
     }
 
+    #[test]
+    fn verify_refresh_is_optional_and_must_be_a_boolean() {
+        let target = json!({"app_id":"mine","signer":"0x01"});
+        assert!(!serde_json::from_value::<VerifyRequest>(target.clone()).unwrap().refresh);
+        let mut refresh = target;
+        refresh["refresh"] = json!(true);
+        assert!(serde_json::from_value::<VerifyRequest>(refresh.clone()).unwrap().refresh);
+        refresh["refresh"] = json!("true");
+        assert!(serde_json::from_value::<VerifyRequest>(refresh).is_err());
+    }
+
+    // Exercise the real HTTP/RPC/nonce/AS path. Only the chain, node and AS are
+    // fixtures; no test-only attestation hook bypasses the production handler.
+    #[derive(Clone)]
+    struct RefreshEvidence {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        nonces: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+        signer: String,
+    }
+
+    impl tonic::server::UnaryService<crate::attest::tapp::GetEvidenceRequest> for RefreshEvidence {
+        type Response = crate::attest::tapp::GetEvidenceResponse;
+        type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<Self::Response>, tonic::Status>> + Send>>;
+
+        fn call(&mut self, request: tonic::Request<crate::attest::tapp::GetEvidenceRequest>) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                let request = request.into_inner();
+                assert_eq!(request.app_id, "mine");
+                assert_eq!(request.nonce.len(), 32);
+                let round = this.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                this.nonces.lock().await.push(request.nonce.clone());
+                let runtime = serde_json::to_vec(&json!({
+                    "app_id":"mine", "signer":this.signer,
+                    "nonce":format!("0x{}",hex::encode(request.nonce)),
+                    "tls_public_key":format!("0x{}",format!("{round:02x}").repeat(32)),
+                })).unwrap();
+                Ok(tonic::Response::new(crate::attest::tapp::GetEvidenceResponse {
+                    success:true, message:String::new(), tee_type:"tdx".into(), timestamp:now(),
+                    evidence:serde_json::to_vec(&json!({
+                        "runtime_data":base64::engine::general_purpose::STANDARD.encode(runtime),
+                        "quote":"fixture verified by the mock AS", "cc_eventlog":"fixture",
+                    })).unwrap(),
+                }))
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RefreshAs {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        first_entered: Arc<tokio::sync::Semaphore>,
+        release_first: Option<Arc<tokio::sync::Semaphore>>,
+    }
+
+    impl tonic::server::UnaryService<crate::attest::as_proto::AttestationRequest> for RefreshAs {
+        type Response = crate::attest::as_proto::AttestationResponse;
+        type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<tonic::Response<Self::Response>, tonic::Status>> + Send>>;
+
+        fn call(&mut self, request: tonic::Request<crate::attest::as_proto::AttestationRequest>) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                use sha2::Digest;
+                let round = this.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let request = request.into_inner();
+                assert!(request.policy_ids.is_empty());
+                let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&request.verification_requests[0].evidence).unwrap();
+                let evidence: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                let runtime = base64::engine::general_purpose::STANDARD
+                    .decode(evidence["runtime_data"].as_str().unwrap()).unwrap();
+                // The quote has been fetched before this pause: a refresh which
+                // arrives now must not share this older in-flight observation.
+                if round == 1 {
+                    this.first_entered.add_permits(1);
+                    if let Some(release) = this.release_first {
+                        release.acquire().await.unwrap().forget();
+                    }
+                }
+                let claims = json!({"submods":{"cpu0":{
+                    "ear.status":"affirming", "ear.veraison.annotated-evidence":{"tdx":{
+                        "quote":{"body":{"reportdata":hex::encode(sha2::Sha512::digest(runtime))}},
+                        "td_attributes":{"debug":false}, "tcb_status":"UpToDate", "advisory_ids":[],
+                        "uefi_event_logs":[{"type_name":"EV_EFI_BOOT_SERVICES_APPLICATION",
+                            "digests":[{"alg":"SHA-384","digest":"u-digest"}]}],
+                    }}
+                }}});
+                Ok(tonic::Response::new(crate::attest::as_proto::AttestationResponse {
+                    attestation_token:format!("e30.{}.fixture",base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::to_vec(&claims).unwrap())),
+                }))
+            })
+        }
+    }
+
+    struct RefreshFixture {
+        state: AppState,
+        signer: String,
+        peer: SocketAddr,
+        epoch: Arc<AtomicU64>,
+        scope_reads: Arc<std::sync::atomic::AtomicUsize>,
+        evidence: RefreshEvidence,
+        attestation: RefreshAs,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for RefreshFixture {
+        fn drop(&mut self) { for server in &self.servers { server.abort(); } }
+    }
+
+    impl RefreshFixture {
+        async fn new(pause_first_as: bool) -> Self {
+            use ethers::{abi::{encode, Token}, types::Address};
+            let signer = format!("{:#x}",Address::from_low_u64_be(1));
+            let evidence = RefreshEvidence { calls:Default::default(), nonces:Default::default(), signer:signer.clone() };
+            let evidence_service = evidence.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tee_url = format!("http://{}",listener.local_addr().unwrap());
+            let node = tokio::spawn(async move {
+                let router = Router::new().route("/tapp_service.TappService/GetEvidence",post(move |request:axum::extract::Request| {
+                    let service = evidence_service.clone();
+                    async move { tonic::server::Grpc::new(tonic::codec::ProstCodec::default()).unary(service,request).await }
+                }));
+                axum::serve(listener,router).await.unwrap();
+            });
+            let attestation = RefreshAs {
+                calls:Default::default(), first_entered:Arc::new(tokio::sync::Semaphore::new(0)),
+                release_first:pause_first_as.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+            };
+            let as_service = attestation.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let as_endpoint = listener.local_addr().unwrap().to_string();
+            let as_server = tokio::spawn(async move {
+                let router = Router::new().route("/attestation.AttestationService/AttestationEvaluate",post(move |request:axum::extract::Request| {
+                    let service = as_service.clone();
+                    async move { tonic::server::Grpc::new(tonic::codec::ProstCodec::default()).unary(service,request).await }
+                }));
+                axum::serve(listener,router).await.unwrap();
+            });
+            let epoch = Arc::new(AtomicU64::new(1234));
+            let scope_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let rpc_epoch = epoch.clone();
+            let rpc_reads = scope_reads.clone();
+            let app_selector = format!("0x{}",hex::encode(&ethers::utils::keccak256("getAppInfo(string)")[..4]));
+            let node_selector = format!("0x{}",hex::encode(&ethers::utils::keccak256("getNode(string,address)")[..4]));
+            let handler = move |Json(request):Json<serde_json::Value>| {
+                let (epoch, reads, tee_url, app_selector, node_selector) =
+                    (rpc_epoch.clone(),rpc_reads.clone(),tee_url.clone(),app_selector.clone(),node_selector.clone());
+                async move {
+                    let result = if request["method"] == "eth_blockNumber" { "0x2a".into() }
+                    else {
+                        let data = request["params"][0]["data"].as_str().unwrap();
+                        let tokens = if data.starts_with(&app_selector) {
+                            reads.fetch_add(1,Ordering::SeqCst);
+                            vec![Token::Tuple(vec![Token::Bytes(vec![]),Token::Bytes(vec![]),Token::Array(vec![]),
+                                Token::Address(Address::from_low_u64_be(9)),Token::Uint(epoch.load(Ordering::SeqCst).into())])]
+                        } else if data.starts_with(&node_selector) {
+                            vec![Token::Tuple(vec![Token::String(tee_url),Token::Uint(1.into()),Token::Uint(1.into()),Token::Bytes(vec![]),Token::Bytes(vec![])])]
+                        } else { vec![Token::Array(vec![Token::Address(Address::from_low_u64_be(1))])] };
+                        format!("0x{}",hex::encode(encode(&tokens)))
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rpc = format!("http://{}",listener.local_addr().unwrap());
+            let rpc_server = tokio::spawn(async move { axum::serve(listener,Router::new().route("/",post(handler))).await.unwrap() });
+            let contract = format!("{:#x}",Address::from_low_u64_be(8));
+            let registry = chain::Registry {
+                chain_id:16602,contract:contract.clone(),scanned_to:42,app_ids:BTreeMap::new(),
+                events:vec![chain::AppEvent { block:1,log_index:0,tx:String::new(),
+                    app_hash:format!("0x{}",hex::encode(ethers::utils::keccak256("mine"))),
+                    event:chain::Event::NodeAdded{signer:signer.clone(),ack_version:1} }],
+            };
+            let mut entry = good_entry();
+            entry.signer = signer.clone(); entry.checked_at = now(); entry.registered_at = Some(1234);
+            entry.attested.as_mut().unwrap().attested_signer = Some(signer.clone());
+            let mut store = status::Store::default(); store.put(entry);
+            let state = Arc::new(RwLock::new(Shared {
+                registry,store,balances:BTreeMap::new(),rpc_url:rpc.clone(),api_keys:Default::default(),keys_path:Default::default(),
+                admin:None,spent:BTreeMap::new(),authz_secret:None,ref_sets:Arc::new(matching_set()),
+                refs_from:crate::refsource::Provenance{source:"test".into(),tree:None,fetched_at:Some(now()),sets:BTreeMap::new(),error:None},
+                refreshed_at:now(),scanner:Arc::new(chain::Scanner::new(&rpc,&contract,0,Default::default()).unwrap()),
+                as_endpoint,verify:Arc::new(VerifyState::new(1)),accept_dev:false,
+            }));
+            Self { state,signer,peer:"10.1.1.1:1234".parse().unwrap(),epoch,scope_reads,evidence,attestation,
+                servers:vec![node,as_server,rpc_server] }
+        }
+
+        async fn flight(&self) -> Arc<TargetFlight> {
+            self.state.read().await.verify.targets.lock().await
+                .entry(format!("mine|{}",self.signer)).or_default().clone()
+        }
+
+        fn call(&self, refresh: bool) -> tokio::task::JoinHandle<Response> {
+            let (state,peer,signer) = (self.state.clone(),self.peer,self.signer.clone());
+            tokio::spawn(async move { verify(State(state),ConnectInfo(peer),HeaderMap::new(),
+                Json(VerifyRequest{app_id:"mine".into(),signer,refresh})).await })
+        }
+
+        async fn wait_for_queued(flight: &Arc<TargetFlight>, handlers: usize) {
+            // The map, caller and each handler own an Arc. With the gate held,
+            // every handler has taken its generation snapshot before yielding.
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                while Arc::strong_count(flight) < handlers + 2 { tokio::task::yield_now().await; }
+            }).await.expect("refresh requests did not reach the target gate");
+        }
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        assert_eq!(response.status(),StatusCode::OK);
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_share_one_new_quote_and_as_verification() {
+        let fixture = RefreshFixture::new(false).await;
+        let flight = fixture.flight().await;
+        let guard = flight.gate.lock().await;
+        let requests:Vec<_> = (0..12).map(|_| fixture.call(true)).collect();
+        RefreshFixture::wait_for_queued(&flight,12).await;
+        drop(guard);
+        let mut new_results = 0;
+        for request in requests {
+            let body = response_json(request.await.unwrap()).await;
+            assert_eq!(body["verified"],true);
+            assert_eq!(body["status"]["attested"]["fresh"],true);
+            assert_eq!(body["status"]["attested"]["tls_public_key"],format!("0x{}","01".repeat(32)));
+            if body["cached"] == false { new_results += 1; }
+        }
+        assert_eq!(new_results,1);
+        assert_eq!(fixture.evidence.calls.load(Ordering::SeqCst),1);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst),1);
+        assert_eq!(fixture.scope_reads.load(Ordering::SeqCst),13); // 12 pre + leader post
+        assert_eq!(flight.published_generation.load(Ordering::Acquire),1);
+        let body = response_json(fixture.call(false).await.unwrap()).await;
+        assert_eq!(body["cached"],true);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst),1);
+        let state = fixture.state.read().await;
+        let quota = state.verify.quota.lock().await;
+        assert_eq!(quota["read:ip:10.1.1.1"].count,13);
+        assert_eq!(quota["cold:ip:10.1.1.1"].count,1);
+    }
+
+    #[tokio::test]
+    async fn refresh_after_an_older_quote_was_fetched_starts_one_followup_round() {
+        let fixture = RefreshFixture::new(true).await;
+        let first = fixture.call(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5),fixture.attestation.first_entered.acquire()).await.unwrap().unwrap().forget();
+        let flight = fixture.flight().await;
+        assert_eq!(flight.started_generation.load(Ordering::Acquire),1);
+        let requests:Vec<_> = (0..4).map(|_| fixture.call(true)).collect();
+        RefreshFixture::wait_for_queued(&flight,5).await; // first round + four waiters
+        fixture.attestation.release_first.as_ref().unwrap().add_permits(1);
+        let first = response_json(first.await.unwrap()).await;
+        assert_eq!(first["status"]["attested"]["tls_public_key"],format!("0x{}","01".repeat(32)));
+        let mut new_results = 0;
+        for request in requests {
+            let body = response_json(request.await.unwrap()).await;
+            assert_eq!(body["status"]["attested"]["tls_public_key"],format!("0x{}","02".repeat(32)));
+            if body["cached"] == false { new_results += 1; }
+        }
+        assert_eq!(new_results,1);
+        assert_eq!(fixture.evidence.calls.load(Ordering::SeqCst),2);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst),2);
+        let nonces = fixture.evidence.nonces.lock().await;
+        assert_ne!(nonces[0],nonces[1]);
+    }
+
+    #[tokio::test]
+    async fn refresh_cannot_bypass_cold_quota_even_with_a_fresh_cached_result() {
+        let fixture = RefreshFixture::new(false).await;
+        {
+            let state = fixture.state.read().await;
+            let mut quota = state.verify.quota.lock().await;
+            for _ in 0..ANON_PER_WINDOW { count_in_lane(&mut quota,"ip:10.1.1.1",false,QuotaLane::Cold,now()).unwrap(); }
+        }
+        assert_eq!(fixture.call(true).await.unwrap().status(),StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst),0);
+        assert_eq!(fixture.scope_reads.load(Ordering::SeqCst),1);
+        let flight = fixture.flight().await;
+        assert_eq!(flight.started_generation.load(Ordering::Acquire),0);
+        assert_eq!(flight.published_generation.load(Ordering::Acquire),0);
+        assert_eq!(response_json(fixture.call(false).await.unwrap()).await["cached"],true);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_whose_epoch_changes_does_not_publish_or_replace_the_cached_result() {
+        let fixture = RefreshFixture::new(true).await;
+        let first = fixture.call(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5),fixture.attestation.first_entered.acquire()).await.unwrap().unwrap().forget();
+        fixture.epoch.store(1235,Ordering::SeqCst);
+        fixture.attestation.release_first.as_ref().unwrap().add_permits(1);
+        assert_eq!(first.await.unwrap().status(),StatusCode::CONFLICT);
+        let flight = fixture.flight().await;
+        assert_eq!(flight.started_generation.load(Ordering::Acquire),1);
+        assert_eq!(flight.published_generation.load(Ordering::Acquire),0);
+        assert_eq!(fixture.state.read().await.store.get("mine",&fixture.signer).unwrap().registered_at,Some(1234));
+        // Neither the old epoch's cache nor the rejected round is shared.
+        let body = response_json(fixture.call(true).await.unwrap()).await;
+        assert_eq!(body["cached"],false);
+        assert_eq!(body["scope"]["registered_at"],1235);
+        assert_eq!(fixture.attestation.calls.load(Ordering::SeqCst),2);
+    }
+
     #[tokio::test]
     async fn cached_verify_handler_does_not_charge_the_exhausted_cold_lane() {
         use ethers::abi::{encode, Token};
@@ -1704,7 +2026,7 @@ mod tests {
             as_endpoint:"127.0.0.1:1".into(),verify:verify_state.clone(),accept_dev:false,
         }));
         for _ in 0..12 {
-            let response=verify(State(state.clone()),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer:signer.clone()})).await;
+            let response=verify(State(state.clone()),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer:signer.clone(),refresh:false})).await;
             assert_eq!(response.status(),StatusCode::OK);
         }
         assert_eq!(scope_reads.load(std::sync::atomic::Ordering::Relaxed),24);
@@ -1715,7 +2037,7 @@ mod tests {
         }
         let mut expired=good_entry(); expired.signer=signer.clone(); expired.checked_at=now()-VERIFY_COOLDOWN_SECS; expired.registered_at=Some(1234);
         state.write().await.store.put(expired);
-        let response=verify(State(state),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer})).await;
+        let response=verify(State(state),ConnectInfo(peer),HeaderMap::new(),Json(VerifyRequest{app_id:"mine".into(),signer,refresh:false})).await;
         assert_eq!(response.status(),StatusCode::TOO_MANY_REQUESTS);
         server.abort();
     }

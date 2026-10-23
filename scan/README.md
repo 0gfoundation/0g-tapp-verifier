@@ -304,6 +304,21 @@ curl -s -X POST https://scan/api/verify \
 (`/verify` is mounted too, so a consumer configured with a base URL of the bare
 host works the same as one ending in `/api`.)
 
+`refresh` is an optional boolean, default `false`. Once an app has acquired its
+signing/TLS keys and published their measured metadata, a caller can request a
+new observation instead of waiting for the earlier, incomplete one to expire:
+
+```json
+{"app_id":"my-app","signer":"0x…","refresh":true}
+```
+
+Scan still generates its own nonce, pulls `GetEvidence`, and runs the same AS,
+runtime-data, registration-epoch and membership checks. The request does not
+attach evidence or cause the target to acquire a key. Missing metadata after a
+refresh still means that the target has not supplied an accepted declaration;
+repeated refreshes cannot create one. Refresh after the required identities are
+ready, rather than after every generic secret retrieval.
+
 An admission gate needs exactly three things, and they are top-level:
 the **HTTP status** (200 = a verdict about the node; **503** = *this service*
 could not establish anything — chain RPC or AS trouble — which a consumer must
@@ -333,8 +348,13 @@ The endpoint is **public**. What keeps that safe is structural, not caller
 identity:
 
 1. **Per-target cooldown + single-flight.** A result younger than 60s answers
-   repeats as-is, and concurrent requests for one target collapse into one
-   attestation. The forcing scenario: a node reboots with a new signer, all five
+   ordinary requests as-is. Concurrent refreshes queued against the same old
+   observation share one new round; each waiter still checks the live epoch and
+   membership, and the shared result must satisfy the normal TTL and scope
+   checks. A refresh arriving after an older round has already started waits for
+   a subsequent round: that older quote may predate the new metadata even if its
+   AS evaluation finishes later. Only a result published after the final scope
+   check can satisfy the waiting refreshes. The forcing scenario: a node reboots with a new signer, all five
    KMS nodes notice at once — one quote generation must serve all five, not five
    concurrent ones hitting a node that just came up. The one exception is a result
    stored by an earlier version, before the TD's DEBUG attribute was recorded: it
@@ -363,7 +383,9 @@ warming its cache after a restart may verify tens of signers quickly). Every
 they still recheck live registration epoch and membership. Only the leader that
 needs new attestation spends cold budget, so many workloads sharing a NAT can
 reuse one verified app result without increasing AS traffic. Relays retain the
-cold-work budget because each request fetches from the node. The key
+cold-work budget because each request fetches from the node. An explicit refresh
+uses that same cold budget and concurrency cap; `refresh: true` does not bypass
+either. The key
 is **not a security boundary**: all authorisation lives in the three limits
 above, a stolen key yields nothing but quota, so it may sit in plaintext config
 and be rotated freely.
