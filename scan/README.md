@@ -57,11 +57,12 @@ boot-chain comparison happens here. That means:
 
 ## Reading the output honestly
 
-- Every result is **as of** a timestamp — and only that. Evidence carries no
-  challenge ([0g-tapp#76](https://github.com/0gfoundation/0g-tapp/issues/76)), so
-  it is replayable: "as of" means "when we received a blob claiming this", not
-  "when the node was in this state". A node may also have restarted since, which
-  re-derives its signer and resets its RTMRs.
+- Every result is **as of** a timestamp. Scan sends a fresh random challenge
+  when obtaining evidence and checks its quote-bound echo before accepting typed
+  identities. `fresh: true` records that check; older evidence formats remain
+  visible with `fresh: null`, but yield no typed identity. A cached result can
+  describe a node that has since changed, so machine consumers also check its
+  expiry and current on-chain registration scope.
 - **Platform TCB is reported, never a reason to fail.** Host firmware belongs to
   the cloud provider, not the app's owner, and providers take Intel's updates on
   their own schedule — every node measured so far reports `OutOfDate`, so failing
@@ -116,20 +117,17 @@ can reach it can overwrite any policy id, and an EAR token records only which
 policy id was used — never a hash of it — so a client cannot detect a swap.
 
 One tappscan process watches one chain (`TAPPSCAN_RPC` / `TAPPSCAN_CONTRACT` /
-`TAPPSCAN_FROM_BLOCK`, with their own cache files). The UI's testnet/mainnet
-switch expects a second instance for the other network proxied under `/mainnet`
-on the same host; the choice travels in `?net=mainnet` so links stay shareable.
-The proxy must STRIP the prefix (the server's routes are `/` and `/api/*`) —
-nginx does that with a trailing slash on `proxy_pass`:
+`TAPPSCAN_FROM_BLOCK`, with their own cache files), and its page shows that chain
+only: deploy one instance per network, each on its own host. The network label
+follows `/api/health`'s `chain_id`, not the URL.
+
+The page calls its API relative to its own URL, so an instance also works behind
+a reverse proxy under a prefix, provided the proxy STRIPS it (the server's routes
+are `/` and `/api/*`) — nginx does that with a trailing slash on `proxy_pass`:
 
 ```nginx
 location /mainnet/ { proxy_pass http://tappscan-mainnet:9090/; }
 ```
-
-Two misconfigurations to avoid: a proxy that does not strip (everything under
-`/mainnet` 404s), and publishing the second instance's own port directly — the
-page still works there (the network pill follows `/api/health`'s `chain_id`,
-not the URL), but prefer one front so links mean one thing.
 
 Point `TAPPSCAN_REFVALUES_HOST` at a checkout of
 [`0g-tapp`](https://github.com/0gfoundation/0g-tapp)'s `verifier/reference-values`,
@@ -197,6 +195,87 @@ endpoints, bounded as described in their own sections below.
 | `GET /api/apps/:app_id/nodes/:signer/evidence` | the node's evidence, fetched now · `nonce` (hex, ≤ 64 bytes) |
 | `GET /api/apps/:app_id/nodes/:signer/info` | the node's `GetTappInfo`, fetched now; not attested |
 
+### Authenticated app identities
+
+Available from tappscan 0.5.0.
+
+`POST /api/verify` additionally returns `scope` containing `chain_id`,
+`registry_address`, `app_id`, and the contract's current `registered_at` epoch.
+`scope_block` identifies the exact block used to read both `getAppInfo` and
+`getNodeList`. Scan checks this membership and epoch again after obtaining the
+quote; a registration change returns 409, and a chain-read failure returns 503.
+An old cached result is never attached to a newly registered app instance.
+
+`checked_at` is the start of Scan's observation, before fetching the quote and
+evaluating it with the AS. `expires_at` is `checked_at + 300` seconds: the identity
+acceptance window includes that work and is never extended when verification
+finishes. The separate 60-second cache cooldown starts at `status.completed_at`,
+when Scan finishes verification (including its final scope check). It controls
+when an ordinary request must obtain a new observation; it is not the identity
+lease. Older caches without a completion time fall back to `checked_at`. Thus a
+verification that takes 90 seconds can still return an accepted identity, while a result aged
+300 seconds cannot. Neither window promises that the remote process cannot
+change during that time. A consumer must validate the scope and expiry, then
+require both `verified` and `identities_verified`. The existing
+`verified` node verdict keeps its earlier meaning; a legacy node may pass that
+verdict while supplying no authenticated app signer.
+
+Accepted metadata is returned under `status.attested`:
+
+```json
+{
+  "fresh": true,
+  "identities": [{
+    "algorithm": "ecdsa-secp256k1",
+    "derivation": "raw-scalar-v1",
+    "key_ref": {
+      "commitment": "0x<32-byte-canonical-BN254-field-element>",
+      "material": "70726f7669646572",
+      "scheme": "poseidon-bn254-4-v1"
+    },
+    "key_source": "kms",
+    "public_key": "0x<33-byte-compressed-SEC1-point>",
+    "public_key_encoding": "sec1-compressed",
+    "role": "app_signer"
+  }],
+  "key_commitments": [],
+  "app_signer": "0x<address-derived-from-app-public-key>",
+  "identities_error": null
+}
+```
+
+The fragment shows one identity; a valid complete declaration also contains its
+`node_signer` and any TLS identity, and `key_commitments` contains every referenced
+KMS commitment. Known roles are `node_signer` and `app_signer` with algorithm
+`ecdsa-secp256k1`, and `tls` with `ecdsa-p256`. All points use canonical compressed
+SEC1 encoding. Scan derives the node address and checks it against the legacy
+quote signer, and derives canonical P-256 SPKI DER before checking the TLS
+SHA-256 against legacy `tls_public_key`. KMS app signer and TLS identities use
+materials `70726f7669646572` (`provider`) and `746c73` (`tls`) respectively.
+
+New `runtime_data` is accepted only after its original bytes hash to the verified
+quote's report data and its `app_id` matches the request. Each KMS `key_ref` must
+match both `runtime_data.key_commitments` and a replayed `get_secret_resource`
+event for the same app and material; that event must declare the same identity.
+Duplicate roles, conflicting material commitments, invalid curves or encodings,
+and mismatched addresses or TLS fingerprints yield no accepted typed metadata.
+On `/verify`, failed node policy likewise clears the typed metadata. Read-only
+app detail remains an observation cache, not an admission decision.
+
+These checks authenticate a trusted tapp declaration that a secret commitment
+and public key belong together. They do not verify an external ZK proof of that
+relation; none is claimed or synthesized. Public extension fields are ignored
+and cannot populate authenticated identity fields. The legacy `signer` and TLS
+display remain available when new metadata is absent. `/cert` remains a pin
+convenience endpoint without a scope or expiry; app identity consumers use the
+structured verification response above.
+
+`status.attested.identities_unchecked` counts commitments for which no matching
+successful measured acquisition records `kms_attested: true`. This includes TLS
+and generic KMS secrets. Such provenance remains visible in `/verify` warnings;
+an authenticated tapp declaration alone does not assert that its upstream KMS
+connection was authenticated.
+
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
 expensive attestation once, and any client can then reach a TEE serving the app
@@ -232,6 +311,21 @@ curl -s -X POST https://scan/api/verify \
 (`/verify` is mounted too, so a consumer configured with a base URL of the bare
 host works the same as one ending in `/api`.)
 
+`refresh` is an optional boolean, default `false`. Once an app has acquired its
+signing/TLS keys and published their measured metadata, a caller can request a
+new observation instead of waiting for the earlier, incomplete one to expire:
+
+```json
+{"app_id":"my-app","signer":"0x…","refresh":true}
+```
+
+Scan still generates its own nonce, pulls `GetEvidence`, and runs the same AS,
+runtime-data, registration-epoch and membership checks. The request does not
+attach evidence or cause the target to acquire a key. Missing metadata after a
+refresh still means that the target has not supplied an accepted declaration;
+repeated refreshes cannot create one. Refresh after the required identities are
+ready, rather than after every generic secret retrieval.
+
 An admission gate needs exactly three things, and they are top-level:
 the **HTTP status** (200 = a verdict about the node; **503** = *this service*
 could not establish anything — chain RPC or AS trouble — which a consumer must
@@ -260,9 +354,19 @@ verdict was reached against.
 The endpoint is **public**. What keeps that safe is structural, not caller
 identity:
 
-1. **Per-target cooldown + single-flight.** A result younger than 60s answers
-   repeats as-is, and concurrent requests for one target collapse into one
-   attestation. The forcing scenario: a node reboots with a new signer, all five
+1. **Per-target cooldown + single-flight.** For 60 seconds after completing
+   verification, a result answers ordinary requests as-is, while its original
+   300-second identity lease remains valid. Concurrent refreshes queued against
+   the same old observation share one new round; each waiter still checks the live epoch and
+   membership, and the shared result must satisfy the 300-second identity
+   acceptance window and scope checks. A round published while ordinary callers
+   wait may also serve those callers within that window, even if verification
+   took longer than 60 seconds. Ordinary requests arriving after publication
+   still use the 60-second completion cooldown and obtain a new observation once
+   it has elapsed; completion never extends the identity lease. A refresh arriving
+   after an older round has already started waits for a subsequent round: that older quote may predate the new metadata even if its
+   AS evaluation finishes later. Only a result published after the final scope
+   check can satisfy the waiting refreshes. The forcing scenario: a node reboots with a new signer, all five
    KMS nodes notice at once — one quote generation must serve all five, not five
    concurrent ones hitting a node that just came up. The one exception is a result
    stored by an earlier version, before the TD's DEBUG attribute was recorded: it
@@ -278,14 +382,26 @@ identity:
    the registry catches up on its own schedule. The call runs at `latest` (a
    load-balanced RPC may not serve a just-read block number yet) and a failure is
    retried once; if it still fails, the answer is 503, not 404.
-3. **A global concurrency cap** (`--concurrency`, shared with the refresh loop's
-   own fan-out) protects this service, the AS and the nodes. Over capacity is
+   Cache invalidation tracks the app's cached event cursor, so unrelated new
+   blocks do not force repeated attestations while the registry catches up.
+   Every reply still checks the live registration epoch and node membership.
+3. **An on-demand concurrency cap** (sized by `--concurrency`, separately from
+   the background refresh pool) protects this service, the AS and the nodes.
+   Background work cannot consume the on-demand pool. Over capacity is
    `429` + `Retry-After`, not an unbounded queue.
 
 An API key (`Authorization: Bearer` or `x-api-key`, the same keys
 [`as-key.sh`](as-key.sh) issues) only selects a bigger request quota — anonymous
-callers are metered per IP at 6/min, key holders at 60/min (a KMS node warming
-its cache after a restart may need to verify tens of signers quickly). The key
+callers have a cold-work budget of 6/min per IP, key holders 60/min (a KMS node
+warming its cache after a restart may verify tens of signers quickly). Every
+`/verify` request also spends a separate, bounded read budget: 600/min per IP or
+6000/min per key. Cache hits and single-flight waiters do not spend cold budget;
+they still recheck live registration epoch and membership. Only the leader that
+needs new attestation spends cold budget, so many workloads sharing a NAT can
+reuse one verified app result without increasing AS traffic. Relays retain the
+cold-work budget because each request fetches from the node. An explicit refresh
+uses that same cold budget and concurrency cap; `refresh: true` does not bypass
+either. The key
 is **not a security boundary**: all authorisation lives in the three limits
 above, a stolen key yields nothing but quota, so it may sit in plaintext config
 and be rotated freely.
