@@ -492,7 +492,7 @@ async function showApp(appId) {
         ${appBal != null && isZero(appBal)
           ? `${pill('warn', 'no gas')} <span class="dim">this address cannot send the app's transactions</span>`
           : ''}</p>
-      ${appSigner ? topUpForm(appSigner) : ''}` : ''}
+      ${topUpForm(appSigner)}` : ''}
     ${appSigners.length > 1 ? `<p class="lede">${pill('bad', 'app signers disagree')}
       These nodes derive their app signer from the KMS, so they should all hold the
       <b>same</b> one — they do not. A KMS key is per app, so a disagreement means a
