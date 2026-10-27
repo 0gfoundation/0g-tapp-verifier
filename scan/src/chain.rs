@@ -679,6 +679,41 @@ pub struct Scanner {
 }
 
 impl Scanner {
+    /// Read registration epoch and node membership at ONE explicit block. The
+    /// identity API must never combine cached old membership with a new epoch.
+    pub async fn identity_scope_at_head(&self, app_id: &str, signer: &str) -> Result<Option<(u64, u64)>> {
+        use ethers::abi::{encode, Token};
+        use ethers::types::{BlockId, BlockNumber, Bytes, TransactionRequest};
+        let head = self.provider.get_block_number().await?.as_u64();
+        let block = Some(BlockId::Number(BlockNumber::Number(head.into())));
+        let mut data = selector("getAppInfo(string)").to_vec();
+        data.extend_from_slice(&encode(&[Token::String(app_id.to_owned())]));
+        let tx = TransactionRequest::new().to(self.contract).data(Bytes::from(data));
+        let mut nodes_data = selector("getNodeList(string)").to_vec();
+        nodes_data.extend_from_slice(&encode(&[Token::String(app_id.to_owned())]));
+        let nodes_tx = TransactionRequest::new().to(self.contract).data(Bytes::from(nodes_data));
+        let tx = tx.into();
+        let nodes_tx = nodes_tx.into();
+        let (out, nodes) = tokio::try_join!(
+            self.provider.call(&tx, block), self.provider.call(&nodes_tx, block)
+        )?;
+        let requested: Address = signer.parse()?;
+        let nodes = decode(&[ParamType::Array(Box::new(ParamType::Address))], &nodes)?;
+        let current = nodes.into_iter().next().and_then(Token::into_array)
+            .is_some_and(|nodes| nodes.into_iter().any(|v| v.into_address() == Some(requested)));
+        if !current { return Ok(None); }
+        let shape = ParamType::Tuple(vec![
+            ParamType::Bytes, ParamType::Bytes, ParamType::Array(Box::new(ParamType::Bytes)),
+            ParamType::Address, ParamType::Uint(256),
+        ]);
+        let fields = decode(&[shape], &out)?.into_iter().next()
+            .and_then(Token::into_tuple).ok_or_else(|| anyhow!("invalid getAppInfo result"))?;
+        let registered = fields.get(4).and_then(|v| v.clone().into_uint())
+            .filter(|v| !v.is_zero() && v.bits() <= 64)
+            .ok_or_else(|| anyhow!("app has no current registration epoch"))?;
+        Ok(Some((registered.as_u64(), head)))
+    }
+
     pub fn new(rpc_url: &str, contract: &str, from_block: u64, cache_path: PathBuf) -> Result<Self> {
         let provider = Provider::<Http>::try_from(rpc_url)
             .with_context(|| format!("invalid RPC URL: {rpc_url}"))?;
@@ -999,6 +1034,46 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn identity_scope_reads_epoch_and_membership_at_the_same_block() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use ethers::abi::{encode, Token};
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app_selector = format!("0x{}", hex::encode(selector("getAppInfo(string)")));
+        let handler = move |State(calls): State<Arc<Mutex<Vec<Value>>>>, Json(request): Json<Value>| {
+            let app_selector = app_selector.clone();
+            async move {
+                calls.lock().unwrap().push(request.clone());
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_blockNumber" => "0x2a".into(),
+                    "eth_call" if request["params"][0]["data"].as_str().unwrap().starts_with(&app_selector) => {
+                        format!("0x{}", hex::encode(encode(&[Token::Tuple(vec![
+                            Token::Bytes(vec![]), Token::Bytes(vec![]), Token::Array(vec![]),
+                            Token::Address(Address::from_low_u64_be(9)), Token::Uint(1234.into()),
+                        ])])))
+                    }
+                    "eth_call" => format!("0x{}", hex::encode(encode(&[Token::Array(vec![Token::Address(Address::from_low_u64_be(1))])]))),
+                    other => panic!("unexpected RPC method {other}"),
+                };
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(handler)).with_state(calls.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let scanner = Scanner::new(&format!("http://{addr}"), &format!("{:#x}", Address::from_low_u64_be(8)), 0, PathBuf::new()).unwrap();
+        assert_eq!(scanner.identity_scope_at_head("app", &format!("{:#x}", Address::from_low_u64_be(1))).await.unwrap(), Some((1234, 42)));
+        assert_eq!(scanner.identity_scope_at_head("app", &format!("{:#x}", Address::from_low_u64_be(2))).await.unwrap(), None);
+        let requests = calls.lock().unwrap();
+        let reads: Vec<_> = requests.iter().filter(|r| r["method"] == "eth_call").collect();
+        assert_eq!(reads.len(), 4);
+        assert!(reads.iter().all(|r| r["params"][1] == "0x2a"));
+        server.abort();
+    }
 
     #[test]
     fn bytes_display_prefers_printable_ascii() {
