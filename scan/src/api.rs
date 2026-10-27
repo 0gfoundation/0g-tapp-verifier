@@ -395,23 +395,19 @@ async fn app_detail(
                 .map(|e| refreshed_verdict(e, &s.ref_sets))
                 .unwrap_or(json!(null));
             let (trace_events, trace_shown) = trace_counts(entry, &app_id);
+            // The payloads themselves are served by /events, not duplicated here.
             // The app signer of a KMS app is the address that pays its gas, so
             // its balance travels next to the address itself — keyed lowercase
             // like every entry of the map. No app signer, no field: a legacy
             // node keeps exactly the shape it had.
-            let app_signer = status
-                .get("attested")
-                .and_then(|a| a.get("app_signer"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
             if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
-                // The payloads themselves are served by /events, not duplicated here.
                 a.remove("events");
-                if let Some(address) = &app_signer {
-                    a.insert(
-                        "app_signer_balance_wei".into(),
-                        json!(s.balances.get(&address.to_lowercase())),
-                    );
+                let balance = a
+                    .get("app_signer")
+                    .and_then(|v| v.as_str())
+                    .map(|address| s.balances.get(&address.to_lowercase()).cloned());
+                if let Some(balance) = balance {
+                    a.insert("app_signer_balance_wei".into(), json!(balance));
                 }
             }
             json!({
@@ -1946,13 +1942,7 @@ mod tests {
             entry.signer = signer.clone(); entry.checked_at = now(); entry.registered_at = Some(1234);
             entry.attested.as_mut().unwrap().attested_signer = Some(signer.clone());
             let mut store = status::Store::default(); store.put(entry);
-            let state = Arc::new(RwLock::new(Shared {
-                registry,store,balances:BTreeMap::new(),rpc_url:rpc.clone(),api_keys:Default::default(),keys_path:Default::default(),
-                admin:None,spent:BTreeMap::new(),authz_secret:None,ref_sets:Arc::new(matching_set()),
-                refs_from:crate::refsource::Provenance{source:"test".into(),tree:None,fetched_at:Some(now()),sets:BTreeMap::new(),error:None},
-                refreshed_at:now(),scanner:Arc::new(chain::Scanner::new(&rpc,&contract,0,Default::default()).unwrap()),
-                as_endpoint,verify:Arc::new(VerifyState::new(1)),accept_dev:false,
-            }));
+            let state = shared_with(registry, store, BTreeMap::new(), &rpc, &as_endpoint);
             Self { state,signer,peer:"10.1.1.1:1234".parse().unwrap(),epoch,head,scope_reads,evidence,attestation,
                 servers:vec![node,as_server,rpc_server] }
         }
@@ -2454,29 +2444,41 @@ mod tests {
         );
     }
 
+    /// The Shared of a read-only view over the two caches. Read endpoints touch
+    /// no network, so a dead RPC and AS endpoint are fine; RefreshFixture passes
+    /// its live ones because its verify calls do.
+    fn shared_with(
+        registry: chain::Registry,
+        store: status::Store,
+        balances: BTreeMap<String, String>,
+        rpc_url: &str,
+        as_endpoint: &str,
+    ) -> AppState {
+        std::sync::Arc::new(RwLock::new(Shared {
+            registry, store, balances, rpc_url: rpc_url.into(),
+            api_keys: Default::default(), keys_path: Default::default(), admin: None,
+            spent: BTreeMap::new(), authz_secret: None,
+            ref_sets: std::sync::Arc::new(matching_set()),
+            refs_from: crate::refsource::Provenance {
+                source: "test".into(), tree: None, fetched_at: Some(now()),
+                sets: BTreeMap::new(), error: None,
+            },
+            refreshed_at: now(),
+            scanner: std::sync::Arc::new(
+                chain::Scanner::new(rpc_url,
+                    &format!("{:#x}", ethers::types::Address::from_low_u64_be(8)),
+                    0, Default::default()).unwrap(),
+            ),
+            as_endpoint: as_endpoint.into(),
+            verify: std::sync::Arc::new(VerifyState::new(1)), accept_dev: false,
+        }))
+    }
+
     #[tokio::test]
     async fn app_detail_serves_the_app_signers_balance_next_to_the_address() {
-        // The Shared of an app-detail read: no network, just the two caches and
-        // the balance map the refresh loop keeps.
         let detail = |store: status::Store, balances: BTreeMap<String, String>| async move {
-            let state: AppState = std::sync::Arc::new(RwLock::new(Shared {
-                registry: one_app_registry(&[("0xaaa", true)]),
-                store, balances,
-                rpc_url: "http://127.0.0.1:9".into(), api_keys: Default::default(),
-                keys_path: Default::default(), admin: None, spent: BTreeMap::new(),
-                authz_secret: None, ref_sets: std::sync::Arc::new(matching_set()),
-                refs_from: crate::refsource::Provenance {
-                    source: "test".into(), tree: None, fetched_at: Some(now()),
-                    sets: BTreeMap::new(), error: None,
-                },
-                refreshed_at: now(),
-                scanner: std::sync::Arc::new(
-                    chain::Scanner::new("http://127.0.0.1:9", "0x0000000000000000000000000000000000000008",
-                        0, Default::default()).unwrap(),
-                ),
-                as_endpoint: "127.0.0.1:9".into(),
-                verify: std::sync::Arc::new(VerifyState::new(1)), accept_dev: false,
-            }));
+            let state = shared_with(one_app_registry(&[("0xaaa", true)]), store, balances,
+                "http://127.0.0.1:9", "127.0.0.1:9");
             let response = app_detail(State(state), Path("mine".into())).await.unwrap();
             let response = response.into_response();
             serde_json::from_slice::<serde_json::Value>(

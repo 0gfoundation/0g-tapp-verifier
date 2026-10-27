@@ -661,8 +661,6 @@ struct Job {
     reason: &'static str,
 }
 
-/// Nodes across `apps` whose cached result is missing, superseded by a chain
-/// event, or past the age backstop.
 /// Every address whose native balance is worth refreshing: each signer that has
 /// ever served an app, plus the KMS app signers attested by CURRENT signers.
 ///
@@ -675,22 +673,15 @@ struct Job {
 /// to see. One entry per distinct address, so signers shared between apps and
 /// nodes sharing an app signer cost one read, not many.
 fn balance_addresses(registry: &chain::Registry, store: &status::Store) -> Vec<String> {
-    let apps = registry.apps();
-    let mut all: Vec<String> = apps
-        .iter()
-        .flat_map(|app| {
-            registry
-                .timeline(app)
-                .signers
-                .iter()
-                .map(|h| h.signer.clone())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    for app in &apps {
-        for signer in registry.timeline(app).current_signers() {
+    let mut all = Vec::new();
+    for app in registry.apps() {
+        let timeline = registry.timeline(&app);
+        for h in &timeline.signers {
+            all.push(h.signer.clone());
+        }
+        for signer in timeline.current_signers() {
             if let Some(address) = store
-                .get(app, &signer)
+                .get(&app, &signer)
                 .and_then(|e| e.attested.as_ref())
                 .and_then(|a| a.identity.app_signer.clone())
             {
@@ -703,6 +694,8 @@ fn balance_addresses(registry: &chain::Registry, store: &status::Store) -> Vec<S
     all
 }
 
+/// Nodes across `apps` whose cached result is missing, superseded by a chain
+/// event, or past the age backstop.
 fn plan(
     registry: &chain::Registry,
     store: &status::Store,
