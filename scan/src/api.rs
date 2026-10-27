@@ -395,9 +395,24 @@ async fn app_detail(
                 .map(|e| refreshed_verdict(e, &s.ref_sets))
                 .unwrap_or(json!(null));
             let (trace_events, trace_shown) = trace_counts(entry, &app_id);
-            // The payloads themselves are served by /events, not duplicated here.
+            // The app signer of a KMS app is the address that pays its gas, so
+            // its balance travels next to the address itself — keyed lowercase
+            // like every entry of the map. No app signer, no field: a legacy
+            // node keeps exactly the shape it had.
+            let app_signer = status
+                .get("attested")
+                .and_then(|a| a.get("app_signer"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
             if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
+                // The payloads themselves are served by /events, not duplicated here.
                 a.remove("events");
+                if let Some(address) = &app_signer {
+                    a.insert(
+                        "app_signer_balance_wei".into(),
+                        json!(s.balances.get(&address.to_lowercase())),
+                    );
+                }
             }
             json!({
                 "signer": h.signer,
@@ -2390,6 +2405,111 @@ mod tests {
             derivation: "tapp-app-signer-v1".into(), key_ref: None,
         }];
         e
+    }
+
+    /// A one-app registry: `current` signers stay registered, `retired` ones had
+    /// a NodeRemoved after joining, so the timeline distinguishes them.
+    fn one_app_registry(signers: &[(&str, bool)]) -> chain::Registry {
+        let app_hash = format!("0x{}", hex::encode(ethers::utils::keccak256("mine")));
+        // app_ids carries the recovered plaintext, as the scanner does for apps
+        // whose name a registration event revealed.
+        let app_ids = BTreeMap::from([(app_hash.clone(), "mine".to_string())]);
+        let mut events = Vec::new();
+        for (signer, current) in signers {
+            events.push(chain::AppEvent {
+                block: events.len() as u64 + 1, log_index: 0, tx: String::new(),
+                app_hash: app_hash.clone(),
+                event: chain::Event::NodeAdded { signer: (*signer).into(), ack_version: 1 },
+            });
+            if !current {
+                events.push(chain::AppEvent {
+                    block: events.len() as u64 + 1, log_index: 0, tx: String::new(),
+                    app_hash: app_hash.clone(),
+                    event: chain::Event::NodeRemoved { signer: (*signer).into(), ack_version: 1 },
+                });
+            }
+        }
+        chain::Registry {
+            chain_id: 16602, contract: "0x8".into(), scanned_to: 42,
+            app_ids, events,
+        }
+    }
+
+    #[test]
+    fn balance_refresh_covers_current_signers_app_signers_once_each() {
+        // Two current signers attesting the same KMS app signer, one retired
+        // signer attesting another: the shared address is read once, and the
+        // retired one's app signer is not read at all — it is not spending gas.
+        let registry = one_app_registry(&[("0xaaa", true), ("0xbbb", false), ("0xccc", true)]);
+        let mut store = status::Store::default();
+        for (signer, app_signer) in [("0xaaa", "0xfee"), ("0xbbb", "0xold"), ("0xccc", "0xfee")] {
+            let mut e = good_identity_entry();
+            e.signer = signer.into();
+            e.attested.as_mut().unwrap().identity.app_signer = Some(app_signer.into());
+            store.put(e);
+        }
+        assert_eq!(
+            crate::balance_addresses(&registry, &store),
+            vec!["0xaaa".to_string(), "0xbbb".to_string(), "0xccc".to_string(), "0xfee".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn app_detail_serves_the_app_signers_balance_next_to_the_address() {
+        // The Shared of an app-detail read: no network, just the two caches and
+        // the balance map the refresh loop keeps.
+        let detail = |store: status::Store, balances: BTreeMap<String, String>| async move {
+            let state: AppState = std::sync::Arc::new(RwLock::new(Shared {
+                registry: one_app_registry(&[("0xaaa", true)]),
+                store, balances,
+                rpc_url: "http://127.0.0.1:9".into(), api_keys: Default::default(),
+                keys_path: Default::default(), admin: None, spent: BTreeMap::new(),
+                authz_secret: None, ref_sets: std::sync::Arc::new(matching_set()),
+                refs_from: crate::refsource::Provenance {
+                    source: "test".into(), tree: None, fetched_at: Some(now()),
+                    sets: BTreeMap::new(), error: None,
+                },
+                refreshed_at: now(),
+                scanner: std::sync::Arc::new(
+                    chain::Scanner::new("http://127.0.0.1:9", "0x0000000000000000000000000000000000000008",
+                        0, Default::default()).unwrap(),
+                ),
+                as_endpoint: "127.0.0.1:9".into(),
+                verify: std::sync::Arc::new(VerifyState::new(1)), accept_dev: false,
+            }));
+            let response = app_detail(State(state), Path("mine".into())).await.unwrap();
+            let response = response.into_response();
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+            ).unwrap()
+        };
+        let entry_with = |app_signer: Option<&str>, balances: &BTreeMap<String, String>| {
+            let mut e = good_identity_entry(); // app "mine", signer 0xaaa
+            e.attested.as_mut().unwrap().identity.app_signer = app_signer.map(str::to_owned);
+            let mut store = status::Store::default();
+            store.put(e);
+            (store, balances.clone())
+        };
+        // Served next to the address it belongs to, keyed lowercase.
+        let mut balances = BTreeMap::new();
+        balances.insert("0xfee".to_string(), "1234".to_string());
+        let (store, balances) = entry_with(Some("0xfee"), &balances);
+        let body = detail(store, balances).await;
+        let attested = &body["signers"][0]["status"]["attested"];
+        assert_eq!(attested["app_signer"], json!("0xfee"));
+        assert_eq!(attested["app_signer_balance_wei"], json!("1234"));
+        // Not yet read is unknown, not zero — a null the page renders as "—".
+        let (store, balances) = entry_with(Some("0xfee"), &BTreeMap::new());
+        let body = detail(store, balances).await;
+        assert_eq!(body["signers"][0]["status"]["attested"]["app_signer_balance_wei"], json!(null));
+        // A legacy node with no app signer keeps exactly the shape it had: the
+        // address field is there as null (the flattened identity struct always
+        // serializes it), and no balance field is added next to it.
+        let (store, balances) = entry_with(None, &BTreeMap::new());
+        let body = detail(store, balances).await;
+        let attested = &body["signers"][0]["status"]["attested"];
+        assert_eq!(attested["app_signer"], json!(null));
+        assert!(attested.get("app_signer_balance_wei").is_none());
     }
 
     #[test]

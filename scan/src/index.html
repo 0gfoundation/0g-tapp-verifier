@@ -329,7 +329,11 @@ function pin(hex) {
   return 'sha256//' + btoa(String.fromCharCode(...bytes))
 }
 
-function signerCard(h, now, appId) {
+// `appSigner` is the one KMS app signer every current node of this app attests,
+// or null when there is none (or they disagree). For such an app the node signer
+// never spends gas — its balance is information, and the warning and the top-up
+// live at the app level instead of on each card.
+function signerCard(h, now, appId, appSigner) {
   const spans = h.intervals
     .map(i => `${i.from_block.toLocaleString()} → ${i.to_block ? i.to_block.toLocaleString() : '<span class="ok">now</span>'}`)
     .join('<br>')
@@ -340,20 +344,25 @@ function signerCard(h, now, appId) {
   rows.push(['registered', `<span class="mono">${spans}</span>` +
     `<div class="dim">${plural(h.code_updates, 'code update')} while serving</div>`])
 
-  // A signer spends gas. Live at zero cannot transact; retired holding a balance has
-  // funds behind in a key derived inside an instance that is gone.
+  // A signer spends gas — unless the app's transactions are signed by a KMS app
+  // signer, in which case the node signer's balance is information only and both
+  // the warning and the top-up sit at the app level. Retired signers keep the
+  // "left behind" note either way: funds behind a key derived inside an instance
+  // that is gone are worth seeing whatever signs for the app now.
   const bal = h.balance_wei
+  const paysGas = !appSigner
   const note = h.current
-    ? (isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">cannot send transactions</span>` : '')
+    ? (paysGas && isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">cannot send transactions</span>` : '')
     : (isZero(bal) ? '' : `${pill('warn', 'left behind')} <span class="dim">this key was derived
         inside an instance that no longer exists</span>`)
   rows.push(['balance', `<span class="bal">${bal == null ? '—' : og(bal) + ' OG'}</span> ${note}
-    ${h.current && eth() ? `<div class="toolbar">
+    ${h.current && paysGas && eth() ? `<div class="toolbar">
       <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
              id="amt-${esc(h.signer)}" aria-label="amount in OG">
       <button class="primary" data-topup="${esc(h.signer)}"${account ? '' : ' disabled'}>
         ${account ? 'top up' : 'connect wallet to top up'}</button>
-      </div><p class="say dim" id="say-${esc(h.signer)}"></p>` : ''}`])
+      </div><p class="say dim" id="say-${esc(h.signer)}"></p>`
+      : (h.current && appSigner ? '<div class="dim">this app’s transactions are signed by its app signer, which pays the gas</div>' : '')}`])
 
   if (!st) {
     rows.push(['verification', pill('dim', 'never attested')])
@@ -374,6 +383,21 @@ function signerCard(h, now, appId) {
          <div class="dim">The registered identity is not the one this node holds, so neither
          has standing: the registered signer cannot be attested, and the attested signer is
          not registered.</div>`])
+    // The typed identities the quote itself attests, one line per role: where the
+    // key lives (local or the KMS) and who it is — the registered address for
+    // node_signer, the KMS-derived address for app_signer, the SPKI sha256 for
+    // tls. A declaration that failed checking surfaces as its error instead.
+    if (a.identities?.length || a.identities_error) {
+      const who = (id) => id.role === 'node_signer' ? h.signer
+        : id.role === 'app_signer' ? (a.app_signer || '—')
+        : (a.tls_public_key ? pin(a.tls_public_key) : (id.public_key || '—'))
+      const lines = a.identities_error
+        ? `${pill('warn', 'error')} <span class="dim">${esc(a.identities_error)}</span>`
+        : a.identities.map(id =>
+            `<span class="mono">${esc(id.role)}</span> ${pill('dim', esc(id.key_source))}
+             <span class="mono">${esc(who(id))}</span>`).join('<br>')
+      rows.push(['identities', lines])
+    }
     rows.push(['quote', `${pill('ok', '✓')} signature chain verified by the AS`])
     // Attested per signer (it is in this node's quote), app-level in practice:
     // /api/apps/:id/cert serves it for pinning when every node agrees.
@@ -432,6 +456,16 @@ async function showApp(appId) {
   // them is not serving the app people think it is.
   const pins = [...new Set(current.map(h => h.status?.attested?.tls_public_key).filter(Boolean))]
 
+  // The app signer is the same story: KMS-derived per app, so every current node
+  // should attest the same address. One address means the app's gas is paid there
+  // and only there; several is a finding, not a choice.
+  const appSigners = [...new Set(current.map(h => h.status?.attested?.app_signer).filter(Boolean))]
+  const appSigner = appSigners.length === 1 ? appSigners[0] : null
+  // Same address on every signer, so one balance serves the app. Null until the
+  // refresh round that read it has landed — unknown, not zero.
+  const appBal = current.map(h => h.status?.attested?.app_signer_balance_wei)
+    .find(v => v != null) ?? null
+
   const view = document.getElementById('view')
   view.innerHTML = `
     <div class="toolbar"><button id="back">← all apps</button></div>
@@ -440,6 +474,24 @@ async function showApp(appId) {
       ? `${plural(current.length, 'signer')} registered right now — these, and only these,
          can obtain this app's KMS key.`
       : 'No node is registered for this app right now.'}</p>
+    ${appSigner ? `
+      <p class="lede">${pill('dim', 'app signer (kms)')} <span class="mono">${esc(appSigner)}</span>
+        — the same key on every node, unchanged by reboots.
+        <span class="bal">${appBal == null ? '—' : og(appBal) + ' OG'}</span>
+        ${appBal != null && isZero(appBal)
+          ? `${pill('warn', 'no gas')} <span class="dim">this address cannot send the app's transactions</span>`
+          : ''}</p>
+      ${eth() ? `<div class="toolbar">
+        <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
+               id="amt-${esc(appSigner)}" aria-label="amount in OG">
+        <button class="primary" data-topup="${esc(appSigner)}"${account ? '' : ' disabled'}>
+          ${account ? 'top up' : 'connect wallet to top up'}</button>
+        </div><p class="say dim" id="say-${esc(appSigner)}"></p>` : ''}` : ''}
+    ${appSigners.length > 1 ? `<p class="lede">${pill('bad', 'app signers disagree')}
+      These nodes derive their app signer from the KMS, so they should all hold the
+      <b>same</b> one — they do not. A KMS key is per app, so a disagreement means a
+      node here is not serving the app people think it is. Each address is on its
+      signer's card below.</p>` : ''}
     ${pins.length > 1 ? (d.tls_key_source === 'kms'
       ? `<p class="lede">${pill('bad', 'tls keys disagree')}
          These nodes derive their TLS key from the KMS, so they should all hold the
@@ -450,11 +502,11 @@ async function showApp(appId) {
          and re-derived at every boot, so these differ and always will.
          <span class="mono">/cert</span> returns all of them, which
          <span class="mono">curl --pinnedpubkey</span> accepts as a set.</p>`) : ''}
-    ${current.map(h => signerCard(h, d.now, appId)).join('')}
+    ${current.map(h => signerCard(h, d.now, appId, appSigner)).join('')}
     ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
       <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
       restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
-    ${retired.map(h => signerCard(h, d.now, appId)).join('')}`
+    ${retired.map(h => signerCard(h, d.now, appId, appSigner)).join('')}`
 
   document.getElementById('back').onclick = () => go('')
   view.querySelectorAll('button[data-trace]').forEach(b =>

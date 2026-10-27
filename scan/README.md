@@ -276,6 +276,14 @@ and generic KMS secrets. Such provenance remains visible in `/verify` warnings;
 an authenticated tapp declaration alone does not assert that its upstream KMS
 connection was authenticated.
 
+`GET /api/apps/:app_id` additionally serves `status.attested.app_signer_balance_wei`
+next to `app_signer`: the app signer's native balance, in wei as a decimal string,
+from the same per-round refresh as the node signers' `signers[].balance_wei`. It
+is `null` until the round that read it has landed, and absent on nodes with no
+app signer. A KMS app signer is the address that pays the app's gas, so the page
+shows its balance, its zero-balance warning and its top-up at the app level; the
+node signers' balances remain on their cards as information.
+
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
 expensive attestation once, and any client can then reach a TEE serving the app
