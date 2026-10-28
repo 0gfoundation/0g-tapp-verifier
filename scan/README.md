@@ -289,13 +289,18 @@ connection was authenticated.
   gives. The detail view stays an observation cache — a failing node's claims are
   not cleared — but the page counts only nodes that pass.
 
-The page shows the app signer once at app level when the passing nodes agree on
-it, says how many of the current nodes attested it, and offers a top-up only if
-its key was acquired over an attested KMS connection. Otherwise the app signer
-and its balance are on each attesting card, a failing node's marked as not
-counted. Nothing guarantees an app sends its transactions from its app signer
-rather than its node signers, so the node signers keep their balance, top-up
-and zero-balance warning either way.
+Each signer card lists the node's keys, one line each, with what funds them:
+`node_signer` (always — it is the card's own registered address; its key source is
+shown only when the quote attests it), `app_signer`, and `tls`. A current node's
+node signer and app signer each carry their balance and a top-up. The app signer's
+top-up is withheld, with the reason, when the node fails policy, when the nodes
+disagree, or when the key was not acquired over an attested KMS connection. The
+app-level line is a summary only: the address, how many of the current nodes
+attested it, and its warnings. Nothing guarantees an app sends its transactions
+from its app signer rather than its node signers, so the node signer's zero
+warning is softened, not dropped, when an app signer exists. A retired signer's
+key was generated at random by an instance that is gone, and withdrawing needs
+that instance, so its balance is a record: no top-up, a note when some was left.
 
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
