@@ -548,22 +548,7 @@ async fn main() -> Result<()> {
                         // whether anything needed re-attesting.
                         let addresses = {
                             let s = shared.read().await;
-                            let mut all: Vec<String> = s
-                                .registry
-                                .apps()
-                                .iter()
-                                .flat_map(|app| {
-                                    s.registry
-                                        .timeline(app)
-                                        .signers
-                                        .iter()
-                                        .map(|h| h.signer.clone())
-                                        .collect::<Vec<_>>()
-                                })
-                                .collect();
-                            all.sort();
-                            all.dedup();
-                            all
+                            balance_addresses(&s.registry, &s.store)
                         };
                         let balances = scanner.balances(&addresses).await;
                         if !balances.is_empty() {
@@ -674,6 +659,39 @@ struct Job {
     signer: String,
     latest_block: u64,
     reason: &'static str,
+}
+
+/// Every address whose native balance is worth refreshing: each signer that has
+/// ever served an app, plus the KMS app signers attested by CURRENT signers.
+///
+/// An app's transactions may be sent from its KMS app signer, so that balance
+/// belongs on the same refresh round as the node signers'. Only current signers'
+/// app signers are read: the key is per app, and a retired signer's attestation
+/// of it says nothing about what is spending gas now. A read is information, not
+/// endorsement — the page decides which claims count. Retired node signers stay
+/// in the list, because a balance left behind in a key whose instance is gone is
+/// exactly what an operator wants to see. One entry per distinct address, so
+/// signers shared between apps and nodes sharing an app signer cost one read.
+fn balance_addresses(registry: &chain::Registry, store: &status::Store) -> Vec<String> {
+    let mut all = Vec::new();
+    for app in registry.apps() {
+        let timeline = registry.timeline(&app);
+        for h in &timeline.signers {
+            all.push(h.signer.clone());
+        }
+        for signer in timeline.current_signers() {
+            if let Some(address) = store
+                .get(&app, &signer)
+                .and_then(|e| e.attested.as_ref())
+                .and_then(|a| a.identity.app_signer.clone())
+            {
+                all.push(address);
+            }
+        }
+    }
+    all.sort();
+    all.dedup();
+    all
 }
 
 /// Nodes across `apps` whose cached result is missing, superseded by a chain

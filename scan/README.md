@@ -276,6 +276,32 @@ and generic KMS secrets. Such provenance remains visible in `/verify` warnings;
 an authenticated tapp declaration alone does not assert that its upstream KMS
 connection was authenticated.
 
+`GET /api/apps/:app_id` additionally serves, per signer:
+
+- `status.attested.app_signer_balance_wei` next to `app_signer`: the app signer's
+  native balance, in wei as a decimal string, from the same per-round refresh as
+  the node signers' `signers[].balance_wei`. `null` until the round that read it
+  has landed; absent on nodes with no app signer.
+- `status.attested.app_signer_checked` (also absent with no app signer): whether
+  the app signer's own key was acquired over an attested KMS connection. Unlike
+  `identities_unchecked`, it singles out the app signer's commitment.
+- `status.policy`: `{verified, reason}`, the same node-policy verdict `/verify`
+  gives. The detail view stays an observation cache — a failing node's claims are
+  not cleared — but the page counts only nodes that pass.
+
+Each signer card lists the node's keys, one line each, with what funds them:
+`node_signer` (always — it is the card's own registered address; its key source is
+shown only when the quote attests it), `app_signer`, and `tls`. A current node's
+node signer and app signer each carry their balance and a top-up. The app signer's
+top-up is withheld, with the reason, when the node fails policy, when the nodes
+disagree, or when the key was not acquired over an attested KMS connection. The
+app-level line is a summary only: the address, how many of the current nodes
+attested it, and its warnings. Nothing guarantees an app sends its transactions
+from its app signer rather than its node signers, so the node signer's zero
+warning is softened, not dropped, when an app signer exists. A retired signer's
+key was generated at random by an instance that is gone, and withdrawing needs
+that instance, so its balance is a record: no top-up, a note when some was left.
+
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the
 expensive attestation once, and any client can then reach a TEE serving the app
