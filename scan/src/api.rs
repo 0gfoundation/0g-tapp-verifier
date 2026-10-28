@@ -396,10 +396,10 @@ async fn app_detail(
                 .unwrap_or(json!(null));
             let (trace_events, trace_shown) = trace_counts(entry, &app_id);
             // The payloads themselves are served by /events, not duplicated here.
-            // The app signer of a KMS app is the address that pays its gas, so
-            // its balance travels next to the address itself — keyed lowercase
-            // like every entry of the map. No app signer, no field: a legacy
-            // node keeps exactly the shape it had.
+            // The app signer's balance travels next to the address itself — keyed
+            // lowercase like every entry of the map — with whether its key was
+            // acquired over an attested KMS connection. No app signer, no fields:
+            // a legacy node keeps exactly the shape it had.
             if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
                 a.remove("events");
                 let balance = a
@@ -408,7 +408,20 @@ async fn app_detail(
                     .map(|address| s.balances.get(&address.to_lowercase()).cloned());
                 if let Some(balance) = balance {
                     a.insert("app_signer_balance_wei".into(), json!(balance));
+                    // Against the app id the result was authenticated under, not the
+                    // one in the URL: a page reached by hash must not read as unchecked.
+                    let checked = entry.and_then(|e| e.attested.as_ref().map(|at| (e, at))).is_some_and(|(e, at)| {
+                        crate::identity::app_signer_checked(&at.identity, &at.events, &e.app_id)
+                    });
+                    a.insert("app_signer_checked".into(), json!(checked));
                 }
+            }
+            // The same policy /verify applies. This view stays an observation cache —
+            // nothing is cleared, a failing node's claims stay visible as evidence —
+            // but the page must know which nodes' claims carry weight.
+            if let (Some(e), Some(obj)) = (entry, status.as_object_mut()) {
+                let (verified, reason) = policy_verdict(e, &s.ref_sets, s.accept_dev);
+                obj.insert("policy".into(), json!({ "verified": verified, "reason": reason }));
             }
             json!({
                 "signer": h.signer,
@@ -1251,18 +1264,15 @@ fn verdict_parts(
     verdict_parts_at(entry, sets, cached, accept_dev, now())
 }
 
-fn verdict_parts_at(
+/// The node-policy verdict: does this result establish anything about the node?
+/// One definition, shared by /verify and the app detail view, so the page never
+/// counts a node /verify would refuse.
+fn policy_verdict(
     entry: &status::Entry,
     sets: &[crate::refvalues::RefSet],
-    cached: bool,
     accept_dev: bool,
-    current_time: i64,
-) -> (StatusCode, serde_json::Value) {
-    let mut status = refreshed_verdict(entry, sets);
-    if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
-        a.remove("events");
-    }
-    let (verified, reason) = match &entry.attested {
+) -> (bool, String) {
+    match &entry.attested {
         None => (
             false,
             entry
@@ -1307,7 +1317,21 @@ fn verdict_parts_at(
                 "the boot chain matches no published reference set".into(),
             ),
         },
-    };
+    }
+}
+
+fn verdict_parts_at(
+    entry: &status::Entry,
+    sets: &[crate::refvalues::RefSet],
+    cached: bool,
+    accept_dev: bool,
+    current_time: i64,
+) -> (StatusCode, serde_json::Value) {
+    let mut status = refreshed_verdict(entry, sets);
+    if let Some(a) = status.get_mut("attested").and_then(|a| a.as_object_mut()) {
+        a.remove("events");
+    }
+    let (verified, reason) = policy_verdict(entry, sets, accept_dev);
     // Reported, not failed: clouds roll firmware out behind Intel, so a TCB trailing
     // the latest is common on healthy nodes. The advisories say what is outstanding.
     let mut warnings: Vec<String> = match &entry.attested {
@@ -2500,6 +2524,32 @@ mod tests {
         let attested = &body["signers"][0]["status"]["attested"];
         assert_eq!(attested["app_signer"], json!("0xfee"));
         assert_eq!(attested["app_signer_balance_wei"], json!("1234"));
+        // The fixture's trace has no attested acquisition of the key.
+        assert_eq!(attested["app_signer_checked"], json!(false));
+        // The node-policy verdict /verify would give, next to the observation.
+        assert_eq!(body["signers"][0]["status"]["policy"], json!({"verified": true, "reason": ""}));
+        // An attested acquisition of exactly the app signer's committed key counts.
+        let key = crate::identity::KeyCommitment {
+            commitment: format!("0x{:064x}", 1), material: crate::identity::SIGNER_MATERIAL.into(),
+            scheme: crate::identity::COMMITMENT_SCHEME.into(),
+        };
+        let mut e = good_identity_entry();
+        let a = e.attested.as_mut().unwrap();
+        a.identity.app_signer = Some("0xfee".into());
+        a.identity.identities.push(crate::identity::Identity {
+            role: "app_signer".into(), algorithm: "ecdsa-secp256k1".into(),
+            public_key: "0x02".into(), public_key_encoding: "sec1-compressed".into(),
+            key_source: "kms".into(), derivation: "raw-scalar-v1".into(), key_ref: Some(key.clone()),
+        });
+        a.events.push(crate::attest::RuntimeEvent {
+            operation: "get_secret_resource".into(), digest: None, digest_matches: true,
+            payload: json!({"app_id": "mine", "material": key.material, "key_commitment": key,
+                "result": "success", "kms_attested": true}),
+        });
+        let mut store = status::Store::default();
+        store.put(e);
+        let body = detail(store, BTreeMap::new()).await;
+        assert_eq!(body["signers"][0]["status"]["attested"]["app_signer_checked"], json!(true));
         // Not yet read is unknown, not zero — a null the page renders as "—".
         let (store, balances) = entry_with(Some("0xfee"), &BTreeMap::new());
         let body = detail(store, balances).await;
@@ -2512,6 +2562,27 @@ mod tests {
         let attested = &body["signers"][0]["status"]["attested"];
         assert_eq!(attested["app_signer"], json!(null));
         assert!(attested.get("app_signer_balance_wei").is_none());
+        assert!(attested.get("app_signer_checked").is_none());
+    }
+
+    #[tokio::test]
+    async fn app_detail_marks_a_node_that_fails_policy_without_clearing_its_claims() {
+        // A DEBUG TD whose quote verifies: /verify clears its app signer; the
+        // detail view keeps it as evidence and says the node does not count.
+        let mut e = good_identity_entry();
+        e.attested.as_mut().unwrap().td_debug = Some(true);
+        e.attested.as_mut().unwrap().identity.app_signer = Some("0xfee".into());
+        let mut store = status::Store::default();
+        store.put(e);
+        let state = shared_with(one_app_registry(&[("0xaaa", true)]), store, BTreeMap::new(),
+            "http://127.0.0.1:9", "127.0.0.1:9");
+        let response = app_detail(State(state), Path("mine".into())).await.unwrap().into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        let status = &body["signers"][0]["status"];
+        assert_eq!(status["policy"]["verified"], json!(false));
+        assert!(status["policy"]["reason"].as_str().unwrap().contains("DEBUG"));
+        assert_eq!(status["attested"]["app_signer"], json!("0xfee"));
     }
 
     #[test]

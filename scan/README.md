@@ -276,13 +276,26 @@ and generic KMS secrets. Such provenance remains visible in `/verify` warnings;
 an authenticated tapp declaration alone does not assert that its upstream KMS
 connection was authenticated.
 
-`GET /api/apps/:app_id` additionally serves `status.attested.app_signer_balance_wei`
-next to `app_signer`: the app signer's native balance, in wei as a decimal string,
-from the same per-round refresh as the node signers' `signers[].balance_wei`. It
-is `null` until the round that read it has landed, and absent on nodes with no
-app signer. A KMS app signer is the address that pays the app's gas, so the page
-shows its balance, its zero-balance warning and its top-up at the app level; the
-node signers' balances remain on their cards as information.
+`GET /api/apps/:app_id` additionally serves, per signer:
+
+- `status.attested.app_signer_balance_wei` next to `app_signer`: the app signer's
+  native balance, in wei as a decimal string, from the same per-round refresh as
+  the node signers' `signers[].balance_wei`. `null` until the round that read it
+  has landed; absent on nodes with no app signer.
+- `status.attested.app_signer_checked` (also absent with no app signer): whether
+  the app signer's own key was acquired over an attested KMS connection. Unlike
+  `identities_unchecked`, it singles out the app signer's commitment.
+- `status.policy`: `{verified, reason}`, the same node-policy verdict `/verify`
+  gives. The detail view stays an observation cache — a failing node's claims are
+  not cleared — but the page counts only nodes that pass.
+
+The page shows the app signer once at app level when the passing nodes agree on
+it, says how many of the current nodes attested it, and offers a top-up only if
+its key was acquired over an attested KMS connection. Otherwise the app signer
+and its balance are on each attesting card, a failing node's marked as not
+counted. Nothing guarantees an app sends its transactions from its app signer
+rather than its node signers, so the node signers keep their balance, top-up
+and zero-balance warning either way.
 
 `/cert` is the publish half of the TLS story (tapp-server ≥0.4.0): the quote
 commits to sha256 of a TLS public key derived inside the CVM, tappscan does the

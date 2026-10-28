@@ -269,12 +269,7 @@ fn authenticate_inner(
     );
     let identities_unchecked = keys
         .iter()
-        .filter(|key| {
-            !events.iter().any(|event| {
-                commitment_in_event(event, app_id, key)
-                    && event.payload.get("kms_attested").and_then(Value::as_bool) == Some(true)
-            })
-        })
+        .filter(|key| !acquisition_attested(events, app_id, key))
         .count();
     Ok(Identities {
         identities,
@@ -283,6 +278,30 @@ fn authenticate_inner(
         identities_error: None,
         identities_unchecked,
     })
+}
+
+/// Whether the measured acquisition of `key` went over an attested KMS connection.
+/// Without that, the key is whatever answered at the node's `kms_url` — not
+/// necessarily the 0g KMS, and possibly one its operator knows.
+fn acquisition_attested(events: &[RuntimeEvent], app_id: &str, key: &KeyCommitment) -> bool {
+    events.iter().any(|event| {
+        commitment_in_event(event, app_id, key)
+            && event.payload.get("kms_attested").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+/// Whether the app signer's OWN key was acquired over an attested KMS connection.
+/// `identities_unchecked` counts every commitment, TLS and generic secrets
+/// included, so it cannot single the app signer out; this does. Recomputed on
+/// read from the stored trace, like the rest of a verdict.
+pub fn app_signer_checked(identity: &Identities, events: &[RuntimeEvent], app_id: &str) -> bool {
+    identity.app_signer.is_some()
+        && identity
+            .identities
+            .iter()
+            .find(|i| i.role == "app_signer")
+            .and_then(|i| i.key_ref.as_ref())
+            .is_some_and(|key| acquisition_attested(events, app_id, key))
 }
 
 fn commitment_in_event(event: &RuntimeEvent, app_id: &str, key: &KeyCommitment) -> bool {
@@ -646,5 +665,22 @@ mod tests {
         let out = run(&runtime, &events, &signer, &hash);
         assert_eq!(out.identities_unchecked, 1);
         assert!(out.identities_error.is_none());
+    }
+
+    #[test]
+    fn app_signer_checked_reads_the_app_signers_own_acquisition_only() {
+        // events[0] acquires the app signer's key, events[1] the TLS key.
+        let (runtime, mut events, signer, hash) = fixture();
+        let out = run(&runtime, &events, &signer, &hash);
+        assert!(!app_signer_checked(&out, &events, "app"), "nothing attested");
+        // An attested TLS acquisition says nothing about the app signer's key.
+        events[1].payload["kms_attested"] = json!(true);
+        assert!(!app_signer_checked(&out, &events, "app"), "only TLS attested");
+        events[0].payload["kms_attested"] = json!(true);
+        assert!(app_signer_checked(&out, &events, "app"));
+        // Bound to this app: the same acquisition under another app id does not count.
+        assert!(!app_signer_checked(&out, &events, "other"));
+        // No app signer, nothing to check.
+        assert!(!app_signer_checked(&Identities::default(), &events, "app"));
     }
 }

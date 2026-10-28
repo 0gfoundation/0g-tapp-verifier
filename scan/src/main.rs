@@ -664,14 +664,14 @@ struct Job {
 /// Every address whose native balance is worth refreshing: each signer that has
 /// ever served an app, plus the KMS app signers attested by CURRENT signers.
 ///
-/// An app on a KMS app signer has its transactions signed — and its gas paid —
-/// by that address, not by the node signers, so its balance belongs on the same
-/// refresh round as theirs. Only current signers' app signers are read: the key
-/// is per app, and a retired signer's attestation of it says nothing about what
-/// is spending gas now. Retired node signers stay in the list, because a balance
-/// left behind in a key whose instance is gone is exactly what an operator wants
-/// to see. One entry per distinct address, so signers shared between apps and
-/// nodes sharing an app signer cost one read, not many.
+/// An app's transactions may be sent from its KMS app signer, so that balance
+/// belongs on the same refresh round as the node signers'. Only current signers'
+/// app signers are read: the key is per app, and a retired signer's attestation
+/// of it says nothing about what is spending gas now. A read is information, not
+/// endorsement — the page decides which claims count. Retired node signers stay
+/// in the list, because a balance left behind in a key whose instance is gone is
+/// exactly what an operator wants to see. One entry per distinct address, so
+/// signers shared between apps and nodes sharing an app signer cost one read.
 fn balance_addresses(registry: &chain::Registry, store: &status::Store) -> Vec<String> {
     let mut all = Vec::new();
     for app in registry.apps() {
