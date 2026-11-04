@@ -25,7 +25,8 @@ service TappService {
 message GetEvidenceRequest {
   string app_id = 1;
   // Optional challenge, at most 64 bytes, echoed into the quote's report_data
-  // (tapp-server >= 0.4.0). Sent only on behalf of a caller who supplied one.
+  // (tapp-server >= 0.4.0). Scan sends its own random challenge for verdicts;
+  // relay requests forward the caller's challenge unchanged.
   bytes nonce = 2;
 }
 
