@@ -276,7 +276,7 @@ and generic KMS secrets. Such provenance remains visible in `/verify` warnings;
 an authenticated tapp declaration alone does not assert that its upstream KMS
 connection was authenticated.
 
-`GET /api/apps/:app_id` additionally serves, per signer:
+From tappscan 0.6.0, `GET /api/apps/:app_id` additionally serves, per signer:
 
 - `status.attested.app_signer_balance_wei` next to `app_signer`: the app signer's
   native balance, in wei as a decimal string, from the same per-round refresh as
