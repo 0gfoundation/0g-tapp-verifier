@@ -1,88 +1,26 @@
 # 0g-tapp-verifier
 
-This repository provides tools and scripts for verifying TEE (Trusted Execution Environment) evidence and auditing CVM confidential images. It enables users to validate the integrity and authenticity of TEE instances running on Alibaba Cloud.
+This repository provides tools and scripts for verifying TEE (Trusted Execution Environment) evidence and auditing CVM confidential images. It enables users to validate the integrity and authenticity of 0G tapp TEE instances.
 
 ## Table of Contents
 
-- [TEE Evidence Verification](#tee-evidence-verification)
-- [TEE CVM Image Audit](#tee-cvm-image-audit)
+- [tappscan — TappRegistry explorer and verifier](./scan/README.md) (`scan/`)
+- [TDX boot-chain verifier with your own trustee](./tdx-boot-chain/README.md) (`tdx-boot-chain/`)
+- [TEE CVM Image Audit](#tee-cvm-image-audit) (`audit/`)
 
 ---
 
-## TEE Evidence Verification
+## Verifying a node
 
-This section guides you through the process of verifying TEE evidence.
-
-### Prerequisites
-
-- Access to Alibaba Cloud OSS
-- Sufficient storage space (at least 50GB)
-- Command-line tools: `ossutil`, `git`, `bash`
-- Alinux3 instance
-
-### Step 0: Setup host environment
-Load nbd device
-```bash
-sudo modprobe nbd max_part=8
-```
-
-### Step 1: Download and Configure OSS
-
-Download and configure `ossutil` following the official Alibaba Cloud documentation:
-
-**Documentation:** https://www.alibabacloud.com/help/en/oss/developer-reference/install-ossutil?spm=5176.2020520104.0.0.22953a98t0kXoY
-
-**Configuration Parameters:**
-- **Region:** `cn-beijing`
-- **Endpoint:** 
-  - Internal: `oss-cn-beijing-internal.aliyuncs.com` (Recommended)
-  - Public: `oss-cn-beijing.aliyuncs.com`
-- **Access Credentials:** Generate your own `accessKeyID` and `accessKeySecret` (the bucket has public read access)
-
-> **⚠️ Important Recommendation:** 
-> It is strongly recommended to launch an ECS instance in the same region (cn-beijing) and use the internal endpoint (`oss-cn-beijing-internal.aliyuncs.com`). The CVM confidential image is approximately **18GB** in size, and using the internal endpoint will significantly reduce download time.
-
-### Step 2: Download CVM Confidential Image
-
-Create the input directory and download the confidential image:
-
-```bash
-mkdir -p ./verify/input
-ossutil cp oss://confidential-disk/0g-tapp-confidential-gpu.qcow2 ./verify/input/confidential.qcow2
-```
-
-This will download the `0g-tapp-confidential-gpu.qcow2` image file to your local `./verify/input/` directory.
-
-### Step 3: Get TEE Evidence
-
-Clone the repository and retrieve the evidence:
-
-```bash
-# Clone the repository
-git clone https://github.com/0gfoundation/0g-tapp
-
-# Navigate to the tapp directory
-cd tapp
-
-# Get evidence from the TEE instance
-sh examples/get_evidence.sh 8.131.111.246
-```
-
-Save the output to `./verify/input/evidence.json`:
-
-```bash
-sh examples/get_evidence.sh 8.131.111.246 > ./verify/input/evidence.json
-```
-
-### Step 4: Execute Verification Script
-
-Run the verification script:
-
-```bash
-cd verify && sh run.sh
-```
-
-The script will verify the TEE evidence against the confidential image and output the verification results.
+- `tapp-cli verify-app` from [0g-tapp](https://github.com/0gfoundation/0g-tapp) checks an app's
+  nodes end to end: quote, boot chain against the published reference values, on-chain
+  registration and KMS keys.
+- The hosted scans show the same verdicts for every registered app: mainnet
+  `https://tappscan.0g.ai`, testnet `https://tappscan-testnet.34-122-75-6.sslip.io`
+  ([`scan/`](./scan/README.md)).
+- To trust neither: compute the reference values from the image yourself with 0g-tapp's
+  `cvm/ci/gen-reference-values.sh` and evaluate the evidence on your own trustee
+  ([`tdx-boot-chain/`](./tdx-boot-chain/README.md)).
 
 ---
 
@@ -93,12 +31,6 @@ For detailed information on TEE CVM image audit procedures, please refer to:
 **[TEE CVM Image Audit Documentation](./audit/AUDIT_GUIDE.md)**
 
 ---
-
-## Troubleshooting
-
-- **OSS Connection Issues:** Ensure your OSS credentials (accessKeyID and accessKeySecret) are correctly configured.
-- **Large File Download:** If the download is slow or fails, verify your network connection and consider using the internal endpoint if you're on an Alibaba Cloud ECS instance.
-- **Evidence Collection:** Ensure the IP address `8.131.111.246` is accessible and the TEE instance is running properly.
 
 ## Support
 
