@@ -6,9 +6,6 @@ which platform the node runs on. Brings up a local trustee (the same `coco-as-gr
 `rvps` stack as the shared AS), registers the reference values and the policy, and
 evaluates a node's evidence.
 
-> This is the gRPC CoCo-AS flow. The original Aliyun/cryptpilot RESTful flow under
-> `verify/` is unchanged.
-
 > `policy.rego` and `reference-values.json` here are **older copies** of the canonical artifacts
 > kept in the [`0g-tapp`](https://github.com/0gfoundation/0g-tapp) repo: the v0.1.0 `grub` / `dev`
 > set, and a policy from before UKI images existed. Current images boot a UKI, which this copy of
