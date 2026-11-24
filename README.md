@@ -1,15 +1,24 @@
 # 0g-tapp-verifier
 
-This repository provides tools and scripts for verifying TEE (Trusted Execution Environment) evidence and auditing CVM confidential images. It enables users to validate the integrity and authenticity of TEE instances running on Alibaba Cloud.
+This repository provides tools and scripts for verifying TEE (Trusted Execution Environment) evidence and auditing CVM confidential images. It enables users to validate the integrity and authenticity of 0G tapp TEE instances.
 
 ## Table of Contents
 
-- [TEE Evidence Verification](#tee-evidence-verification)
-- [TEE CVM Image Audit](#tee-cvm-image-audit)
+- [tappscan — TappRegistry explorer and verifier](./scan/README.md) (`scan/`)
+- [TDX boot-chain verifier with your own trustee](./tdx-boot-chain/README.md) (`tdx-boot-chain/`)
+- [TEE Evidence Verification (legacy: old Alibaba Cloud images)](#tee-evidence-verification-legacy-old-alibaba-cloud-images) (`verify/`)
+- [TEE CVM Image Audit](#tee-cvm-image-audit) (`audit/`)
 
 ---
 
-## TEE Evidence Verification
+## TEE Evidence Verification (legacy: old Alibaba Cloud images)
+
+> **Legacy.** This flow (`verify/`: Alinux, cryptpilot 0.2.8, a Trustee REST gateway) is for the
+> old Alibaba Cloud cryptpilot images such as `0g-tapp-confidential-gpu.qcow2` below. It does not
+> handle the UKI boot chain of current `og-tdx-*` images. For a current node use
+> `tapp-cli verify-app` from [0g-tapp](https://github.com/0gfoundation/0g-tapp), the hosted scan
+> (mainnet `https://tappscan.0g.ai`, testnet `https://tappscan-testnet.34-122-75-6.sslip.io`; see
+> [`scan/`](./scan/README.md)), or your own trustee ([`tdx-boot-chain/`](./tdx-boot-chain/README.md)).
 
 This section guides you through the process of verifying TEE evidence.
 
@@ -55,31 +64,28 @@ This will download the `0g-tapp-confidential-gpu.qcow2` image file to your local
 
 ### Step 3: Get TEE Evidence
 
-Clone the repository and retrieve the evidence:
+Clone the repository (next to `./verify`) and retrieve the evidence:
 
 ```bash
 # Clone the repository
 git clone https://github.com/0gfoundation/0g-tapp
 
 # Navigate to the tapp directory
-cd tapp
+cd 0g-tapp
 
-# Get evidence from the TEE instance
-sh examples/get_evidence.sh 8.131.111.246
+# Get evidence from the TEE instance (bash, grpcurl and jq; --app-id is required)
+bash examples/get_evidence.sh --host 8.131.111.246 --app-id <app-id>
 ```
 
-Save the output to `./verify/input/evidence.json`:
-
-```bash
-sh examples/get_evidence.sh 8.131.111.246 > ./verify/input/evidence.json
-```
+The script prints a banner around the response. Save only the JSON object printed under
+`Response:` (the one with the `evidence` field) to `../verify/input/evidence.json`.
 
 ### Step 4: Execute Verification Script
 
 Run the verification script:
 
 ```bash
-cd verify && sh run.sh
+cd ../verify && sh run.sh
 ```
 
 The script will verify the TEE evidence against the confidential image and output the verification results.
