@@ -329,7 +329,21 @@ function pin(hex) {
   return 'sha256//' + btoa(String.fromCharCode(...bytes))
 }
 
-function signerCard(h, now, appId) {
+// The top-up form for one address on one card. The same app signer appears on
+// every card that attests it, so the ids carry the card's signer as well as the
+// address — ids from the address alone would make a second form read the first
+// card's input. The handler in showApp picks it up by data-topup / data-card.
+const topUpForm = (addr, card) => {
+  const id = `${esc(card)}-${esc(addr)}`
+  return eth() ? `<div class="toolbar">
+      <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
+             id="amt-${id}" aria-label="amount in OG">
+      <button class="primary" data-topup="${esc(addr)}" data-card="${esc(card)}"${account ? '' : ' disabled'}>
+        ${account ? 'top up' : 'connect wallet to top up'}</button>
+      </div><p class="say dim" id="say-${id}"></p>` : ''
+}
+
+function signerCard(h, now, appId, ctx = {}) {
   const spans = h.intervals
     .map(i => `${i.from_block.toLocaleString()} → ${i.to_block ? i.to_block.toLocaleString() : '<span class="ok">now</span>'}`)
     .join('<br>')
@@ -340,20 +354,66 @@ function signerCard(h, now, appId) {
   rows.push(['registered', `<span class="mono">${spans}</span>` +
     `<div class="dim">${plural(h.code_updates, 'code update')} while serving</div>`])
 
-  // A signer spends gas. Live at zero cannot transact; retired holding a balance has
-  // funds behind in a key derived inside an instance that is gone.
+  // One line per key this node holds, each with what funds it. The node signer
+  // is always there — it is the card's own registered address — and its key
+  // source is shown only when the quote attests it. Nothing guarantees an app
+  // transacts from its app signer rather than its node signer, so both keep their
+  // balance and top-up; the node signer's zero warning is softened when an app
+  // signer exists. A retired signer's key was generated at random by an instance
+  // that is gone (tapp regenerates it every boot) and WithdrawBalance needs that
+  // instance, so its balance is a record: no top-up, a note when some was left.
+  const declared = a && !a.identities_error ? (a.identities || []) : []
+  const byRole = (role) => declared.find(id => id.role === role)
+  const balance = (wei) => `<span class="bal">${wei == null ? '—' : og(wei) + ' OG'}</span>`
+  const key = (role, source, who, rest) => `<div><span class="mono">${esc(role)}</span>
+    ${source ? pill('dim', esc(source)) : ''} <span class="mono">${esc(who)}</span> ${rest}</div>`
   const bal = h.balance_wei
-  const note = h.current
-    ? (isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">cannot send transactions</span>` : '')
-    : (isZero(bal) ? '' : `${pill('warn', 'left behind')} <span class="dim">this key was derived
-        inside an instance that no longer exists</span>`)
-  rows.push(['balance', `<span class="bal">${bal == null ? '—' : og(bal) + ' OG'}</span> ${note}
-    ${h.current && eth() ? `<div class="toolbar">
-      <input class="amount" type="number" min="0" step="0.1" placeholder="0.5"
-             id="amt-${esc(h.signer)}" aria-label="amount in OG">
-      <button class="primary" data-topup="${esc(h.signer)}"${account ? '' : ' disabled'}>
-        ${account ? 'top up' : 'connect wallet to top up'}</button>
-      </div><p class="say dim" id="say-${esc(h.signer)}"></p>` : ''}`])
+  const lines = []
+  const nodeNote = h.current
+    ? (isZero(bal) ? `${pill('warn', 'no gas')} <span class="dim">${a?.app_signer
+        ? 'if this node sends transactions from its node signer'
+        : 'cannot send transactions'}</span>` : '')
+    : (isZero(bal) ? '' : '<span class="dim">left behind — the key went with its instance</span>')
+  lines.push(key('node_signer', byRole('node_signer')?.key_source, h.signer,
+    `${balance(bal)} ${nodeNote} ${h.current ? topUpForm(h.signer, h.signer) : ''}`))
+  // The app signer keeps every gate a claim must pass before it is funded: the
+  // node passes policy, the nodes agree, and its key came over an attested KMS
+  // connection. A failed gate is said in place of the form.
+  if (byRole('app_signer') && a.app_signer) {
+    let rest = ''
+    if (h.current) {
+      const ab = a.app_signer_balance_wei
+      const blocked = st.policy?.verified !== true
+        ? `${pill('bad', 'not counted')} <span class="dim">this node fails policy
+           (${esc(st.policy?.reason || 'no verdict')}), so its claim carries no weight</span>`
+        : ctx.disagree
+          ? `${pill('bad', 'disputed')} <span class="dim">the nodes disagree on the app signer</span>`
+          : a.app_signer_checked !== true
+            ? `${pill('warn', 'unchecked')} <span class="dim">this key was not acquired over an
+               attested KMS connection, so it is not offered for funding</span>`
+            : ''
+      rest = `${balance(ab)} ${ab != null && isZero(ab) ? pill('warn', 'no gas') : ''}
+        ${blocked || topUpForm(a.app_signer, h.signer)}`
+    }
+    lines.push(key('app_signer', byRole('app_signer').key_source, a.app_signer, rest))
+  }
+  const tls = byRole('tls')
+  if (tls) lines.push(key('tls', tls.key_source, a.tls_public_key ? pin(a.tls_public_key) : (tls.public_key || '—'), ''))
+  for (const id of declared.filter(id => !['node_signer', 'app_signer', 'tls'].includes(id.role))) {
+    lines.push(key(id.role, id.key_source, id.public_key || '—', ''))
+  }
+  // A declaration that failed checking attests no key source; it is said instead.
+  if (a?.identities_error) {
+    lines.push(`<div>${pill('warn', 'error')} <span class="dim">${esc(a.identities_error)}</span></div>`)
+  }
+  // An unattested KMS connection means the key is whatever answered at the
+  // node's kms_url. Nodes configured alike would still agree, so no
+  // disagreement check catches it; it has to be said here.
+  if (a?.identities_unchecked > 0) {
+    lines.push(`<div>${pill('warn', 'kms unchecked')} <span class="dim">${plural(a.identities_unchecked, 'key')}
+      acquired over a KMS connection that was not attested — not necessarily the 0g KMS</span></div>`)
+  }
+  rows.push(['keys', lines.join('')])
 
   if (!st) {
     rows.push(['verification', pill('dim', 'never attested')])
@@ -432,6 +492,32 @@ async function showApp(appId) {
   // them is not serving the app people think it is.
   const pins = [...new Set(current.map(h => h.status?.attested?.tls_public_key).filter(Boolean))]
 
+  // The app signer is the same story: KMS-derived per app, so every node should
+  // attest the same address, and several is a finding. Only nodes that pass the
+  // same policy /verify applies are counted: whoever controls a DEBUG TD, a
+  // revoked TCB or an unpublished image can declare any app signer. Among counted
+  // nodes, one that declares typed identities but no app signer vetoes the
+  // app-level line. Silent nodes (legacy, unreachable) neither veto nor confirm,
+  // so the line says how many nodes attested it rather than "every node".
+  const counted = current.filter(h => h.status?.policy?.verified === true && h.status?.attested)
+  const appSigners = [...new Set(counted.map(h => h.status.attested.app_signer).filter(Boolean))]
+  const selfSigning = counted.some(h => {
+    const a = h.status.attested
+    return !a.app_signer && (a.identities?.length || a.identities_error)
+  })
+  const single = appSigners.length === 1 ? appSigners[0] : null
+  const appSigner = single && !selfSigning ? single : null
+  const attesting = single ? counted.filter(h => h.status.attested.app_signer === single) : []
+  // A key acquired over an unattested KMS connection may be one its operator
+  // knows; the summary warns about it, and the cards withhold its top-up.
+  const appChecked = attesting.length > 0 && attesting.every(h => h.status.attested.app_signer_checked === true)
+  // Same address on every attesting signer, so one balance serves it. Null until
+  // the refresh round that read it has landed — unknown, not zero.
+  const appBal = attesting.map(h => h.status.attested.app_signer_balance_wei)
+    .find(v => v != null) ?? null
+  // Funding lives on each card's key lines; the app level is the summary only.
+  const ctx = { disagree: appSigners.length > 1 }
+
   const view = document.getElementById('view')
   view.innerHTML = `
     <div class="toolbar"><button id="back">← all apps</button></div>
@@ -440,6 +526,21 @@ async function showApp(appId) {
       ? `${plural(current.length, 'signer')} registered right now — these, and only these,
          can obtain this app's KMS key.`
       : 'No node is registered for this app right now.'}</p>
+    ${appSigner ? `
+      <p class="lede">${pill('dim', 'app signer (kms)')} <span class="mono">${esc(appSigner)}</span>
+        — attested by ${attesting.length} of ${plural(current.length, 'current node')}, unchanged by reboots.
+        <span class="bal">${appBal == null ? '—' : og(appBal) + ' OG'}</span>
+        ${appBal != null && isZero(appBal)
+          ? `${pill('warn', 'no gas')} <span class="dim">this address cannot send transactions</span>`
+          : ''}
+        ${appChecked ? '' : `${pill('warn', 'kms unchecked')} <span class="dim">this key was acquired over
+          a KMS connection that was not attested, so it is not necessarily the 0g KMS's — it may be one
+          the operator knows. Not offered for funding.</span>`}</p>` : ''}
+    ${appSigners.length > 1 ? `<p class="lede">${pill('bad', 'app signers disagree')}
+      These nodes derive their app signer from the KMS, so they should all hold the
+      <b>same</b> one — they do not. A KMS key is per app, so a disagreement means a
+      node here is not serving the app people think it is. Each address and its
+      balance is on its signer's card below; neither is offered for funding.</p>` : ''}
     ${pins.length > 1 ? (d.tls_key_source === 'kms'
       ? `<p class="lede">${pill('bad', 'tls keys disagree')}
          These nodes derive their TLS key from the KMS, so they should all hold the
@@ -450,7 +551,7 @@ async function showApp(appId) {
          and re-derived at every boot, so these differ and always will.
          <span class="mono">/cert</span> returns all of them, which
          <span class="mono">curl --pinnedpubkey</span> accepts as a set.</p>`) : ''}
-    ${current.map(h => signerCard(h, d.now, appId)).join('')}
+    ${current.map(h => signerCard(h, d.now, appId, ctx)).join('')}
     ${retired.length ? `<h2>previously ${plural(retired.length, 'signer')}</h2>
       <p class="lede">A retired signer's evidence went with its instance — RTMRs reset on
       restart — so whatever was cached while it was live is the only record there will be.</p>` : ''}
@@ -461,10 +562,11 @@ async function showApp(appId) {
     b.onclick = () => go(appId, b.dataset.trace))
   view.querySelectorAll('button[data-topup]').forEach(b => {
     const signer = b.dataset.topup
+    const id = b.dataset.card + '-' + signer
     b.onclick = () => {
-      const box = document.getElementById('say-' + signer)
+      const box = document.getElementById('say-' + id)
       const say = (html, cls) => { box.className = 'say ' + cls; box.innerHTML = html }
-      topUp(signer, document.getElementById('amt-' + signer).value, say)
+      topUp(signer, document.getElementById('amt-' + id).value, say)
     }
   })
 }
