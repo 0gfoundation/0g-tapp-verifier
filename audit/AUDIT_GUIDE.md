@@ -180,9 +180,9 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# The image carries tapp-server only; tapp-cli runs on the operator's machine.
 BINARY_FILES=(
-    "/usr/local/bin/tapp-cli"
-    "/usr/local/bin/tapp_server"
+    "/usr/local/bin/tapp-server"
 )
 
 if [ $# -eq 0 ]; then
@@ -277,19 +277,19 @@ if [ "$3" = "--json" ]; then
     echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
     echo "  \"binaries\": ["
     
-    local first=1
+    first=1
     for binary in "${BINARY_FILES[@]}"; do
         [ $first -eq 0 ] && echo ","
         first=0
         
-        local file_name=$(basename "$binary")
-        local file_dir=$(dirname "$binary")
+        file_name=$(basename "$binary")
+        file_dir=$(dirname "$binary")
         
         echo "    {"
         echo "      \"path\": \"$binary\","
         
         if virt-ls -a "$IMAGE" "$file_dir" 2>/dev/null | grep -q "^${file_name}$"; then
-            local hash_value
+            hash_value=""
             case "$HASH_TYPE" in
                 md5)    hash_value=$(virt-cat -a "$IMAGE" "$binary" 2>/dev/null | md5sum | awk '{print $1}') ;;
                 sha1)   hash_value=$(virt-cat -a "$IMAGE" "$binary" 2>/dev/null | sha1sum | awk '{print $1}') ;;
@@ -326,19 +326,12 @@ After running the hash check script, you should manually compare the results wit
 ./check_binary_hash.sh myimage.qcow2 sha256
 
 # Or calculate manually
-virt-cat -a myimage.qcow2 /usr/local/bin/tapp-cli | sha256sum
-virt-cat -a myimage.qcow2 /usr/local/bin/tapp_server | sha256sum
+virt-cat -a myimage.qcow2 /usr/local/bin/tapp-server | sha256sum
 ```
 
 **Example output**:
 ```
-[File: /usr/local/bin/tapp-cli]
-✅ File exists
-
-SHA256:
-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2
-
-[File: /usr/local/bin/tapp_server]
+[File: /usr/local/bin/tapp-server]
 ✅ File exists
 
 SHA256:
@@ -348,7 +341,7 @@ f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1
 ### Step 2: Visit GitHub Release Page
 
 1. Open your browser and navigate to the project's GitHub release page
-2. **Example**: `https://github.com/0gfoundation/0g-tapp/releases/tag/v0.0.1`
+2. **Example**: `https://github.com/0gfoundation/0g-tapp/releases/tag/v0.11.1` — use the release whose `tapp-server` the image was built with (`TAPP_SERVER_URL` in 0g-tapp `cvm/build-tapp.sh`; image `og-tdx-uki-v0-11-1` carries v0.11.1)
 3. Look for the **Assets** section at the bottom of the release
 
 ### Step 3: Find Official Checksums
@@ -365,13 +358,11 @@ In the GitHub release page, look for:
 ```
 Official checksums.txt (from GitHub):
 ────────────────────────────────────────────────────────────────
-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2  tapp-cli
-f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp_server
+f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp-server
 
 Your extracted hashes (from Step 1):
 ────────────────────────────────────────────────────────────────
-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2  tapp-cli
-f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp_server
+f2e1d0c9b8a7z6y5x4w3v2u1t0s9r8q7p6o5n4m3l2k1j0i9h8g7f6e5d4c3b2a1  tapp-server
 
 Result: ✅ MATCH - Binaries are authentic
 ```
@@ -464,7 +455,7 @@ echo "Next Steps:"
 echo "=================================="
 echo "1. Copy the hash values above"
 echo "2. Visit GitHub release page:"
-echo "   https://github.com/0gfoundation/0g-tapp/releases/tag/v0.0.1"
+echo "   https://github.com/0gfoundation/0g-tapp/releases/tag/<the image's tapp-server version, e.g. v0.11.1>"
 echo "3. Download checksums file from Assets section"
 echo "4. Manually compare hash values"
 echo ""
@@ -492,7 +483,7 @@ exit $(($SSH_RESULT + $HASH_RESULT))
 3. **Document verification** - Record which release version you verified against and keep audit logs
 4. **Access control** - Limit who can modify base images
 5. **Regular re-audits** - Periodically re-check images to detect tampering
-6. **Use specific versions** - Reference exact release tags (e.g., v0.0.1), not "latest"
+6. **Use specific versions** - Reference exact release tags (e.g., v0.11.1), not "latest"
 7. **Automate where possible** - Integrate SSH and hash check scripts into your CI/CD pipeline
 8. **Verify build provenance** - Check for Sigstore attestations or "Provenance" badges on GitHub releases
 

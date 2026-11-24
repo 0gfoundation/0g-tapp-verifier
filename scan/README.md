@@ -104,6 +104,14 @@ Re-attestation is triggered by the **chain**: a new registry event for an app is
 the signal that something may have changed. `--max-age` (default 1h) is only a
 backstop for what the chain cannot see, such as a node restarting on its own.
 
+Without `--reference-values` (`TAPPSCAN_REFERENCE_VALUES`), the values are tracked from
+GitHub instead: `TAPPSCAN_REFS_REPO` (default `0gfoundation/0g-tapp`) at `TAPPSCAN_REFS_REF`
+(default `dev`), directory `TAPPSCAN_REFS_PATH` (default `verifier/reference-values`);
+`TAPPSCAN_REFS_TOKEN` only raises the GitHub rate limit.
+
+Every attestation goes to the CoCo-AS named by `--as-endpoint` / `TAPPSCAN_AS` (gRPC
+`host:port`); the deployment below points it at its own `as:50004`.
+
 ### Deployment
 
 ```bash
@@ -111,7 +119,8 @@ docker compose -f scan/docker-compose.yml up -d --build    # from the repo root
 ```
 
 Brings up `rvps` + `as` on an internal network only, an nginx front that allows
-`AttestationEvaluate` and refuses `SetAttestationPolicy`, and tappscan on `:9090`.
+`AttestationEvaluate` and `GetAttestationChallenge` and lets `SetAttestationPolicy`
+through only with a key (see [Writing a policy](#writing-a-policy)), and tappscan on `:9090`.
 The AS is not published directly because it has **no authentication**: anyone who
 can reach it can overwrite any policy id, and an EAR token records only which
 policy id was used — never a hash of it — so a client cannot detect a swap.
@@ -188,12 +197,15 @@ endpoints, bounded as described in their own sections below.
 | `GET /` | single-page view |
 | `GET /api/health` | contract, chain, scanned block, last refresh |
 | `GET /api/apps` | every app with its cached attestation state |
-| `GET /api/apps/:app_id` | per-signer registration, status and trace size; full event history |
+| `GET /api/apps/:app_id` | per-signer registration, status and trace size; full event history; `tls_key_source` (`kms` when every current signer's TLS key came from the KMS, else `local`) |
 | `GET /api/apps/:app_id/cert` | the app's attested TLS key as `sha256//<base64>`, text/plain |
 | `GET /api/apps/:app_id/events` | measured runtime log · `signer`, `operation`, `scope`, `limit` |
 | `POST /api/verify` | attest one `{app_id, signer}` now and return the verdict |
 | `GET /api/apps/:app_id/nodes/:signer/evidence` | the node's evidence, fetched now · `nonce` (hex, ≤ 64 bytes) |
 | `GET /api/apps/:app_id/nodes/:signer/info` | the node's `GetTappInfo`, fetched now; not attested |
+| `GET /api/keys` | the registry `admin` and each API key's metadata — never a key or its hash |
+| `POST /api/keys` | issue a key, `{message: "issue_key:<label>:<30\|90\|never>:<unix_ts>", signature}` signed by the admin ([`as-key.sh`](as-key.sh)) |
+| `POST /api/keys/revoke` | revoke one, `{message: "revoke_key:<id>:<unix_ts>", signature}`, same authority |
 
 ### Authenticated app identities
 
@@ -494,13 +506,20 @@ TEE + verification     ← proves "what runs == what was declared",
 
 tappscan's job is to make "runs == declared" machine-checkable for every app, so
 that the object a human must review shrinks to one: **this service**. Verify it
-the way it verifies others, with your own client and the reference values in
-this repository:
+the way it verifies others, with your own client and the reference values
+[`0g-tapp`](https://github.com/0gfoundation/0g-tapp) publishes (verify-app's default):
 
 ```bash
-tapp-cli verify-app --app-id <this instance's app_id> --server <its teeUrl> \
-  --reference-values ./verifier/reference-values
+tapp-cli verify-app --app-id <this instance's app_id> --server <its teeUrl> --insecure \
+  --as-endpoint <an AS that is not this instance's> --as-pubkey 0x<that AS's pin>
 ```
+
+`--insecure` is enough for first contact, because the evidence authenticates itself;
+`--tls-pin 0x<pin>` pins the node once you know its key. Name the AS explicitly — the
+default in tapp-cli 0.11.1 points at a retired host — and not this instance's own: your
+own trustee ([`../tdx-boot-chain`](../tdx-boot-chain)), or the other network's scan,
+whose pin is in 0g-tapp
+[`docs/TAPPSCAN.md`](https://github.com/0gfoundation/0g-tapp/blob/main/docs/TAPPSCAN.md).
 
 (or fetch the evidence yourself and follow
 [`0g-tapp/docs/EVIDENCE_AND_AS_VERIFICATION.md`](https://github.com/0gfoundation/0g-tapp/blob/main/docs/EVIDENCE_AND_AS_VERIFICATION.md)).
@@ -545,6 +564,7 @@ responses, because some providers cap results silently instead of erroring.
 ## Keeping the boot-chain rules in step
 
 Which event is the kernel, which is the shim, and so on is decided in
-[`attest.rs`](src/attest.rs) using the same rules as
-[`../tdx-boot-chain/policy.rego`](../tdx-boot-chain/policy.rego). Here those rules
+[`attest.rs`](src/attest.rs) using the same rules as `0g-tapp`'s
+[`verifier/policy.rego`](https://github.com/0gfoundation/0g-tapp/blob/main/verifier/policy.rego)
+(grub and UKI; the copy in `../tdx-boot-chain` is older and grub-only). Here those rules
 *are* the security check rather than a routing hint, so the two must not drift.
